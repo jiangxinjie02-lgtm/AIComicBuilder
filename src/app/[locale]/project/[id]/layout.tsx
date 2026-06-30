@@ -6,6 +6,7 @@ import { useProjectStore } from "@/stores/project-store";
 import { useTranslations } from "next-intl";
 import Link from "next/link";
 import { useLocale } from "next-intl";
+import { usePathname } from "next/navigation";
 import { ArrowLeft, Loader2, Settings, Wand2 } from "lucide-react";
 import { LogoIcon } from "@/components/logo";
 import { LanguageSwitcher } from "@/components/language-switcher";
@@ -20,7 +21,9 @@ export default function ProjectLayout({
   const { id } = use(params);
   const t = useTranslations("common");
   const locale = useLocale();
+  const pathname = usePathname();
   const { project, loading, fetchProject } = useProjectStore();
+  const isImportPage = pathname.endsWith(`/project/${id}/import`);
 
   useEffect(() => {
     fetchProject(id);
@@ -40,7 +43,7 @@ export default function ProjectLayout({
   return (
     <div className="flex min-h-screen flex-col">
       {/* Top bar */}
-      <header className="sticky top-0 z-30 flex h-14 flex-shrink-0 items-center justify-between border-b border-[--border-subtle] bg-white/80 backdrop-blur-xl px-4 lg:px-6">
+      <header className={`${isImportPage ? "hidden" : "flex"} sticky top-0 z-30 h-14 flex-shrink-0 items-center justify-between border-b border-[--border-subtle] bg-white/80 backdrop-blur-xl px-4 lg:px-6`}>
         <div className="flex items-center gap-3">
           <Link
             href={`/${locale}`}

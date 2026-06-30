@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { projects, episodes, characters, episodeCharacters, characterRelations } from "@/lib/db/schema";
 import { eq, and, max } from "drizzle-orm";
@@ -23,6 +23,13 @@ interface CharacterData {
   visualHint?: string;
 }
 
+interface AssetData {
+  name: string;
+  frequency: number;
+  description: string;
+  visualHint?: string;
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -42,6 +49,8 @@ export async function POST(
   const body = (await request.json()) as {
     episodes: EpisodeData[];
     characters: CharacterData[];
+    items?: AssetData[];
+    environments?: AssetData[];
     relationships?: Array<{
       characterA: string;
       characterB: string;
@@ -51,8 +60,8 @@ export async function POST(
   };
 
   await addImportLog(
-    projectId, 4, "running",
-    `开始创建 ${body.episodes.length} 集和 ${body.characters.length} 个角色`
+    projectId, 5, "running",
+    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境`
   );
 
   // 1. Create all characters (main + guest), build name→id map
@@ -94,7 +103,7 @@ export async function POST(
   }
 
   await addImportLog(
-    projectId, 4, "running",
+    projectId, 5, "running",
     `已创建 ${body.characters.length} 个角色${body.relationships?.length ? `和 ${body.relationships.length} 个关系` : ""}`
   );
 
@@ -143,13 +152,23 @@ export async function POST(
   }
 
   await addImportLog(
-    projectId, 4, "done",
+    projectId, 5, "done",
     `导入完成！创建了 ${body.characters.length} 个角色和 ${created.length} 集（${relationCount} 个角色分配）`,
-    { episodeCount: created.length, characterCount: body.characters.length }
+    {
+      episodeCount: created.length,
+      characterCount: body.characters.length,
+      itemCount: body.items?.length || 0,
+      environmentCount: body.environments?.length || 0,
+      items: body.items || [],
+      environments: body.environments || [],
+    }
   );
 
   return NextResponse.json({
     episodes: created,
     characterCount: body.characters.length,
+    itemCount: body.items?.length || 0,
+    environmentCount: body.environments?.length || 0,
   }, { status: 201 });
 }
+

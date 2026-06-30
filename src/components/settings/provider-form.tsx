@@ -322,7 +322,7 @@ export function ProviderForm({ provider }: ProviderFormProps) {
                   <div className="grid grid-cols-1 gap-0.5 sm:grid-cols-2 lg:grid-cols-3">
                     {filtered.map((model) => (
                       <label
-                        key={model.id}
+                        key={`${provider.id}:${model.id}`}
                         className={`group/item flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 transition-colors ${
                           model.checked
                             ? "bg-primary/5"

@@ -2,15 +2,41 @@
 
 import { useEffect, useState, useCallback, use } from "react";
 import { useTranslations, useLocale } from "next-intl";
-import { Layers, Plus, Loader2, Users, X, Upload, FileUp, Merge, Download } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  Download,
+  FileUp,
+  Layers,
+  Loader2,
+  Merge,
+  Play,
+  Plus,
+  Upload,
+  Users,
+  X,
+} from "lucide-react";
 import { uploadUrl } from "@/lib/utils/upload-url";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { EpisodeCard } from "@/components/editor/episode-card";
 import { EpisodeDialog } from "@/components/editor/episode-dialog";
 import { useEpisodeStore, type Episode } from "@/stores/episode-store";
 import { apiFetch } from "@/lib/api-fetch";
 import Link from "next/link";
+
+function stripEpisodePrefix(title: string) {
+  return title
+    .replace(
+      /^\s*(第\s*[0-9０-９一二三四五六七八九十百千万两〇零]+\s*[集话話回]|EP\.?\s*\d+|Episode\s+\d+)\s*[:：.\-、,，]?\s*/i,
+      ""
+    )
+    .trim();
+}
+
+function formatEpisodeChipLabel(episode: Episode) {
+  const title = stripEpisodePrefix(episode.title?.trim() || "");
+  return `E${episode.sequence}${title ? ` ${title}` : ""}`;
+}
 
 export default function EpisodesPage({
   params,
@@ -37,6 +63,7 @@ export default function EpisodesPage({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [merging, setMerging] = useState(false);
   const [mergedVideoUrl, setMergedVideoUrl] = useState<string | null>(null);
+  const [episodeListOpen, setEpisodeListOpen] = useState(true);
 
   useEffect(() => {
     fetchEpisodes(projectId);
@@ -118,6 +145,69 @@ export default function EpisodesPage({
     }
   }
 
+  function episodeDetailHref(episode: Episode) {
+    return `/${locale}/project/${projectId}/episodes/${episode.id}/script`;
+  }
+
+  function chipClassName(episode: Episode, selected: boolean, selectable: boolean) {
+    const base =
+      "inline-flex h-11 max-w-[360px] shrink-0 items-center gap-1.5 rounded-full px-4 text-sm font-semibold transition-all";
+    if (selectionMode) {
+      if (!selectable) {
+        return `${base} cursor-not-allowed bg-black/[0.04] text-[--text-muted] opacity-45`;
+      }
+      return selected
+        ? `${base} border border-primary/60 bg-primary/10 text-primary shadow-sm`
+        : `${base} bg-black/[0.04] text-[--text-secondary] hover:bg-primary/8 hover:text-primary`;
+    }
+
+    return episode.finalVideoUrl
+      ? `${base} bg-black/[0.04] text-[--text-secondary] hover:bg-primary/8 hover:text-primary`
+      : `${base} bg-primary/8 text-primary hover:bg-primary/12`;
+  }
+
+  function renderEpisodeChip(episode: Episode) {
+    const selected = selectedIds.has(episode.id);
+    const selectable = !!episode.finalVideoUrl;
+    const label = formatEpisodeChipLabel(episode);
+    const content = (
+      <>
+        <span className="truncate">{label}</span>
+        {selectionMode && selected ? (
+          <Check className="h-4 w-4 shrink-0" />
+        ) : episode.finalVideoUrl ? (
+          <Check className="h-4 w-4 shrink-0 text-emerald-500" />
+        ) : null}
+      </>
+    );
+
+    if (selectionMode) {
+      return (
+        <button
+          key={episode.id}
+          type="button"
+          disabled={!selectable}
+          onClick={() => selectable && toggleSelect(episode)}
+          className={chipClassName(episode, selected, selectable)}
+          title={label}
+        >
+          {content}
+        </button>
+      );
+    }
+
+    return (
+      <Link
+        key={episode.id}
+        href={episodeDetailHref(episode)}
+        className={chipClassName(episode, false, selectable)}
+        title={label}
+      >
+        {content}
+      </Link>
+    );
+  }
+
   if (loading) {
     return (
       <div className="flex min-h-[400px] items-center justify-center">
@@ -183,7 +273,7 @@ export default function EpisodesPage({
         </div>
       </div>
 
-      {/* Episode grid */}
+      {/* Episode chips */}
       {episodes.length === 0 ? (
         <div className="flex min-h-[400px] flex-col items-center justify-center rounded-3xl border border-dashed border-[--border-subtle] bg-white/50 p-8 text-center">
           <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-primary/15 to-accent/10">
@@ -209,31 +299,46 @@ export default function EpisodesPage({
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-4 xl:grid-cols-4">
-          {episodes.map((episode) => (
-            <EpisodeCard
-              key={episode.id}
-              episode={episode}
-              projectId={projectId}
-              onEdit={(ep) => setEditingEpisode(ep)}
-              onDelete={handleDelete}
-              onPlayVideo={handlePlayVideo}
-              selectionMode={selectionMode}
-              selected={selectedIds.has(episode.id)}
-              selectable={!!episode.finalVideoUrl}
-              onToggleSelect={toggleSelect}
-            />
-          ))}
-          {/* Add new card */}
+        <div className="space-y-3">
+          <section className="rounded-lg border border-[--border-subtle] bg-white px-4 py-4">
+            <div className="flex items-start gap-3">
+              <span className="mt-3 shrink-0 text-sm font-semibold text-[--text-secondary]">
+                分集:
+              </span>
+              <div className="relative min-w-0 flex-1">
+                <div
+                  className={`flex gap-2.5 ${
+                    episodeListOpen
+                      ? "max-h-[420px] flex-wrap overflow-y-auto pr-1"
+                      : "h-11 flex-nowrap overflow-hidden"
+                  }`}
+                >
+                  {episodes.map((episode) => renderEpisodeChip(episode))}
+                </div>
+                {!episodeListOpen && (
+                  <div className="pointer-events-none absolute bottom-0 right-0 top-0 w-16 bg-gradient-to-r from-transparent to-white" />
+                )}
+              </div>
+              <Button
+                variant="outline"
+                onClick={() => setEpisodeListOpen((open) => !open)}
+                className="h-11 shrink-0 rounded-full border-primary/30 px-4 text-primary hover:border-primary/50 hover:bg-primary/8"
+              >
+                {episodeListOpen ? "收起" : `展开全部 ${episodes.length} 集`}
+                <ChevronDown
+                  className={`h-4 w-4 transition-transform ${episodeListOpen ? "rotate-180" : ""}`}
+                />
+              </Button>
+            </div>
+          </section>
+
           {!selectionMode && (
             <button
               onClick={() => setCreateOpen(true)}
-              className="flex min-h-[200px] flex-col items-center justify-center rounded-[14px] border-[1.5px] border-dashed border-[--border-subtle] bg-white transition-all hover:border-primary hover:bg-primary/[0.02]"
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-[--border-subtle] bg-white px-4 py-4 text-sm font-medium text-[--text-muted] transition-all hover:border-primary hover:bg-primary/[0.02] hover:text-primary"
             >
-              <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-[10px] bg-[--surface] text-[--text-muted] transition-all group-hover:bg-primary/8 group-hover:text-primary">
-                <Plus className="h-[18px] w-[18px]" />
-              </div>
-              <span className="text-xs font-medium text-[--text-muted]">{t("create")}</span>
+              <Plus className="h-4 w-4" />
+              {t("create")}
             </button>
           )}
         </div>

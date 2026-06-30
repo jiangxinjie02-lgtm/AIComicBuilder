@@ -30,6 +30,12 @@ export function createLanguageModel(config: ProviderConfig): LanguageModel {
   }
 }
 
+export function supportsOpenAIJsonMode(config: ProviderConfig): boolean {
+  if (config.protocol !== "openai") return false;
+  const modelId = config.modelId.toLowerCase();
+  return /^(gpt-|o\d|chatgpt-)/.test(modelId);
+}
+
 /**
  * Strip markdown code fences from AI response if present.
  */
@@ -37,5 +43,40 @@ export function extractJSON(text: string): string {
   const match = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const raw = match ? match[1].trim() : text.trim();
   // Remove control characters that break JSON.parse (except \n \r \t)
-  return raw.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+  const cleaned = raw.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+  if (cleaned.startsWith("{") || cleaned.startsWith("[")) return cleaned;
+
+  const start = cleaned.search(/[\[{]/);
+  if (start < 0) return cleaned;
+
+  const open = cleaned[start];
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = true;
+    } else if (ch === open) {
+      depth++;
+    } else if (ch === close) {
+      depth--;
+      if (depth === 0) return cleaned.slice(start, i + 1);
+    }
+  }
+
+  return cleaned.slice(start);
 }

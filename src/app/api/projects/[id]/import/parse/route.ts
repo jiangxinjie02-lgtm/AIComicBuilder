@@ -43,6 +43,7 @@ export async function POST(
 
     await addImportLog(projectId, 1, "done", `解析完成，共 ${text.length} 字`, {
       charCount: text.length,
+      text,
     });
 
     return NextResponse.json({ text, charCount: text.length });
