@@ -9,6 +9,10 @@ interface ListRequest {
 interface ModelItem {
   id: string;
   name: string;
+  model_type?: string;
+  tags?: string;
+  description?: string;
+  supported_endpoint_types?: string[];
 }
 
 function dedupeModels(models: ModelItem[]) {
@@ -17,7 +21,7 @@ function dedupeModels(models: ModelItem[]) {
     const id = model.id.trim();
     if (!id) continue;
     if (!byId.has(id)) {
-      byId.set(id, { id, name: model.name?.trim() || id });
+      byId.set(id, { ...model, id, name: model.name?.trim() || id });
     }
   }
   return Array.from(byId.values());
@@ -45,11 +49,49 @@ async function fetchModels(baseUrl: string, apiKey: string): Promise<ModelItem[]
     throw new Error(`${res.status} ${text.slice(0, 200)}`);
   }
 
-  const data = (await res.json()) as { data?: { id: string }[] };
+  const data = (await res.json()) as { data?: ModelItem[] };
   if (!data.data || !Array.isArray(data.data)) {
     throw new Error("Unexpected response format: missing data array");
   }
-  return dedupeModels(data.data.map((m) => ({ id: m.id, name: m.id })));
+  return dedupeModels(data.data.map((m) => ({ ...m, name: m.name || m.id })));
+}
+
+function isJimApiVideoModel(model: ModelItem) {
+  const id = model.id.toLowerCase();
+  const tags = (model.tags || "").toLowerCase();
+  const endpoints = (model.supported_endpoint_types ?? []).join(" ").toLowerCase();
+  const videoText = "\u89c6\u9891";
+
+  const supportedFamily =
+    id.startsWith("vidu") ||
+    id.startsWith("wan") ||
+    id.includes("hailuo") ||
+    id.includes("seedance") ||
+    id.includes("kling-video") ||
+    id.includes("kling-3") ||
+    id === "pixverse-video";
+
+  const hasVideoSignal =
+    id.includes("video") ||
+    tags.includes("video") ||
+    tags.includes(videoText) ||
+    endpoints.includes("video") ||
+    endpoints.includes(videoText);
+
+  return supportedFamily && hasVideoSignal;
+}
+
+function jimApiVideoFallbackModels() {
+  return dedupeModels([
+    { id: "viduq3-turbo", name: "Vidu Q3 Turbo" },
+    { id: "viduq3-pro", name: "Vidu Q3 Pro" },
+    { id: "kling-video", name: "Kling Video" },
+    { id: "kling-3.0-turbo", name: "Kling 3.0 Turbo" },
+    { id: "pixverse-video", name: "PixVerse Video" },
+    { id: "MiniMax-Hailuo-02", name: "MiniMax Hailuo 02" },
+    { id: "wan2.6-i2v-flash", name: "Wan 2.6 I2V Flash" },
+    { id: "wan2.6-i2v", name: "Wan 2.6 I2V" },
+  ]);
 }
 
 async function fetchGeminiModels(baseUrl: string, apiKey: string): Promise<ModelItem[]> {
@@ -128,6 +170,18 @@ export async function POST(request: Request) {
           { id: "qwen-image-plus", name: "Qwen Image Plus" },
           { id: "z-image-turbo", name: "Z-Image Turbo" },
         ]),
+      });
+    }
+
+    if (body.protocol === "jimapi-video") {
+      const baseUrl = body.baseUrl || process.env.JIMAPI_BASE_URL || "https://www.jimapi.com/v1";
+      const apiKey = body.apiKey || process.env.JIMAPI_API_KEY || "";
+      if (!baseUrl || !apiKey) {
+        return NextResponse.json({ models: jimApiVideoFallbackModels() });
+      }
+      const models = (await fetchModels(baseUrl, apiKey)).filter(isJimApiVideoModel);
+      return NextResponse.json({
+        models: models.length > 0 ? dedupeModels(models) : jimApiVideoFallbackModels(),
       });
     }
 

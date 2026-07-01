@@ -2,6 +2,7 @@ import { setDefaultAIProvider, setDefaultVideoProvider } from "./index";
 import { OpenAIProvider } from "./providers/openai";
 import { GeminiProvider } from "./providers/gemini";
 import { SeedanceProvider } from "./providers/seedance";
+import { JimApiVideoProvider } from "./providers/jimapi-video";
 
 let initialized = false;
 
@@ -24,6 +25,11 @@ export function initializeProviders() {
     setDefaultVideoProvider(
       new SeedanceProvider(),
       (uploadDir) => new SeedanceProvider({ ...(uploadDir && { uploadDir }) }),
+    );
+  } else if (process.env.JIMAPI_API_KEY) {
+    setDefaultVideoProvider(
+      new JimApiVideoProvider(),
+      (uploadDir) => new JimApiVideoProvider({ ...(uploadDir && { uploadDir }) }),
     );
   }
 

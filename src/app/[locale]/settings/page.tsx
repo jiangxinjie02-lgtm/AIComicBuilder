@@ -5,7 +5,7 @@ import { ProviderSection } from "@/components/settings/provider-section";
 import { AgentSection } from "@/components/settings/agent-section";
 import { useTranslations } from "next-intl";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Settings, Zap, Type, ImageIcon, VideoIcon, Wand2, Bot } from "lucide-react";
+import { ArrowLeft, Settings, Zap, Type, ImageIcon, VideoIcon, Wand2 } from "lucide-react";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import Link from "next/link";
 
@@ -87,8 +87,8 @@ export default function SettingsPage() {
             capability="video"
             label={t("videoModels")}
             icon={<VideoIcon className="h-3.5 w-3.5" />}
-            defaultProtocol="kling"
-            defaultBaseUrl="https://api.klingai.com"
+            defaultProtocol="jimapi-video"
+            defaultBaseUrl="https://www.jimapi.com/v1"
           />
         </div>
       </main>
