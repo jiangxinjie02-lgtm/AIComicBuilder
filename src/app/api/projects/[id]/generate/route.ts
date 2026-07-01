@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { streamText, generateText } from "ai";
-import { createLanguageModel, extractJSON } from "@/lib/ai/ai-sdk";
+import { createLanguageModel, extractJSON, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
 import { db } from "@/lib/db";
 import { projects, episodes, characters, shots, dialogues, storyboardVersions, episodeCharacters, characterRelations, agentBindings, agents } from "@/lib/db/schema";
@@ -62,6 +62,9 @@ import { buildRefImagePromptsRequest } from "@/lib/ai/prompts/ref-image-prompts"
 import { buildKeyframePromptsRequest } from "@/lib/ai/prompts/keyframe-prompts";
 
 export const maxDuration = 300;
+
+const SHOT_SPLIT_MODEL_CALL_TIMEOUT_MS =
+  Number(process.env.SHOT_SPLIT_MODEL_CALL_TIMEOUT_MS) || 180_000;
 
 /** Map user-facing ratio string to ImageOptions fields */
 function ratioToImageOpts(ratio?: string): { aspectRatio?: string; size?: string } {
@@ -1089,6 +1092,7 @@ async function handleShotSplitStream(
       { status: 400 }
     );
   }
+  const textModelConfig = modelConfig.text;
 
   // Fetch only characters linked to this episode
   let shotCharacters: typeof characters.$inferSelect[];
@@ -1157,7 +1161,9 @@ async function handleShotSplitStream(
   const shotSplitSlots = await resolveSlotContents("shot_split", { userId, projectId });
   const shotSplitDef = getPromptDefinition("shot_split")!;
   const systemPrompt = shotSplitDef.buildFullPrompt(shotSplitSlots, { maxDuration: videoMaxDuration });
-  const jsonMode = { openai: { response_format: { type: "json_object" } } };
+  const providerOptions = supportsOpenAIJsonMode(textModelConfig)
+    ? { openai: { response_format: { type: "json_object" } } }
+    : undefined;
 
   // Split screenplay into chunks by SCENE markers (~8 scenes per chunk)
   const fullScript = script || "";
@@ -1165,7 +1171,11 @@ async function handleShotSplitStream(
   // Log scene detection details
   const sceneRe = /^[\s*#]*(?:SCENE|场景)\s*\d+/i;
   const sceneMatches = fullScript.split("\n").filter((l) => sceneRe.test(l.trim()));
-  console.log(`[ShotSplit] Detected ${sceneMatches.length} scenes, split into ${sceneChunks.length} chunk(s) of ~8 scenes each`);
+  console.log(
+    `[ShotSplit] Detected ${sceneMatches.length} scenes, split into ${sceneChunks.length} chunk(s) of ~8 scenes each; ` +
+    `model=${textModelConfig.modelId}, protocol=${textModelConfig.protocol}, jsonMode=${providerOptions ? "on" : "off"}, ` +
+    `timeoutMs=${SHOT_SPLIT_MODEL_CALL_TIMEOUT_MS}`
+  );
   sceneChunks.forEach((c, i) => {
     const sceneCount = c.split("\n").filter((l) => sceneRe.test(l.trim())).length;
     console.log(`[ShotSplit] Chunk ${i + 1}: ${sceneCount} scenes, ${c.length} chars`);
@@ -1210,11 +1220,14 @@ async function handleShotSplitStream(
         prompt += `\n\n目标总时长：${targetDuration}秒（${Math.floor(targetDuration / 60)}分${targetDuration % 60}秒）。请确保所有镜头的时长之和接近此目标。\n`;
       }
       try {
+        const startedAt = Date.now();
+        console.log(`[ShotSplit] Chunk ${idx + 1}/${sceneChunks.length}: requesting ${textModelConfig.modelId}`);
         const result = await generateText({
           model,
           system: systemPrompt,
           prompt,
-          providerOptions: jsonMode,
+          providerOptions,
+          timeout: SHOT_SPLIT_MODEL_CALL_TIMEOUT_MS,
         });
         const parsed = JSON.parse(extractJSON(result.text));
         // Handle multiple formats:
@@ -1235,7 +1248,10 @@ async function handleShotSplitStream(
         } else {
           shotList = parsed.shots || [];
         }
-        console.log(`[ShotSplit] Chunk ${idx + 1}/${sceneChunks.length}: ${shotList.length} shots, keys: ${shotList[0] ? Object.keys(shotList[0]).join(",") : "empty"}`);
+        console.log(
+          `[ShotSplit] Chunk ${idx + 1}/${sceneChunks.length}: ${shotList.length} shots in ${Date.now() - startedAt}ms, ` +
+          `keys: ${shotList[0] ? Object.keys(shotList[0]).join(",") : "empty"}`
+        );
         return shotList as ParsedShot[];
       } catch (err) {
         console.error(`[ShotSplit] Chunk ${idx + 1} failed:`, err);
