@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, use, useMemo } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import { useRouter } from "next/navigation";
 import {
   Upload, FileText, Users, Layers, Sparkles,
   Loader2, Check, X, ArrowLeft, AlertCircle,
+  ImageIcon, Images,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -32,11 +34,21 @@ interface ExtractedCharacter {
   episodes?: string[];
   prompt?: string;
   negativePrompt?: string;
-  variants?: Array<{ id?: string; name: string; description?: string; prompt?: string; imageUrl?: string; history?: Array<Record<string, unknown>> }>;
+  variants?: AssetVariant[];
   imageUrl?: string;
   history?: Array<Record<string, unknown>>;
   mainImageName?: string;
   tags?: string[];
+  faceTemplate?: { label?: string; url?: string; note?: string } | null;
+}
+
+interface AssetVariant {
+  id?: string;
+  name: string;
+  description?: string;
+  prompt?: string;
+  imageUrl?: string;
+  history?: Array<Record<string, unknown>>;
 }
 
 interface ExtractedAsset {
@@ -52,11 +64,12 @@ interface ExtractedAsset {
   episodes?: string[];
   prompt?: string;
   negativePrompt?: string;
-  variants?: Array<{ id?: string; name: string; description?: string; prompt?: string; imageUrl?: string; history?: Array<Record<string, unknown>> }>;
+  variants?: AssetVariant[];
   imageUrl?: string;
   history?: Array<Record<string, unknown>>;
   mainImageName?: string;
   tags?: string[];
+  faceTemplate?: { label?: string; url?: string; note?: string } | null;
 }
 
 type AssetTab = "characters" | "items" | "environments" | "voices";
@@ -165,6 +178,7 @@ export default function ImportPage({
   const [selectedStep, setSelectedStep] = useState<Step | null>(null);
   const [activeAssetTab, setActiveAssetTab] = useState<AssetTab>("characters");
   const [activeAssetKey, setActiveAssetKey] = useState("");
+  const [assetGeneratingTarget, setAssetGeneratingTarget] = useState<string | null>(null);
 
   // Load existing logs on mount
   useEffect(() => {
@@ -804,6 +818,159 @@ export default function ImportPage({
     }
   }
 
+  function getAssetSetter(tab: AssetTab): Dispatch<SetStateAction<WorkbenchAsset[]>> {
+    if (tab === "characters") return setCharacters as Dispatch<SetStateAction<WorkbenchAsset[]>>;
+    if (tab === "items") return setItems as Dispatch<SetStateAction<WorkbenchAsset[]>>;
+    if (tab === "environments") return setEnvironments as Dispatch<SetStateAction<WorkbenchAsset[]>>;
+    return setVoices as Dispatch<SetStateAction<WorkbenchAsset[]>>;
+  }
+
+  function assetCategoryForTab(tab: AssetTab) {
+    if (tab === "items") return "props";
+    if (tab === "environments") return "scenes";
+    return tab;
+  }
+
+  function sizeForAssetTab(tab: AssetTab) {
+    return tab === "voices" ? "1024x1024" : "1536x1024";
+  }
+
+  function makeHistoryEntry(result: Record<string, unknown>) {
+    return {
+      at: new Date().toISOString(),
+      provider: result.provider,
+      status: result.status,
+      imageUrl: result.imageUrl || "",
+    };
+  }
+
+  function patchWorkbenchAsset(
+    tab: AssetTab,
+    assetIndex: number,
+    patcher: (asset: WorkbenchAsset) => WorkbenchAsset,
+  ) {
+    const setter = getAssetSetter(tab);
+    setter((prev) => prev.map((asset, index) => index === assetIndex ? patcher(asset) : asset));
+  }
+
+  async function generateWorkbenchAsset(
+    tab: AssetTab,
+    assetIndex: number,
+    variantIndex?: number,
+    options: { quiet?: boolean; keepBusy?: boolean } = {},
+  ) {
+    if (tab === "voices") return false;
+    const sourceList = tab === "characters" ? characters : tab === "items" ? items : environments;
+    const asset = sourceList[assetIndex] as WorkbenchAsset | undefined;
+    if (!asset) return false;
+
+    const variant = typeof variantIndex === "number" ? asset.variants?.[variantIndex] : undefined;
+    const target = variant || asset;
+    const prompt = target.prompt || asset.prompt || "";
+    if (!prompt.trim()) {
+      toast.error(t("assetPromptMissing"));
+      return false;
+    }
+
+    const targetKey = `${tab}:${assetIndex}:${variantIndex ?? "main"}`;
+    setAssetGeneratingTarget(targetKey);
+
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/import/generate-image`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          category: assetCategoryForTab(tab),
+          asset,
+          prompt,
+          negativePrompt: asset.negativePrompt,
+          size: sizeForAssetTab(tab),
+          targetName: target.name,
+          targetType: variant ? "variant" : "main",
+          referenceImages: asset.faceTemplate?.url ? [asset.faceTemplate.url] : [],
+        }),
+      });
+      const result = await res.json();
+      if (result.status === "error") throw new Error(result.error || "image2 生成失败");
+
+      patchWorkbenchAsset(tab, assetIndex, (current) => {
+        const historyEntry = makeHistoryEntry(result);
+        if (typeof variantIndex === "number") {
+          const variants = [...(current.variants || [])];
+          const currentVariant = variants[variantIndex];
+          if (!currentVariant) return current;
+          variants[variantIndex] = {
+            ...currentVariant,
+            imageUrl: result.imageUrl || "",
+            history: [historyEntry, ...(currentVariant.history || [])],
+          };
+          return { ...current, variants };
+        }
+        return {
+          ...current,
+          imageUrl: result.imageUrl || "",
+          history: [historyEntry, ...(current.history || [])],
+        };
+      });
+
+      if (!options.quiet) toast.success(t("assetGenerateSuccess", { name: target.name || asset.name }));
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "image2 生成失败";
+      patchWorkbenchAsset(tab, assetIndex, (current) => {
+        const failedEntry = {
+          at: new Date().toISOString(),
+          provider: "jimapi:image2",
+          status: "failed",
+          error: msg,
+        };
+        if (typeof variantIndex === "number") {
+          const variants = [...(current.variants || [])];
+          const currentVariant = variants[variantIndex];
+          if (!currentVariant) return current;
+          variants[variantIndex] = {
+            ...currentVariant,
+            history: [failedEntry, ...(currentVariant.history || [])],
+          };
+          return { ...current, variants };
+        }
+        return {
+          ...current,
+          history: [failedEntry, ...(current.history || [])],
+        };
+      });
+      if (!options.quiet) toast.error(msg);
+      return false;
+    } finally {
+      if (!options.keepBusy) setAssetGeneratingTarget(null);
+    }
+  }
+
+  async function generateActiveWorkbenchAsset(variantIndex?: number) {
+    if (activeWorkbenchAssetIndex < 0) return;
+    await generateWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, variantIndex);
+  }
+
+  async function generateCurrentAssetTab() {
+    if (activeAssetTab === "voices") return;
+    const tab = activeAssetTab;
+    const list = tab === "characters" ? characters : tab === "items" ? items : environments;
+    if (!list.length) return;
+    setAssetGeneratingTarget(`${tab}:category`);
+
+    let successCount = 0;
+    for (let assetIndex = 0; assetIndex < list.length; assetIndex += 1) {
+      if (await generateWorkbenchAsset(tab, assetIndex, undefined, { quiet: true, keepBusy: true })) successCount += 1;
+      const variants = list[assetIndex].variants || [];
+      for (let variantIndex = 0; variantIndex < variants.length; variantIndex += 1) {
+        if (await generateWorkbenchAsset(tab, assetIndex, variantIndex, { quiet: true, keepBusy: true })) successCount += 1;
+      }
+    }
+
+    toast.success(t("assetGenerateBatchSuccess", { count: successCount }));
+    setAssetGeneratingTarget(null);
+  }
+
   function assetTabInfo(tab: AssetTab) {
     if (tab === "characters") return { label: t("assetCharacters"), count: characters.length };
     if (tab === "items") return { label: t("assetItems"), count: items.length };
@@ -1312,8 +1479,8 @@ export default function ImportPage({
               <aside className="min-h-0 overflow-y-auto p-4">
                 {activeWorkbenchAsset ? (
                   <div className="space-y-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
                         <div className="text-xs font-bold text-[--text-secondary]">{t("assetMainImageName")}</div>
                         <Input
                           value={getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab)}
@@ -1322,6 +1489,37 @@ export default function ImportPage({
                           className="mt-1 h-9 rounded-lg text-xs font-semibold"
                         />
                       </div>
+                      {activeAssetTab !== "voices" && (
+                        <div className="flex shrink-0 flex-col gap-2 pt-5">
+                          <Button
+                            size="sm"
+                            onClick={() => generateActiveWorkbenchAsset()}
+                            disabled={Boolean(assetGeneratingTarget)}
+                            className="rounded-lg"
+                          >
+                            {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <ImageIcon className="size-3.5" />
+                            )}
+                            {activeWorkbenchAsset.imageUrl ? t("assetRegenerateMain") : t("assetGenerateMain")}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={generateCurrentAssetTab}
+                            disabled={Boolean(assetGeneratingTarget)}
+                            className="rounded-lg"
+                          >
+                            {assetGeneratingTarget ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <Images className="size-3.5" />
+                            )}
+                            {t("assetGenerateCurrentType")}
+                          </Button>
+                        </div>
+                      )}
                     </div>
 
                     <div className="flex aspect-[16/10] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
@@ -1363,6 +1561,29 @@ export default function ImportPage({
                                 </div>
                                 {variant.imageUrl && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">OK</span>}
                               </div>
+                              {variant.imageUrl && (
+                                <div className="mt-2 overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
+                                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                                  <img src={variant.imageUrl} alt={variant.name} className="h-24 w-full object-contain" />
+                                </div>
+                              )}
+                              {activeAssetTab !== "voices" && (
+                                <div className="mt-2 flex items-center justify-end">
+                                  <Button
+                                    size="xs"
+                                    variant="outline"
+                                    onClick={() => generateActiveWorkbenchAsset(index)}
+                                    disabled={Boolean(assetGeneratingTarget)}
+                                  >
+                                    {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                      <Loader2 className="size-3 animate-spin" />
+                                    ) : (
+                                      <ImageIcon className="size-3" />
+                                    )}
+                                    {variant.imageUrl ? t("assetRegenerateVariant") : t("assetGenerateVariant")}
+                                  </Button>
+                                </div>
+                              )}
                             </div>
                           ))}
                         </div>
