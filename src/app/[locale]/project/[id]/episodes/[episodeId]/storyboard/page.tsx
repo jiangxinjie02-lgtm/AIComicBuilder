@@ -823,7 +823,6 @@ export default function EpisodeStoryboardPage() {
           characters={project.characters}
           projectId={project.id}
           generationMode={generationMode}
-          onUpdate={() => fetchProject(project.id, useProjectStore.getState().currentEpisodeId!)}
         />
 
         {/* Batch operations */}
