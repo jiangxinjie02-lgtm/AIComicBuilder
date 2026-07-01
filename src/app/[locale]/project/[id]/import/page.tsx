@@ -25,13 +25,14 @@ interface ExtractedCharacter {
   description: string;
   visualHint?: string;
   scope: "main" | "guest";
+  confirmed?: boolean;
   assetId?: string;
   role?: string;
   roleKey?: string;
   episodes?: string[];
   prompt?: string;
   negativePrompt?: string;
-  variants?: Array<{ name: string; description?: string; prompt?: string }>;
+  variants?: Array<{ id?: string; name: string; description?: string; prompt?: string; imageUrl?: string; history?: Array<Record<string, unknown>> }>;
   imageUrl?: string;
   history?: Array<Record<string, unknown>>;
   mainImageName?: string;
@@ -43,6 +44,7 @@ interface ExtractedAsset {
   frequency: number;
   description: string;
   visualHint?: string;
+  confirmed?: boolean;
   assetId?: string;
   category?: string;
   role?: string;
@@ -50,11 +52,24 @@ interface ExtractedAsset {
   episodes?: string[];
   prompt?: string;
   negativePrompt?: string;
-  variants?: Array<{ name: string; description?: string; prompt?: string }>;
+  variants?: Array<{ id?: string; name: string; description?: string; prompt?: string; imageUrl?: string; history?: Array<Record<string, unknown>> }>;
   imageUrl?: string;
   history?: Array<Record<string, unknown>>;
   mainImageName?: string;
   tags?: string[];
+}
+
+type AssetTab = "characters" | "items" | "environments" | "voices";
+type WorkbenchAsset = ExtractedAsset & { scope?: "main" | "guest" };
+
+function getAssetKey(asset: WorkbenchAsset, index: number, tab: AssetTab) {
+  return asset.assetId || `${tab}:${asset.name}:${index}`;
+}
+
+function formatEpisodeRefs(episodes?: string[]) {
+  if (!episodes?.length) return "EP1";
+  if (episodes.length <= 3) return episodes.join(", ");
+  return `${episodes.slice(0, 2).join(", ")} +${episodes.length - 2}`;
 }
 
 interface SplitEpisode {
@@ -148,7 +163,8 @@ export default function ImportPage({
   // History mode
   const [historyMode, setHistoryMode] = useState(false);
   const [selectedStep, setSelectedStep] = useState<Step | null>(null);
-  const [activeAssetTab, setActiveAssetTab] = useState<"characters" | "items" | "environments" | "voices">("characters");
+  const [activeAssetTab, setActiveAssetTab] = useState<AssetTab>("characters");
+  const [activeAssetKey, setActiveAssetKey] = useState("");
 
   // Load existing logs on mount
   useEffect(() => {
@@ -699,14 +715,6 @@ export default function ImportPage({
     }
   }
 
-  function toggleScope(idx: number) {
-    setCharacters((prev) =>
-      prev.map((c, i) =>
-        i === idx ? { ...c, scope: c.scope === "main" ? "guest" : "main" } : c
-      )
-    );
-  }
-
   function updateEpisode(idx: number, field: keyof SplitEpisode, value: string) {
     setEpisodes((prev) =>
       prev.map((ep, i) => (i === idx ? { ...ep, [field]: value } : ep))
@@ -756,6 +764,57 @@ export default function ImportPage({
     medium: t("severityMedium"),
     low: t("severityLow"),
   };
+
+  const activeAssetList = useMemo<WorkbenchAsset[]>(() => {
+    if (activeAssetTab === "characters") return characters;
+    if (activeAssetTab === "items") return items;
+    if (activeAssetTab === "environments") return environments;
+    return voices;
+  }, [activeAssetTab, characters, items, environments, voices]);
+  const activeAssetIndex = activeAssetList.findIndex((asset, index) =>
+    getAssetKey(asset, index, activeAssetTab) === activeAssetKey
+  );
+  const activeWorkbenchAsset = activeAssetIndex >= 0 ? activeAssetList[activeAssetIndex] : activeAssetList[0];
+  const activeWorkbenchAssetIndex = activeAssetIndex >= 0 ? activeAssetIndex : activeAssetList.length ? 0 : -1;
+  const activeWorkbenchKey = activeWorkbenchAssetIndex >= 0
+    ? getAssetKey(activeWorkbenchAsset, activeWorkbenchAssetIndex, activeAssetTab)
+    : "";
+
+  useEffect(() => {
+    if (!activeAssetList.length) {
+      if (activeAssetKey) setActiveAssetKey("");
+      return;
+    }
+    const exists = activeAssetList.some((asset, index) => getAssetKey(asset, index, activeAssetTab) === activeAssetKey);
+    if (!exists) {
+      setActiveAssetKey(getAssetKey(activeAssetList[0], 0, activeAssetTab));
+    }
+  }, [activeAssetKey, activeAssetList, activeAssetTab]);
+
+  function updateActiveWorkbenchAsset(patch: Partial<WorkbenchAsset>) {
+    if (activeWorkbenchAssetIndex < 0) return;
+    if (activeAssetTab === "characters") {
+      setCharacters((prev) => prev.map((asset, index) => index === activeWorkbenchAssetIndex ? { ...asset, ...patch } as ExtractedCharacter : asset));
+    } else if (activeAssetTab === "items") {
+      setItems((prev) => prev.map((asset, index) => index === activeWorkbenchAssetIndex ? { ...asset, ...patch } : asset));
+    } else if (activeAssetTab === "environments") {
+      setEnvironments((prev) => prev.map((asset, index) => index === activeWorkbenchAssetIndex ? { ...asset, ...patch } : asset));
+    } else {
+      setVoices((prev) => prev.map((asset, index) => index === activeWorkbenchAssetIndex ? { ...asset, ...patch } : asset));
+    }
+  }
+
+  function assetTabInfo(tab: AssetTab) {
+    if (tab === "characters") return { label: t("assetCharacters"), count: characters.length };
+    if (tab === "items") return { label: t("assetItems"), count: items.length };
+    if (tab === "environments") return { label: t("assetEnvironments"), count: environments.length };
+    return { label: t("assetVoices"), count: voices.length };
+  }
+
+  function getAssetPreviewLabel(asset: WorkbenchAsset, tab: AssetTab) {
+    if (tab === "voices") return t("assetVoicePrompt");
+    return asset.mainImageName || asset.visualHint || asset.name;
+  }
   const categoryLabel: Record<StoryReviewIssue["category"], string> = {
     prohibited: t("reviewCategoryProhibited"),
     logic: t("reviewCategoryLogic"),
@@ -1089,8 +1148,8 @@ export default function ImportPage({
 
         {/* Asset setup review */}
         {showCharReview && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
+          <div className="flex h-[calc(100vh-150px)] min-h-[660px] flex-col gap-3">
+            <div className="flex items-center justify-between gap-4">
               <div>
                 <h3 className="font-display text-lg font-bold text-[--text-primary]">
                   {t("reviewAssets")}
@@ -1103,165 +1162,224 @@ export default function ImportPage({
               </Button>
             </div>
 
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              {([
-                {
-                  key: "characters" as const,
-                  title: t("assetCharacters"),
-                  count: characters.length,
-                  summary: t("assetCharactersSummary", {
-                    main: characters.filter((c) => c.scope === "main").length,
-                    guest: characters.filter((c) => c.scope === "guest").length,
-                  }),
-                },
-                {
-                  key: "items" as const,
-                  title: t("assetItems"),
-                  count: items.length,
-                  summary: t("assetItemsSummary", { count: items.length }),
-                },
-                {
-                  key: "environments" as const,
-                  title: t("assetEnvironments"),
-                  count: environments.length,
-                  summary: t("assetEnvironmentsSummary", { count: environments.length }),
-                },
-                {
-                  key: "voices" as const,
-                  title: t("assetVoices"),
-                  count: voices.length,
-                  summary: t("assetVoicesSummary", { count: voices.length }),
-                },
-              ]).map((asset) => (
-                <button
-                  key={asset.key}
-                  onClick={() => setActiveAssetTab(asset.key)}
-                  className={`rounded-xl border p-4 text-left transition-all ${
-                    activeAssetTab === asset.key
-                      ? "border-primary/40 bg-primary/5"
-                      : "border-[--border-subtle] bg-white hover:border-[--border-hover]"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-base font-bold text-[--text-primary]">{asset.title}</div>
-                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-600">
-                      {t("assetConfirmed", { count: asset.count })}
-                    </span>
-                  </div>
-                  <div className="mt-3 rounded-lg bg-[--surface] px-3 py-1.5 text-xs text-[--text-muted]">
-                    {asset.summary}
-                  </div>
-                </button>
-              ))}
-            </div>
-
-            <div className="flex flex-wrap gap-2 rounded-xl border border-[--border-subtle] bg-white p-1.5">
-              {([
-                { key: "characters" as const, label: t("assetCharacters"), count: characters.length },
-                { key: "items" as const, label: t("assetItems"), count: items.length },
-                { key: "environments" as const, label: t("assetEnvironments"), count: environments.length },
-                { key: "voices" as const, label: t("assetVoices"), count: voices.length },
-              ]).map((tab) => (
-                <button
-                  key={tab.key}
-                  onClick={() => setActiveAssetTab(tab.key)}
-                  className={`flex h-9 items-center gap-2 rounded-lg px-3 text-sm font-medium transition-colors ${
-                    activeAssetTab === tab.key
-                      ? "bg-primary text-white"
-                      : "text-[--text-muted] hover:bg-[--surface] hover:text-[--text-primary]"
-                  }`}
-                >
-                  <span>{tab.label}</span>
-                  <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${
-                    activeAssetTab === tab.key
-                      ? "bg-white/20 text-white"
-                      : "bg-[--surface] text-[--text-muted]"
-                  }`}>
-                    {tab.count}
+            <div className="grid min-h-0 flex-1 grid-cols-[270px_minmax(0,1fr)_420px] overflow-hidden rounded-xl border border-[--border-subtle] bg-white shadow-sm">
+              <aside className="flex min-h-0 flex-col border-r border-[--border-subtle] bg-[--surface]">
+                <div className="flex h-12 items-center justify-between border-b border-[--border-subtle] px-3">
+                  <div className="text-sm font-bold text-[--text-primary]">{t("assetTypes")}</div>
+                  <span className="rounded-full bg-white px-2 py-0.5 text-xs font-semibold text-[--text-muted]">
+                    {characters.length + items.length + environments.length + voices.length}
                   </span>
-                </button>
-              ))}
-            </div>
-
-            {activeAssetTab === "characters" && (
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
-                {characters.map((char, idx) => (
-                <div
-                  key={`${char.name}:${idx}`}
-                  className="group relative overflow-hidden rounded-[14px] border border-[--border-subtle] bg-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
-                >
-                  {/* Top accent strip */}
-                  <div className={`h-1 w-full ${char.scope === "main" ? "bg-gradient-to-r from-blue-500 to-blue-400" : "bg-gradient-to-r from-purple-500 to-purple-400"}`} />
-                  <div className="p-3.5">
-                    {/* Avatar + Name */}
-                    <div className="mb-2.5 flex items-center gap-2.5">
-                      <div
-                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-sm font-bold text-white"
-                        style={{ background: `linear-gradient(135deg, hsl(${(char.name.charCodeAt(0) * 37) % 360}, 45%, 45%), hsl(${(char.name.charCodeAt(0) * 37) % 360}, 50%, 55%))` }}
+                </div>
+                <div className="grid grid-cols-2 gap-2 border-b border-[--border-subtle] p-2">
+                  {(["characters", "items", "environments", "voices"] as AssetTab[]).map((tab) => {
+                    const info = assetTabInfo(tab);
+                    return (
+                      <button
+                        key={tab}
+                        onClick={() => setActiveAssetTab(tab)}
+                        className={`rounded-lg border p-2 text-left transition-colors ${
+                          activeAssetTab === tab
+                            ? "border-primary/50 bg-primary/10 text-primary"
+                            : "border-[--border-subtle] bg-white text-[--text-primary] hover:border-[--border-hover]"
+                        }`}
                       >
-                        {char.name.charAt(0)}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-[13px] font-bold text-[--text-primary]">{char.name}</div>
-                        <div className="flex items-center gap-1.5 text-[10px] text-[--text-muted]">
-                          <span>{t("frequency")} {char.frequency}</span>
-                          {char.visualHint && (
-                            <>
-                              <span className="h-[3px] w-[3px] rounded-full bg-[#ddd]" />
-                              <span className="truncate">{char.visualHint}</span>
-                            </>
-                          )}
+                        <div className="text-xs font-bold">{info.label}</div>
+                        <div className="mt-1 text-[10px] text-[--text-muted]">{info.count}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="flex h-10 items-center justify-between border-b border-[--border-subtle] px-3">
+                  <div className="text-xs font-bold text-[--text-secondary]">{assetTabInfo(activeAssetTab).label}</div>
+                  <span className="text-[10px] text-[--text-muted]">{assetTabInfo(activeAssetTab).count}</span>
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto p-2">
+                  {activeAssetList.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-[--border-subtle] bg-white p-4 text-center text-xs text-[--text-muted]">
+                      {t("assetEmpty")}
+                    </div>
+                  ) : (
+                    activeAssetList.map((asset, index) => {
+                      const key = getAssetKey(asset, index, activeAssetTab);
+                      const isActive = key === activeWorkbenchKey;
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => setActiveAssetKey(key)}
+                          className={`mb-1.5 grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg border p-2 text-left transition-colors ${
+                            isActive
+                              ? "border-primary/50 bg-primary/8"
+                              : "border-transparent bg-white hover:border-[--border-hover]"
+                          }`}
+                        >
+                          <span className="min-w-0">
+                            <span className="block truncate text-xs font-bold text-[--text-primary]">{asset.name}</span>
+                            <span className="mt-0.5 block truncate text-[10px] text-[--text-muted]">
+                              {(asset.role || asset.visualHint || assetTabInfo(activeAssetTab).label)} · {formatEpisodeRefs(asset.episodes)}
+                            </span>
+                          </span>
+                          <span className={`h-2 w-2 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </aside>
+
+              <section className="min-h-0 overflow-y-auto border-r border-[--border-subtle] p-4">
+                {activeWorkbenchAsset ? (
+                  <div className="space-y-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold uppercase text-primary">{assetTabInfo(activeAssetTab).label}{t("assetConfigSuffix")}</div>
+                        <h4 className="mt-1 truncate text-xl font-bold text-[--text-primary]">{activeWorkbenchAsset.name}</h4>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {(activeWorkbenchAsset.tags || []).slice(0, 4).map((tag) => (
+                            <span key={tag} className="rounded-full bg-[--surface] px-2 py-0.5 text-[10px] font-medium text-[--text-muted]">
+                              {tag}
+                            </span>
+                          ))}
+                          <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                            {formatEpisodeRefs(activeWorkbenchAsset.episodes)}
+                          </span>
                         </div>
                       </div>
+                      <label className="flex shrink-0 items-center gap-2 text-xs font-semibold text-[--text-secondary]">
+                        <input
+                          type="checkbox"
+                          checked={activeWorkbenchAsset.confirmed !== false}
+                          onChange={(event) => updateActiveWorkbenchAsset({ confirmed: event.target.checked })}
+                          className="h-4 w-4 accent-primary"
+                        />
+                        {t("assetConfirmedToggle")}
+                      </label>
                     </div>
-                    {/* Visual hint tag */}
-                    {char.visualHint && (
-                      <div className="mb-2 inline-block rounded-md bg-[--surface] px-2 py-0.5 text-[10px] font-medium text-[--text-muted]">
-                        {char.visualHint}
-                      </div>
-                    )}
-                    {/* Description */}
-                    <p className="line-clamp-2 text-[11px] leading-relaxed text-[--text-muted]">{char.description}</p>
-                  </div>
-                  {/* Scope badge (floating, clickable) */}
-                  <button
-                    onClick={() => toggleScope(idx)}
-                    className={`absolute right-3 top-3 rounded-[8px] px-2 py-0.5 text-[9px] font-bold tracking-wide transition-colors ${
-                      char.scope === "main"
-                        ? "bg-blue-50 text-blue-600 hover:bg-blue-100"
-                        : "bg-purple-50 text-purple-600 hover:bg-purple-100"
-                    }`}
-                  >
-                    {char.scope === "main" ? t("main") : t("guest")}
-                  </button>
-                </div>
-                ))}
-              </div>
-            )}
 
-            {(activeAssetTab === "items" || activeAssetTab === "environments" || activeAssetTab === "voices") && (
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
-                {(activeAssetTab === "items" ? items : activeAssetTab === "environments" ? environments : voices).map((asset, idx) => (
-                  <div
-                    key={`${asset.name}:${idx}`}
-                    className="rounded-[14px] border border-[--border-subtle] bg-white p-3.5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
-                  >
-                    <div className="mb-2 flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="truncate text-[13px] font-bold text-[--text-primary]">{asset.name}</div>
-                        <div className="text-[10px] text-[--text-muted]">{t("frequency")} {asset.frequency}</div>
+                    <div className="grid gap-3 rounded-xl border border-[--border-subtle] bg-[--surface] p-3">
+                      <div className="grid gap-1">
+                        <div className="text-xs font-bold text-[--text-secondary]">{t("assetDescription")}</div>
+                        <p className="text-xs leading-relaxed text-[--text-muted]">{activeWorkbenchAsset.description || "-"}</p>
                       </div>
-                      {asset.visualHint && (
-                        <span className="shrink-0 rounded-md bg-[--surface] px-2 py-0.5 text-[10px] font-medium text-[--text-muted]">
-                          {asset.visualHint}
-                        </span>
+                      {activeAssetTab === "characters" && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => updateActiveWorkbenchAsset({ scope: activeWorkbenchAsset.scope === "main" ? "guest" : "main" })}
+                            className={`rounded-lg px-2 py-1 text-xs font-bold ${
+                              activeWorkbenchAsset.scope === "main"
+                                ? "bg-blue-50 text-blue-600"
+                                : "bg-purple-50 text-purple-600"
+                            }`}
+                          >
+                            {activeWorkbenchAsset.scope === "main" ? t("main") : t("guest")}
+                          </button>
+                          <span className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || ""}</span>
+                        </div>
                       )}
                     </div>
-                    <p className="line-clamp-4 text-[11px] leading-relaxed text-[--text-muted]">{asset.description}</p>
+
+                    <div className="grid gap-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-[--text-secondary]">
+                          {activeAssetTab === "voices" ? t("assetVoicePrompt") : t("assetPrompt")}
+                        </label>
+                        <span className="text-[10px] text-[--text-muted]">{t("assetCustomEdit")}</span>
+                      </div>
+                      <Textarea
+                        value={activeWorkbenchAsset.prompt || ""}
+                        onChange={(event) => updateActiveWorkbenchAsset({ prompt: event.target.value })}
+                        className="min-h-[360px] resize-y rounded-xl bg-white font-mono text-xs leading-relaxed"
+                      />
+                    </div>
+
+                    {activeAssetTab !== "voices" && (
+                      <div className="grid gap-2">
+                        <label className="text-xs font-bold text-[--text-secondary]">{t("assetNegativePrompt")}</label>
+                        <Textarea
+                          value={activeWorkbenchAsset.negativePrompt || ""}
+                          onChange={(event) => updateActiveWorkbenchAsset({ negativePrompt: event.target.value })}
+                          className="min-h-20 resize-y rounded-xl bg-white text-xs leading-relaxed"
+                        />
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-            )}
+                ) : (
+                  <div className="flex h-full items-center justify-center rounded-xl border border-dashed border-[--border-subtle] text-sm text-[--text-muted]">
+                    {t("assetEmpty")}
+                  </div>
+                )}
+              </section>
+
+              <aside className="min-h-0 overflow-y-auto p-4">
+                {activeWorkbenchAsset ? (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-[--text-secondary]">{t("assetMainImageName")}</div>
+                        <Input
+                          value={getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab)}
+                          onChange={(event) => updateActiveWorkbenchAsset({ mainImageName: event.target.value, visualHint: event.target.value })}
+                          disabled={activeAssetTab === "voices"}
+                          className="mt-1 h-9 rounded-lg text-xs font-semibold"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex aspect-[16/10] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
+                      {activeWorkbenchAsset.imageUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={activeWorkbenchAsset.imageUrl} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
+                      ) : (
+                        <div className="grid gap-1 text-center">
+                          <div className="text-sm font-bold text-[--text-primary]">
+                            {activeAssetTab === "voices" ? activeWorkbenchAsset.name : t("assetNoImage")}
+                          </div>
+                          <div className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || assetTabInfo(activeAssetTab).label}</div>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-sm font-bold text-[--text-primary]">{t("assetVariants")}</div>
+                          <div className="text-xs text-[--text-muted]">
+                            {activeAssetTab === "voices" ? t("assetVoiceVariantsHint") : t("assetImageVariantsHint")}
+                          </div>
+                        </div>
+                        <span className="rounded-full bg-[--surface] px-2 py-0.5 text-xs font-semibold text-[--text-muted]">
+                          {activeWorkbenchAsset.variants?.length || 0}
+                        </span>
+                      </div>
+                      {activeWorkbenchAsset.variants?.length ? (
+                        <div className="grid gap-2">
+                          {activeWorkbenchAsset.variants.map((variant, index) => (
+                            <div key={variant.id || `${variant.name}:${index}`} className="rounded-xl border border-[--border-subtle] bg-white p-3">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="truncate text-xs font-bold text-[--text-primary]">{variant.name}</div>
+                                  {variant.description && (
+                                    <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-[--text-muted]">{variant.description}</p>
+                                  )}
+                                </div>
+                                {variant.imageUrl && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">OK</span>}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="rounded-xl border border-dashed border-[--border-subtle] bg-[--surface] p-4 text-center text-xs text-[--text-muted]">
+                          {t("assetNoVariants")}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex h-full items-center justify-center rounded-xl border border-dashed border-[--border-subtle] text-sm text-[--text-muted]">
+                    {t("assetEmpty")}
+                  </div>
+                )}
+              </aside>
+            </div>
           </div>
         )}
 
