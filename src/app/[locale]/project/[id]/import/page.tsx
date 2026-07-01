@@ -25,6 +25,17 @@ interface ExtractedCharacter {
   description: string;
   visualHint?: string;
   scope: "main" | "guest";
+  assetId?: string;
+  role?: string;
+  roleKey?: string;
+  episodes?: string[];
+  prompt?: string;
+  negativePrompt?: string;
+  variants?: Array<{ name: string; description?: string; prompt?: string }>;
+  imageUrl?: string;
+  history?: Array<Record<string, unknown>>;
+  mainImageName?: string;
+  tags?: string[];
 }
 
 interface ExtractedAsset {
@@ -32,6 +43,18 @@ interface ExtractedAsset {
   frequency: number;
   description: string;
   visualHint?: string;
+  assetId?: string;
+  category?: string;
+  role?: string;
+  roleKey?: string;
+  episodes?: string[];
+  prompt?: string;
+  negativePrompt?: string;
+  variants?: Array<{ name: string; description?: string; prompt?: string }>;
+  imageUrl?: string;
+  history?: Array<Record<string, unknown>>;
+  mainImageName?: string;
+  tags?: string[];
 }
 
 interface SplitEpisode {
@@ -82,7 +105,6 @@ export default function ImportPage({
   const locale = useLocale();
   const router = useRouter();
   const t = useTranslations("import");
-  const tc = useTranslations("common");
   const textGuard = useModelGuard("text");
   const getModelConfig = useModelStore((s) => s.getModelConfig);
   const projectTitle = useProjectStore((s) => s.project?.title);
@@ -117,6 +139,7 @@ export default function ImportPage({
   const [characters, setCharacters] = useState<ExtractedCharacter[]>([]);
   const [items, setItems] = useState<ExtractedAsset[]>([]);
   const [environments, setEnvironments] = useState<ExtractedAsset[]>([]);
+  const [voices, setVoices] = useState<ExtractedAsset[]>([]);
   const [relationships, setRelationships] = useState<Array<{ characterA: string; characterB: string; relationType: string; description?: string }>>([]);
 
   // Step 3 result
@@ -152,11 +175,13 @@ export default function ImportPage({
             characters?: ExtractedCharacter[];
             items?: ExtractedAsset[];
             environments?: ExtractedAsset[];
+            voices?: ExtractedAsset[];
             relationships?: Array<{ characterA: string; characterB: string; relationType: string; description?: string }>;
           } | undefined;
           if (assetMeta?.characters) setCharacters(assetMeta.characters);
           if (assetMeta?.items) setItems(assetMeta.items);
           if (assetMeta?.environments) setEnvironments(assetMeta.environments);
+          if (assetMeta?.voices) setVoices(assetMeta.voices);
           if (assetMeta?.relationships) setRelationships(assetMeta.relationships);
 
           const splitLog = data.find((l: LogEntry) => l.step === 4 && l.status === "done" && l.metadata);
@@ -205,6 +230,7 @@ export default function ImportPage({
     setCharacters([]);
     setItems([]);
     setEnvironments([]);
+    setVoices([]);
     setRelationships([]);
     setEpisodes([]);
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
@@ -223,6 +249,7 @@ export default function ImportPage({
     setCharacters([]);
     setItems([]);
     setEnvironments([]);
+    setVoices([]);
     setRelationships([]);
     setEpisodes([]);
     storyReviewedRef.current = false;
@@ -312,6 +339,7 @@ export default function ImportPage({
       setCharacters([]);
       setItems([]);
       setEnvironments([]);
+      setVoices([]);
       setRelationships([]);
       setEpisodes([]);
       setStepStatus((prev) => ({
@@ -535,17 +563,15 @@ export default function ImportPage({
       setStepStatus((prev) => ({ ...prev, 2: "idle", 3: "idle" }));
       return;
     }
-    if (!textGuard()) return;
-
     setCurrentStep(3);
     setStepStatus((prev) => ({ ...prev, 3: "running" }));
-    addLog(3, "running", "开始资产设定：提取角色、关系和主配角...");
+    addLog(3, "running", "开始资产设定：提取角色、物品、场景和音色...");
 
     try {
       const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: fullText, modelConfig: getModelConfig() }),
+        body: JSON.stringify({ text: fullText }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -555,10 +581,11 @@ export default function ImportPage({
       setCharacters(data.characters);
       setItems(data.items || []);
       setEnvironments(data.environments || []);
+      setVoices(data.voices || []);
       setRelationships(data.relationships || []);
       const mainCount = data.characters.filter((c: ExtractedCharacter) => c.scope === "main").length;
       const guestCount = data.characters.length - mainCount;
-      addLog(3, "done", `资产设定完成: ${mainCount} 个主角, ${guestCount} 个配角, ${(data.items || []).length} 个物品, ${(data.environments || []).length} 个环境`);
+      addLog(3, "done", `资产设定完成: ${mainCount} 个主角, ${guestCount} 个配角, ${(data.items || []).length} 个物品, ${(data.environments || []).length} 个环境, ${(data.voices || []).length} 个音色`);
       setStepStatus((prev) => ({ ...prev, 3: "done" }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Extract failed";
@@ -627,6 +654,7 @@ export default function ImportPage({
           characters,
           items,
           environments,
+          voices,
           relationships,
         }),
       });
@@ -635,7 +663,7 @@ export default function ImportPage({
         throw new Error(err.error || `HTTP ${res.status}`);
       }
       const data = await res.json();
-      addLog(5, "done", `导入完成！创建了 ${data.characterCount} 个角色、${data.itemCount || 0} 个物品、${data.environmentCount || 0} 个环境和 ${data.episodes.length} 集`);
+      addLog(5, "done", `导入完成！创建了 ${data.characterCount} 个角色、${data.itemCount || 0} 个物品、${data.environmentCount || 0} 个环境、${data.voiceCount || 0} 个音色和 ${data.episodes.length} 集`);
       setStepStatus((prev) => ({ ...prev, 5: "done" }));
       toast.success(t("complete"));
       setTimeout(() => {
@@ -1059,7 +1087,7 @@ export default function ImportPage({
           </div>
         )}
 
-        {/* Asset setup review (characters, items, environments, voices placeholder) */}
+        {/* Asset setup review */}
         {showCharReview && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
@@ -1101,8 +1129,8 @@ export default function ImportPage({
                 {
                   key: "voices" as const,
                   title: t("assetVoices"),
-                  count: 0,
-                  summary: t("assetVoicesPlaceholder"),
+                  count: voices.length,
+                  summary: t("assetVoicesSummary", { count: voices.length }),
                 },
               ]).map((asset) => (
                 <button
@@ -1116,10 +1144,8 @@ export default function ImportPage({
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-base font-bold text-[--text-primary]">{asset.title}</div>
-                    <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
-                      asset.key === "voices" ? "bg-[--surface] text-[--text-muted]" : "bg-emerald-50 text-emerald-600"
-                    }`}>
-                      {asset.key === "voices" ? t("assetPending") : t("assetConfirmed", { count: asset.count })}
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-600">
+                      {t("assetConfirmed", { count: asset.count })}
                     </span>
                   </div>
                   <div className="mt-3 rounded-lg bg-[--surface] px-3 py-1.5 text-xs text-[--text-muted]">
@@ -1134,7 +1160,7 @@ export default function ImportPage({
                 { key: "characters" as const, label: t("assetCharacters"), count: characters.length },
                 { key: "items" as const, label: t("assetItems"), count: items.length },
                 { key: "environments" as const, label: t("assetEnvironments"), count: environments.length },
-                { key: "voices" as const, label: t("assetVoices"), count: 0 },
+                { key: "voices" as const, label: t("assetVoices"), count: voices.length },
               ]).map((tab) => (
                 <button
                   key={tab.key}
@@ -1151,25 +1177,11 @@ export default function ImportPage({
                       ? "bg-white/20 text-white"
                       : "bg-[--surface] text-[--text-muted]"
                   }`}>
-                    {tab.key === "voices" ? t("assetPending") : tab.count}
+                    {tab.count}
                   </span>
                 </button>
               ))}
             </div>
-
-            {activeAssetTab === "voices" && (
-              <div className="rounded-xl border border-[--border-subtle] bg-white p-5">
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <h4 className="text-sm font-bold text-[--text-primary]">{t("assetVoices")}</h4>
-                    <p className="mt-1 text-sm text-[--text-muted]">{t("assetVoicesSetupHint")}</p>
-                  </div>
-                  <Button variant="outline" className="rounded-xl" disabled>
-                    {t("assetSetup")}
-                  </Button>
-                </div>
-              </div>
-            )}
 
             {activeAssetTab === "characters" && (
               <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
@@ -1227,9 +1239,9 @@ export default function ImportPage({
               </div>
             )}
 
-            {(activeAssetTab === "items" || activeAssetTab === "environments") && (
+            {(activeAssetTab === "items" || activeAssetTab === "environments" || activeAssetTab === "voices") && (
               <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
-                {(activeAssetTab === "items" ? items : environments).map((asset, idx) => (
+                {(activeAssetTab === "items" ? items : activeAssetTab === "environments" ? environments : voices).map((asset, idx) => (
                   <div
                     key={`${asset.name}:${idx}`}
                     className="rounded-[14px] border border-[--border-subtle] bg-white p-3.5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
@@ -1329,6 +1341,7 @@ export default function ImportPage({
           const metaCharacters = meta?.characters as ExtractedCharacter[] | undefined;
           const metaItems = meta?.items as ExtractedAsset[] | undefined;
           const metaEnvironments = meta?.environments as ExtractedAsset[] | undefined;
+          const metaVoices = meta?.voices as ExtractedAsset[] | undefined;
           const metaEpisodes = meta?.episodes as SplitEpisode[] | undefined;
 
           // For step 4, also show characters from step 3
@@ -1347,7 +1360,7 @@ export default function ImportPage({
                       { key: "characters" as const, label: t("assetCharacters"), count: metaCharacters?.length || characters.length },
                       { key: "items" as const, label: t("assetItems"), count: metaItems?.length || items.length },
                       { key: "environments" as const, label: t("assetEnvironments"), count: metaEnvironments?.length || environments.length },
-                      { key: "voices" as const, label: t("assetVoices"), count: 0 },
+                      { key: "voices" as const, label: t("assetVoices"), count: metaVoices?.length || voices.length },
                     ]).map((tab) => (
                       <button
                         key={tab.key}
@@ -1364,25 +1377,11 @@ export default function ImportPage({
                             ? "bg-white/20 text-white"
                             : "bg-[--surface] text-[--text-muted]"
                         }`}>
-                          {tab.key === "voices" ? t("assetPending") : tab.count}
+                          {tab.count}
                         </span>
                       </button>
                     ))}
                   </div>
-
-                  {activeAssetTab === "voices" && (
-                    <div className="rounded-xl border border-[--border-subtle] bg-white p-5">
-                      <div className="flex items-center justify-between gap-4">
-                        <div>
-                          <h4 className="text-sm font-bold text-[--text-primary]">{t("assetVoices")}</h4>
-                          <p className="mt-1 text-sm text-[--text-muted]">{t("assetVoicesSetupHint")}</p>
-                        </div>
-                        <Button variant="outline" className="rounded-xl" disabled>
-                          {t("assetSetup")}
-                        </Button>
-                      </div>
-                    </div>
-                  )}
 
                   {activeAssetTab === "characters" && (
                     <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
@@ -1430,9 +1429,9 @@ export default function ImportPage({
                     </div>
                   )}
 
-                  {(activeAssetTab === "items" || activeAssetTab === "environments") && (
+                  {(activeAssetTab === "items" || activeAssetTab === "environments" || activeAssetTab === "voices") && (
                     <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
-                      {(activeAssetTab === "items" ? (metaItems || items) : (metaEnvironments || environments)).map((asset, idx) => (
+                      {(activeAssetTab === "items" ? (metaItems || items) : activeAssetTab === "environments" ? (metaEnvironments || environments) : (metaVoices || voices)).map((asset, idx) => (
                         <div
                           key={`${asset.name}:${idx}`}
                           className="rounded-[14px] border border-[--border-subtle] bg-white p-3.5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
@@ -1514,14 +1513,14 @@ export default function ImportPage({
               )}
 
               {/* Step 3 metadata: asset setup */}
-              {false && selectedStep === 3 && (metaCharacters || metaItems || metaEnvironments) && (
+              {false && selectedStep === 3 && (metaCharacters || metaItems || metaEnvironments || metaVoices) && (
                 <div className="space-y-3">
                   <div className="flex flex-wrap gap-2 rounded-xl border border-[--border-subtle] bg-white p-1.5">
                     {([
                       { key: "characters" as const, label: t("assetCharacters"), count: metaCharacters?.length || 0 },
                       { key: "items" as const, label: t("assetItems"), count: metaItems?.length || 0 },
                       { key: "environments" as const, label: t("assetEnvironments"), count: metaEnvironments?.length || 0 },
-                      { key: "voices" as const, label: t("assetVoices"), count: 0 },
+                      { key: "voices" as const, label: t("assetVoices"), count: metaVoices?.length || 0 },
                     ]).map((tab) => (
                       <button
                         key={tab.key}
@@ -1538,7 +1537,7 @@ export default function ImportPage({
                             ? "bg-white/20 text-white"
                             : "bg-[--surface] text-[--text-muted]"
                         }`}>
-                          {tab.key === "voices" ? t("assetPending") : tab.count}
+                          {tab.count}
                         </span>
                       </button>
                     ))}
@@ -1590,9 +1589,9 @@ export default function ImportPage({
                     </div>
                   )}
 
-                  {(activeAssetTab === "items" || activeAssetTab === "environments") && (
+                  {(activeAssetTab === "items" || activeAssetTab === "environments" || activeAssetTab === "voices") && (
                     <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
-                      {(activeAssetTab === "items" ? (metaItems || []) : (metaEnvironments || [])).map((asset, idx) => (
+                      {(activeAssetTab === "items" ? (metaItems || []) : activeAssetTab === "environments" ? (metaEnvironments || []) : (metaVoices || [])).map((asset, idx) => (
                         <div
                           key={`${asset.name}:${idx}`}
                           className="rounded-[14px] border border-[--border-subtle] bg-white p-3.5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
@@ -1614,19 +1613,6 @@ export default function ImportPage({
                     </div>
                   )}
 
-                  {activeAssetTab === "voices" && (
-                    <div className="rounded-xl border border-[--border-subtle] bg-white p-5">
-                      <div className="flex items-center justify-between gap-4">
-                        <div>
-                          <h4 className="text-sm font-bold text-[--text-primary]">{t("assetVoices")}</h4>
-                          <p className="mt-1 text-sm text-[--text-muted]">{t("assetVoicesSetupHint")}</p>
-                        </div>
-                        <Button variant="outline" className="rounded-xl" disabled>
-                          {t("assetSetup")}
-                        </Button>
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
               {/* Step 4 metadata: episodes */}

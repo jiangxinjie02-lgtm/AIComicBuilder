@@ -51,6 +51,7 @@ export async function POST(
     characters: CharacterData[];
     items?: AssetData[];
     environments?: AssetData[];
+    voices?: AssetData[];
     relationships?: Array<{
       characterA: string;
       characterB: string;
@@ -61,7 +62,7 @@ export async function POST(
 
   await addImportLog(
     projectId, 5, "running",
-    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境`
+    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境、${body.voices?.length || 0} 个音色`
   );
 
   // 1. Create all characters (main + guest), build name→id map
@@ -159,8 +160,10 @@ export async function POST(
       characterCount: body.characters.length,
       itemCount: body.items?.length || 0,
       environmentCount: body.environments?.length || 0,
+      voiceCount: body.voices?.length || 0,
       items: body.items || [],
       environments: body.environments || [],
+      voices: body.voices || [],
     }
   );
 
@@ -169,6 +172,7 @@ export async function POST(
     characterCount: body.characters.length,
     itemCount: body.items?.length || 0,
     environmentCount: body.environments?.length || 0,
+    voiceCount: body.voices?.length || 0,
   }, { status: 201 });
 }
 
