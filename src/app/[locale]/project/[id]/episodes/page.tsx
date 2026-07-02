@@ -9,7 +9,6 @@ import {
   ChevronDown,
   Download,
   Film,
-  FileText,
   ImageIcon,
   Layers,
   Loader2,
@@ -1764,7 +1763,6 @@ export default function EpisodesPage({
   }
 
   const workflowNavItems = [
-    { label: "文本解析", icon: FileText },
     { label: "剧情审阅", icon: AlertCircle },
     { label: "资产设定", icon: Users },
     { label: "自动分集", icon: Layers },

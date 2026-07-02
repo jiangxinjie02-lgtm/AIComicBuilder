@@ -1106,6 +1106,8 @@ export default function ImportPage({
   }
 
   function goToStep(step: Step) {
+    if (step === 1 && (stepStatus[2] === "done" || currentStep >= 3)) return;
+
     setHistoryMode(false);
     setSelectedStep(null);
     setCurrentStep(step);
@@ -1177,6 +1179,8 @@ export default function ImportPage({
   const showStoryReview = currentStep === 2 && stepStatus[1] === "done" && stepStatus[2] !== "done" && !historyMode;
   const showCharReview = stepStatus[3] === "done" && stepStatus[4] === "idle" && !historyMode;
   const showEpReview = stepStatus[4] === "done" && stepStatus[5] === "idle" && !historyMode;
+  const hideParseStep = stepStatus[2] === "done" || currentStep >= 3;
+  const visibleSteps = hideParseStep ? STEPS.filter(({ num }) => num !== 1) : STEPS;
   const reviewRunning = stepStatus[2] === "running";
   const unappliedIssueCount = reviewIssues.filter((issue) => !issue.applied).length;
   const selectableIssueIndexes = reviewIssues
@@ -1757,7 +1761,7 @@ export default function ImportPage({
           </button>
 
           <div className="flex min-w-[760px] flex-1 gap-2">
-            {STEPS.map(({ num, icon: Icon, label }) => {
+            {visibleSteps.map(({ num, icon: Icon, label }) => {
               const isClickable = stepStatus[num] !== "idle" || currentStep >= num;
               const isSelected = selectedStep === num;
               return (
