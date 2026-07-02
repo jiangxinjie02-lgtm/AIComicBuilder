@@ -8,6 +8,7 @@ import {
   analyzeScriptAssets,
   type AssetAgentAsset,
   type AssetAgentProject,
+  type StoryAssetAnalysis,
 } from "@/lib/asset-agent/analyze-script-assets";
 
 export const maxDuration = 300;
@@ -17,6 +18,7 @@ interface ImportedAsset {
   frequency: number;
   description: string;
   visualHint?: string;
+  confirmed?: boolean;
   assetId?: string;
   category?: string;
   role?: string;
@@ -51,6 +53,7 @@ function mapCharacter(asset: AssetAgentAsset): ImportedCharacter {
     description: asset.description,
     visualHint: toVisualHint(asset),
     scope: isMainRole(asset) ? "main" : "guest",
+    confirmed: asset.confirmed,
     assetId: asset.id,
     category: asset.category,
     role: asset.role,
@@ -73,6 +76,7 @@ function mapAsset(asset: AssetAgentAsset): ImportedAsset {
     frequency: asset.appearances || asset.score || 1,
     description: asset.description,
     visualHint: toVisualHint(asset),
+    confirmed: asset.confirmed,
     assetId: asset.id,
     category: asset.category,
     role: asset.role,
@@ -106,6 +110,7 @@ export async function POST(
 
   const body = (await request.json()) as {
     text?: string;
+    storyAnalysis?: StoryAssetAnalysis | null;
   };
   const text = String(body.text || "").trim();
 
@@ -125,6 +130,7 @@ export async function POST(
     assetProject = analyzeScriptAssets({
       title: project.title,
       script: text,
+      storyAnalysis: body.storyAnalysis || null,
       aspectRatio: "16:9",
       targetSize: "1536x1024",
       style: "真人实拍",

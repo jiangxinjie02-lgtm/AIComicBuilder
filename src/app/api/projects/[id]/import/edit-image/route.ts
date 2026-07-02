@@ -1,0 +1,400 @@
+import { NextResponse } from "next/server";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { db } from "@/lib/db";
+import { projects } from "@/lib/db/schema";
+import { and, eq } from "drizzle-orm";
+import { getUserIdFromRequest } from "@/lib/get-user-id";
+
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
+interface EditImageAsset {
+  id?: string;
+  assetId?: string;
+  name?: string;
+  category?: string;
+}
+
+interface EditImageBody {
+  imageUrl?: string;
+  editPrompt?: string;
+  prompt?: string;
+  negativePrompt?: string;
+  category?: string;
+  size?: string;
+  quality?: string;
+  targetName?: string;
+  targetType?: string;
+  asset?: EditImageAsset;
+}
+
+interface EditImagePayload {
+  model: string;
+  prompt: string;
+  image: string;
+  n: number;
+  size: string;
+  quality: string;
+  output_format: "png";
+  metadata: {
+    assetId: string;
+    assetName: string;
+    targetName: string;
+    targetType: string;
+    category: string;
+    sourceImage: string;
+    projectId: string;
+  };
+}
+
+const generatedDir = path.join(process.cwd(), "public", "generated", "import-assets");
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id: projectId } = await params;
+  const userId = getUserIdFromRequest(request);
+
+  const [project] = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.userId, userId)));
+
+  if (!project) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  const body = (await request.json()) as EditImageBody;
+  const sourceImage = String(body.imageUrl || "").trim();
+  const editPrompt = String(body.editPrompt || "").trim();
+  const basePrompt = String(body.prompt || "").trim();
+  if (!sourceImage) {
+    return NextResponse.json({ error: "Missing source image" }, { status: 400 });
+  }
+  if (!editPrompt) {
+    return NextResponse.json({ error: "Missing edit prompt" }, { status: 400 });
+  }
+
+  const category = String(body.category || body.asset?.category || "");
+  const providerImage = await toProviderImage(sourceImage);
+  const prompt = [
+    basePrompt,
+    "Edit instruction:",
+    editPrompt,
+    "Keep the same identity, facial features, body proportions, composition continuity, and visual style unless the instruction explicitly changes them.",
+  ].filter(Boolean).join("\n\n");
+
+  const payload: EditImagePayload = {
+    model: getEditImageModel(),
+    prompt: mergePromptWithNegative(prompt, body.negativePrompt || defaultNegativePrompt(category)),
+    image: providerImage,
+    n: 1,
+    size: normalizeImageSize(String(body.size || sizeForCategory(category))),
+    quality: String(body.quality || process.env.JIMAPI_IMAGE_QUALITY || "high"),
+    output_format: "png",
+    metadata: {
+      assetId: body.asset?.id || body.asset?.assetId || "",
+      assetName: body.asset?.name || "",
+      targetName: body.targetName || body.asset?.name || "",
+      targetType: body.targetType || "variant-edit",
+      category,
+      sourceImage,
+      projectId,
+    },
+  };
+
+  const result = await callImageEdit(payload);
+  return NextResponse.json(result);
+}
+
+async function callImageEdit(payload: EditImagePayload) {
+  const endpoint = getEditImageEndpoint();
+  const apiKey = getImageApiKey();
+  if (!endpoint || !apiKey) {
+    return {
+      provider: "mock",
+      status: "skipped",
+      imageUrl: makePlaceholderImage(payload),
+      request: payload,
+      message: "Image edit endpoint is not configured; returned a local placeholder.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    Number(process.env.IMAGE_EDIT_TIMEOUT_MS || process.env.IMAGE2_TIMEOUT_MS || 300000),
+  );
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(stripMetadataForProvider(payload)),
+    });
+
+    const text = await response.text();
+    let json: unknown;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text };
+    }
+
+    if (!response.ok) {
+      return {
+        provider: "jimapi:image-edit",
+        status: "error",
+        request: payload,
+        error: getProviderError(json) || `image edit returned HTTP ${response.status}`,
+        raw: sanitizeProviderRaw(json),
+      };
+    }
+
+    const extracted = await extractImageResult(json, payload);
+    return {
+      provider: "jimapi:image-edit",
+      status: "succeeded",
+      request: payload,
+      imageUrl: extracted.imageUrl,
+      savedPath: extracted.savedPath,
+      raw: sanitizeProviderRaw(json),
+    };
+  } catch (error) {
+    return {
+      provider: "jimapi:image-edit",
+      status: "error",
+      request: payload,
+      error: error instanceof Error && error.name === "AbortError"
+        ? `image edit exceeded ${process.env.IMAGE_EDIT_TIMEOUT_MS || process.env.IMAGE2_TIMEOUT_MS || 300000}ms and was aborted.`
+        : error instanceof Error ? error.message : "image edit request failed",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function getEditImageEndpoint() {
+  if (process.env.JIMAPI_IMAGE_EDIT_ENDPOINT) return process.env.JIMAPI_IMAGE_EDIT_ENDPOINT;
+  if (process.env.IMAGE_EDIT_ENDPOINT) return process.env.IMAGE_EDIT_ENDPOINT;
+  const base = (process.env.JIMAPI_BASE_URL || "https://www.jimapi.com/v1").replace(/\/+$/, "");
+  return `${base}/images/edits`;
+}
+
+function getImageApiKey() {
+  return process.env.JIMAPI_API_KEY || process.env.IMAGE_EDIT_API_KEY || process.env.IMAGE2_API_KEY || "";
+}
+
+function getEditImageModel() {
+  return process.env.JIMAPI_IMAGE_EDIT_MODEL || process.env.IMAGE_EDIT_MODEL || process.env.JIMAPI_IMAGE_MODEL || process.env.IMAGE2_MODEL || "gpt-image-2";
+}
+
+function stripMetadataForProvider(payload: EditImagePayload) {
+  const providerPayload = {
+    ...payload,
+    image_url: payload.image,
+    referenceImages: [payload.image],
+  } as Omit<EditImagePayload, "metadata"> & {
+    image_url: string;
+    referenceImages: string[];
+    metadata?: EditImagePayload["metadata"];
+  };
+  delete providerPayload.metadata;
+  return providerPayload;
+}
+
+async function toProviderImage(imageUrl: string) {
+  if (imageUrl.startsWith("data:image/") || /^https?:\/\//i.test(imageUrl)) return imageUrl;
+  const normalized = imageUrl.replace(/\\/g, "/");
+  let localPath = "";
+  if (normalized.startsWith("/generated/")) {
+    localPath = path.join(process.cwd(), "public", normalized);
+  } else if (normalized.startsWith("/api/uploads/")) {
+    localPath = path.join(process.cwd(), "uploads", normalized.replace(/^\/api\/uploads\//, ""));
+  } else if (normalized.includes("/uploads/")) {
+    localPath = normalized.replace(/^.*?uploads\//, path.join(process.cwd(), "uploads", path.sep));
+  } else if (path.isAbsolute(imageUrl)) {
+    localPath = imageUrl;
+  }
+
+  if (!localPath) return imageUrl;
+  const buffer = await fs.readFile(localPath);
+  const mimeType = mimeTypeFor(localPath);
+  return `data:${mimeType};base64,${buffer.toString("base64")}`;
+}
+
+function mimeTypeFor(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".bmp") return "image/bmp";
+  return "image/png";
+}
+
+async function extractImageResult(json: unknown, payload: EditImagePayload) {
+  const directUrl = extractImageUrl(json);
+  if (directUrl) return { imageUrl: directUrl, savedPath: "" };
+
+  const b64 = extractImageBase64(json);
+  if (!b64) return { imageUrl: "", savedPath: "" };
+
+  const cleanB64 = b64.replace(/^data:image\/\w+;base64,/, "");
+  const buffer = Buffer.from(cleanB64, "base64");
+  await fs.mkdir(generatedDir, { recursive: true });
+  const safeAsset = slugify(
+    payload.metadata.assetName || payload.metadata.assetId || payload.metadata.targetName || "asset-edit",
+  );
+  const filename = `${Date.now()}_${safeAsset}_edit.png`;
+  const outputPath = path.join(generatedDir, filename);
+  await fs.writeFile(outputPath, buffer);
+  return {
+    imageUrl: `/generated/import-assets/${filename}`,
+    savedPath: outputPath,
+  };
+}
+
+function extractImageUrl(value: unknown): string {
+  const record = asRecord(value);
+  const candidates = [
+    record.imageUrl,
+    record.image_url,
+    record.url,
+    asRecord(record.output).url,
+    asRecord(record.output).image_url,
+    asRecord(asArray(record.data)[0]).url,
+    asRecord(asArray(record.data)[0]).image_url,
+    asRecord(asArray(record.images)[0]).url,
+    asRecord(asArray(record.output)[0]).url,
+    asRecord(record.result).url,
+  ];
+
+  const url = candidates.find((item): item is string => typeof item === "string" && item.length > 0);
+  if (!url) return "";
+  return url.startsWith("http") || url.startsWith("data:image/") || url.startsWith("/")
+    ? url
+    : "";
+}
+
+function extractImageBase64(value: unknown): string {
+  const record = asRecord(value);
+  const candidates = [
+    record.b64_json,
+    record.image_base64,
+    record.base64,
+    asRecord(asArray(record.data)[0]).b64_json,
+    asRecord(asArray(record.data)[0]).image_base64,
+    asRecord(asArray(record.images)[0]).b64_json,
+    asRecord(asArray(record.images)[0]).base64,
+    asRecord(asArray(record.output)[0]).b64_json,
+    asRecord(asArray(record.output)[0]).image_base64,
+    asRecord(record.result).b64_json,
+    asRecord(record.result).image_base64,
+  ];
+
+  return candidates.find((item): item is string => typeof item === "string" && item.length > 0) || "";
+}
+
+function getProviderError(value: unknown) {
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  const nestedError = record.error;
+  if (typeof nestedError === "string") return nestedError;
+  if (nestedError && typeof nestedError === "object") {
+    const message = (nestedError as Record<string, unknown>).message;
+    if (typeof message === "string") return message;
+  }
+  return typeof record.message === "string" ? record.message : "";
+}
+
+function sanitizeProviderRaw(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  return JSON.parse(JSON.stringify(value, (key, item) => {
+    if (key === "b64_json" || key === "image_base64" || key === "base64" || key === "image") return "[base64 omitted]";
+    if (typeof item === "string" && item.length > 500) {
+      if (/^[A-Za-z0-9+/=]+$/.test(item.slice(0, 80))) return `[base64 omitted: ${item.length} chars]`;
+      return `${item.slice(0, 500)}...`;
+    }
+    return item;
+  }));
+}
+
+function mergePromptWithNegative(prompt: string, negativePrompt: string) {
+  const negative = String(negativePrompt || "").trim();
+  if (!negative) return prompt;
+  return `${prompt}\n\nNegative prompt: ${negative}`;
+}
+
+function normalizeImageSize(size: string) {
+  const supported = new Set(["1024x1024", "1024x1536", "1536x1024", "auto"]);
+  return supported.has(size) ? size : "1536x1024";
+}
+
+function sizeForCategory(category: string) {
+  if (category === "characters") return "1536x1024";
+  if (category === "props") return "1536x1024";
+  if (category === "scenes") return "1536x1024";
+  return "1024x1024";
+}
+
+function defaultNegativePrompt(category: string) {
+  const common = "subtitles, text, logo, watermark, UI, low resolution, deformation, extra limbs, wrong perspective";
+  if (category === "props") return `${common}, people, hands, background environment`;
+  if (category === "scenes") return `${common}, people, silhouettes, pedestrians, unrelated modern objects`;
+  return `${common}, multiple people, duplicate character, distorted face, inconsistent outfit`;
+}
+
+function makePlaceholderImage(payload: EditImagePayload) {
+  const label = payload.metadata.targetName || payload.metadata.assetName || payload.metadata.category || "image edit";
+  const promptPreview = escapeSvg(compactText(payload.prompt, 150));
+  const svg = `
+  <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+    <rect width="1280" height="720" fill="#111827"/>
+    <rect x="72" y="72" width="1136" height="576" rx="22" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.22)"/>
+    <text x="110" y="145" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="42" font-weight="700">Image Edit Placeholder</text>
+    <text x="110" y="205" fill="#93c5fd" font-family="Arial, sans-serif" font-size="30">${escapeSvg(label)}</text>
+    <foreignObject x="110" y="250" width="1040" height="310">
+      <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:Arial,sans-serif;color:#d1d5db;font-size:24px;line-height:1.55;">
+        ${promptPreview}
+      </div>
+    </foreignObject>
+  </svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+function compactText(text: string, maxLength: number) {
+  const cleaned = String(text || "").replace(/\s+/g, " ").trim();
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}...` : cleaned;
+}
+
+function escapeSvg(text: string) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function slugify(value: string) {
+  return String(value || "asset")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "asset";
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}

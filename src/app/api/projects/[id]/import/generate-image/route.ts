@@ -75,7 +75,7 @@ export async function POST(
   const body = (await request.json()) as GenerateImageBody;
   const prompt = String(body.prompt || body.asset?.prompt || "").trim();
   if (!prompt) {
-    return NextResponse.json({ error: "缺少生图提示词" }, { status: 400 });
+    return NextResponse.json({ error: "Missing image prompt" }, { status: 400 });
   }
 
   const category = String(body.category || body.asset?.category || "");
@@ -119,7 +119,7 @@ async function callImage2(payload: ProviderPayload) {
       status: "skipped",
       imageUrl: makePlaceholderImage(payload),
       request: payload,
-      message: "未配置 IMAGE2/JimAPI 生图密钥，已返回本地占位图。",
+      message: "IMAGE2/JimAPI image key is not configured; returned a local placeholder image.",
     };
   }
 
@@ -174,7 +174,7 @@ async function callImage2(payload: ProviderPayload) {
       status: "error",
       request: payload,
       error: error instanceof Error && error.name === "AbortError"
-        ? `image2 生成超过 ${process.env.IMAGE2_TIMEOUT_MS || 300000}ms，已中断。`
+        ? `image2 generation exceeded ${process.env.IMAGE2_TIMEOUT_MS || 300000}ms and was aborted.`
         : message,
     };
   } finally {
@@ -231,7 +231,7 @@ function sanitizeProviderRaw(value: unknown): unknown {
 function mergePromptWithNegative(prompt: string, negativePrompt: string) {
   const negative = String(negativePrompt || "").trim();
   if (!negative) return prompt;
-  return `${prompt}\n\n【禁止项】${negative}`;
+  return `${prompt}\n\nNegative prompt: ${negative}`;
 }
 
 function normalizeImageSize(size: string) {
@@ -320,10 +320,10 @@ function asArray(value: unknown): unknown[] {
 }
 
 function defaultNegativePrompt(category: string) {
-  const common = "字幕, 文字, logo, 水印, UI, 低清晰度, 畸形, 多余肢体, 错误透视";
-  if (category === "props") return `${common}, 人物, 人手, 背景环境, 反光字样`;
-  if (category === "scenes") return `${common}, 人物, 人影, 行人, 现代无关物件`;
-  return `${common}, 多人, 角色重复, 五官变形, 服装不一致`;
+  const common = "subtitles, text, logo, watermark, UI, low resolution, distorted anatomy, extra limbs, wrong perspective";
+  if (category === "props") return `${common}, people, hands, background environment, reflected lettering`;
+  if (category === "scenes") return `${common}, people, silhouettes, pedestrians, unrelated modern objects`;
+  return `${common}, multiple people, duplicate character, distorted facial features, inconsistent costume`;
 }
 
 function makePlaceholderImage(payload: ProviderPayload) {
@@ -340,7 +340,7 @@ function makePlaceholderImage(payload: ProviderPayload) {
     </defs>
     <rect width="1280" height="720" fill="url(#bg)"/>
     <rect x="72" y="72" width="1136" height="576" rx="22" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.22)"/>
-    <text x="110" y="145" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="42" font-weight="700">image2 未配置</text>
+        <text x="110" y="145" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="42" font-weight="700">image2 not configured</text>
     <text x="110" y="205" fill="#93c5fd" font-family="Arial, sans-serif" font-size="30">${escapeSvg(label)}</text>
     <foreignObject x="110" y="250" width="1040" height="310">
       <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:Arial,sans-serif;color:#d1d5db;font-size:24px;line-height:1.55;">

@@ -3,9 +3,27 @@ type AssetCategory = "characters" | "props" | "scenes" | "voices";
 interface AnalyzeScriptAssetsInput {
   title: string;
   script: string;
+  storyAnalysis?: StoryAssetAnalysis | null;
   aspectRatio?: string;
   targetSize?: string;
   style?: string;
+}
+
+export interface StoryMetaAnalysis {
+  time?: string;
+  background?: string;
+  visualStyleBase?: string;
+  genre?: string;
+  locationBackground?: string;
+}
+
+export interface StoryAssetAnalysis {
+  storyMeta?: StoryMetaAnalysis;
+  assets?: {
+    characters?: Array<{ name: string; role?: string; description?: string }>;
+    scenes?: Array<{ name: string; type?: string; description?: string }>;
+    props?: Array<{ name: string; type?: string; description?: string }>;
+  };
 }
 
 interface FaceTemplate {
@@ -58,6 +76,7 @@ export interface AssetAgentProject {
     output: string;
     scriptLength: number;
     lineCount: number;
+    storyMeta?: StoryMetaAnalysis;
     counts: {
       characters: number;
       props: number;
@@ -167,6 +186,39 @@ const BANNED_CHARACTER_NAMES = new Set([
   "警察",
   "士兵",
   "丧尸",
+  "今生",
+  "前世",
+  "初期",
+  "中期",
+  "后期",
+  "前期",
+  "高潮",
+  "开端",
+  "结尾",
+  "背景",
+  "性格",
+  "题材标签",
+  "人物弧光",
+  "角色弧光",
+  "性格反差",
+  "性格与金手指",
+  "高光时刻",
+  "男主角",
+  "女主角",
+  "黄金配角",
+  "渣男前夫",
+  "老板",
+  "老首长",
+  "团长",
+  "民警",
+  "婆婆",
+  "前夫",
+  "丈夫",
+  "妻子",
+  "老婆",
+  "老公",
+  "母亲",
+  "父亲",
 ]);
 
 const PROP_KEYWORDS: Array<{ keyword: string; type: string }> = [
@@ -217,12 +269,17 @@ const PROP_KEYWORDS: Array<{ keyword: string; type: string }> = [
 ];
 
 const SCENE_KEYWORDS: Array<{ keyword: string; type: string }> = [
+  { keyword: "军区一号会议室", type: "办公场景" },
+  { keyword: "军区医院", type: "医疗场景" },
+  { keyword: "医院中医科", type: "医疗场景" },
   { keyword: "医院楼顶", type: "医疗场景" },
   { keyword: "医院", type: "医疗场景" },
   { keyword: "学校", type: "公共建筑" },
   { keyword: "教室", type: "公共建筑" },
   { keyword: "公司", type: "办公场景" },
   { keyword: "办公室", type: "办公场景" },
+  { keyword: "沈家客厅", type: "居住空间" },
+  { keyword: "沈家厨房", type: "居住空间" },
   { keyword: "客厅", type: "居住空间" },
   { keyword: "卧室", type: "居住空间" },
   { keyword: "厨房", type: "居住空间" },
@@ -236,6 +293,7 @@ const SCENE_KEYWORDS: Array<{ keyword: string; type: string }> = [
   { keyword: "楼顶", type: "屋顶空间" },
   { keyword: "走廊", type: "过渡空间" },
   { keyword: "街道", type: "城市外景" },
+  { keyword: "盘山公路", type: "道路" },
   { keyword: "公路", type: "道路" },
   { keyword: "高速服务区", type: "道路" },
   { keyword: "高速", type: "道路" },
@@ -266,12 +324,19 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
   const lines = normalized.split("\n").map((line) => line.trim()).filter(Boolean);
   const episodes = extractEpisodes(normalized);
   const sceneBuckets = collectSceneBuckets(lines);
-  const characterSeeds = collectCharacterSeeds(lines, normalized);
+  const aiCharacterSeeds = buildCharacterSeedsFromAnalysis(input.storyAnalysis);
+  const ruleCharacterSeeds = collectCharacterSeeds(lines, normalized);
+  const characterSeeds = mergeCharacterSeeds(aiCharacterSeeds, ruleCharacterSeeds);
   const characterNames = characterSeeds.map((seed) => seed.name);
-  const propSeeds = collectPropSeeds(lines, normalized, characterNames);
-  const sceneSeeds = collectSceneSeeds(sceneBuckets, lines, normalized, characterNames);
+  const aiPropSeeds = buildPropSeedsFromAnalysis(input.storyAnalysis);
+  const aiSceneSeeds = buildSceneSeedsFromAnalysis(input.storyAnalysis, characterNames);
+  const rulePropSeeds = collectPropSeeds(lines, normalized, characterNames);
+  const ruleSceneSeeds = collectSceneSeeds(sceneBuckets, lines, normalized, characterNames);
+  const propSeeds = mergeNamedSeeds(aiPropSeeds, rulePropSeeds);
+  const sceneSeeds = mergeNamedSeeds(aiSceneSeeds, ruleSceneSeeds);
 
-  const settings = { aspectRatio, targetSize, style };
+  const storyMeta = normalizeStoryMeta(input.storyAnalysis?.storyMeta);
+  const settings = { aspectRatio, targetSize, style, storyMeta };
   const characters = characterSeeds.slice(0, 80).map((seed, index) =>
     makeCharacterAsset(seed, index, normalized, episodes, settings)
   );
@@ -291,7 +356,7 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
     sourceLength: normalized.length,
     createdAt: new Date().toISOString(),
     settings,
-    summary: buildSummary(normalized, characters, props, scenes, voices, episodes),
+    summary: buildSummary(normalized, characters, props, scenes, voices, episodes, storyMeta),
     assets: { characters, props, scenes, voices },
     stages: [
       {
@@ -516,12 +581,126 @@ function collectSceneSeeds(
     .slice(0, 120);
 }
 
+function normalizeStoryMeta(meta?: StoryMetaAnalysis): StoryMetaAnalysis | undefined {
+  if (!meta) return undefined;
+  const normalized: StoryMetaAnalysis = {
+    time: compactText(meta.time || "", 120),
+    background: compactText(meta.background || "", 180),
+    visualStyleBase: compactText(meta.visualStyleBase || "", 220),
+    genre: compactText(meta.genre || "", 80),
+    locationBackground: compactText(meta.locationBackground || "", 120),
+  };
+  return Object.values(normalized).some(Boolean) ? normalized : undefined;
+}
+
+function mergeCharacterSeeds(primary: CharacterSeed[], fallback: CharacterSeed[]) {
+  const merged = new Map<string, CharacterSeed>();
+
+  for (const seed of [...primary, ...fallback]) {
+    const name = cleanCharacterName(seed.name);
+    if (!isProperCharacterAssetName(name)) continue;
+
+    const existing = merged.get(name);
+    if (!existing) {
+      merged.set(name, { ...seed, name, contexts: seed.contexts.slice(0, 10) });
+      continue;
+    }
+
+    existing.score = Math.max(existing.score, seed.score);
+    existing.role = existing.role || seed.role;
+    existing.explicitRole = existing.explicitRole || seed.explicitRole;
+    existing.contexts = [...new Set([...existing.contexts, ...seed.contexts])].slice(0, 12);
+  }
+
+  return [...merged.values()].sort((a, b) => b.score - a.score);
+}
+
+function mergeNamedSeeds(primary: NamedSeed[], fallback: NamedSeed[]) {
+  return dedupeNamedSeeds([...primary, ...fallback]).sort((a, b) => b.score - a.score);
+}
+
+function buildGlobalStoryPrompt(meta?: StoryMetaAnalysis) {
+  if (!meta) return "";
+  const lines = [
+    meta.time ? `故事时间：${meta.time}` : "",
+    meta.background ? `故事背景：${meta.background}` : "",
+    meta.genre ? `题材类型：${meta.genre}` : "",
+    meta.locationBackground ? `主要地域/空间背景：${meta.locationBackground}` : "",
+    meta.visualStyleBase ? `统一视觉基调：${meta.visualStyleBase}` : "",
+  ].filter(Boolean);
+  return lines.length ? ["【全局故事设定】", ...lines, ""].join("\n") : "";
+}
+
+function buildCharacterSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null): CharacterSeed[] {
+  const seen = new Set<string>();
+  return (analysis?.assets?.characters || [])
+    .map((item, index): CharacterSeed | null => {
+      const name = cleanCharacterName(item.name);
+      if (!isProperCharacterAssetName(name) || seen.has(name)) return null;
+      seen.add(name);
+      const role = normalizeRoleFromAnalysis(item.role || "", index);
+      return {
+        name,
+        score: role.includes("主") ? 90 : 50,
+        role,
+        explicitRole: role,
+        contexts: [item.description || item.role || ""].filter(Boolean),
+      };
+    })
+    .filter((item): item is CharacterSeed => item !== null);
+}
+
+function buildPropSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null): NamedSeed[] {
+  const seen = new Set<string>();
+  return (analysis?.assets?.props || [])
+    .map((item): NamedSeed | null => {
+      const name = normalizePropName(item.name);
+      if (!isProperPropAssetName(name) || seen.has(name)) return null;
+      seen.add(name);
+      return {
+        name,
+        score: 70,
+        type: item.type || inferPropType(name),
+        contexts: [item.description || ""].filter(Boolean),
+      };
+    })
+    .filter((item): item is NamedSeed => item !== null);
+}
+
+function buildSceneSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null, characterNames: string[] = []): NamedSeed[] {
+  const seen = new Set<string>();
+  const characterNameSet = new Set(characterNames);
+  return (analysis?.assets?.scenes || [])
+    .map((item): NamedSeed | null => {
+      const name = normalizeSceneAssetCandidate(item.name, characterNameSet);
+      if (!isProperSceneAssetName(name) || seen.has(name)) return null;
+      seen.add(name);
+      return {
+        name,
+        score: 70,
+        type: item.type || inferSceneType(name),
+        contexts: [item.description || ""].filter(Boolean),
+      };
+    })
+    .filter((item): item is NamedSeed => item !== null);
+}
+
+function normalizeRoleFromAnalysis(role: string, index: number) {
+  if (/男主|男一/.test(role)) return "男主角";
+  if (/女主|女一/.test(role)) return "女主角";
+  if (/主角/.test(role)) return "主角";
+  if (/反派/.test(role)) return "反派角色";
+  if (/男配/.test(role)) return "男配角";
+  if (/女配/.test(role)) return "女配角";
+  return index < 2 ? "主角" : "配角";
+}
+
 function makeCharacterAsset(
   seed: CharacterSeed,
   index: number,
   text: string,
   episodes: string[],
-  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">>
+  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & { storyMeta?: StoryMetaAnalysis }
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const joined = snippets.concat(seed.contexts).join(" ");
@@ -540,7 +719,9 @@ function makeCharacterAsset(
         "",
       ]
     : [];
+  const globalStoryPrompt = buildGlobalStoryPrompt(settings.storyMeta);
   const prompt = [
+    globalStoryPrompt,
     "【整体美学】",
     `${settings.style}摄影质感，自然皮肤毛孔与织物纹理，影棚柔光，35mm 胶片质地，统一剧集视觉风格。`,
     "",
@@ -583,12 +764,14 @@ function makePropAsset(
   index: number,
   text: string,
   episodes: string[],
-  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">>
+  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & { storyMeta?: StoryMetaAnalysis }
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
   const description = compactText(seed.contexts.concat(snippets).join(" "), 180);
+  const globalStoryPrompt = buildGlobalStoryPrompt(settings.storyMeta);
   const prompt = [
+    globalStoryPrompt,
     "【整体美学】",
     `${settings.style}摄影质感，真实材质细节，柔和棚拍光，35mm 胶片质地。`,
     "",
@@ -628,13 +811,15 @@ function makeSceneAsset(
   index: number,
   text: string,
   episodes: string[],
-  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">>
+  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & { storyMeta?: StoryMetaAnalysis }
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
   const description = compactText(seed.contexts.concat(snippets).join(" "), 220);
   const times = Array.isArray(seed.times) ? seed.times : [];
+  const globalStoryPrompt = buildGlobalStoryPrompt(settings.storyMeta);
   const prompt = [
+    globalStoryPrompt,
     "【整体美学】",
     `${settings.style}摄影质感，电影级布光，空间纹理真实，冷暖对比克制，35mm 胶片颗粒，Cinematic。`,
     "",
@@ -715,7 +900,8 @@ function buildSummary(
   props: AssetAgentAsset[],
   scenes: AssetAgentAsset[],
   voices: AssetAgentAsset[],
-  episodes: string[]
+  episodes: string[],
+  storyMeta?: StoryMetaAnalysis
 ) {
   const lines = text.split("\n").filter(Boolean);
   return {
@@ -728,6 +914,7 @@ function buildSummary(
       scenes: scenes.length,
       voices: voices.length,
     },
+    storyMeta,
     note: "规则 Agent 已完成第一轮抽取，请在人审后批量调用 image2 生成设定图。",
   };
 }
@@ -829,7 +1016,7 @@ function cleanCharacterName(name: string) {
 function isLikelyCharacterName(name: string) {
   const value = cleanCharacterName(name);
   if (value.length < 2 || value.length > 8) return false;
-  if (BANNED_CHARACTER_NAMES.has(value)) return false;
+  if (looksLikeNonCharacterAssetName(value)) return false;
   if (!/^[\u4e00-\u9fa5A-Za-z0-9·]+$/.test(value)) return false;
   if (looksLikeSceneOrAction(value) || looksLikePropName(value)) return false;
   return true;
@@ -840,6 +1027,18 @@ function isProperCharacterAssetName(name: string) {
   if (!isLikelyCharacterName(value)) return false;
   if (/^(这时|此时|突然|镜头|画面|声音|电话|消息|系统提示|正文|大纲)$/.test(value)) return false;
   return true;
+}
+
+function looksLikeNonCharacterAssetName(name: string) {
+  const value = cleanCharacterName(name);
+  if (!value) return true;
+  if (BANNED_CHARACTER_NAMES.has(value)) return true;
+  if (/^(今生|前世|重生前|重生后|前期|初期|中期|后期|高潮|开端|结尾|尾声|背景|性格|人设|设定|剧情|简介|梗概|主题|主线|支线|卖点|看点|题材标签|核心看点|人物弧光|角色弧光|性格反差|高光时刻)$/.test(value)) return true;
+  if (/(标签|看点|弧光|反差|时刻|阶段|背景|设定|剧情|简介|梗概|主题|主线|支线|卖点|金手指)$/.test(value)) return true;
+  if (/^(男主角?|女主角?|男一|女一|男配|女配|主角|配角|反派|黄金配角|渣男前夫)$/.test(value)) return true;
+  if (/^(老板|老首长|团长|民警|医生|护士|警察|司机|保镖|助理|秘书|律师|老师|学生|记者|军官|士兵|下属|领导|同事)$/.test(value)) return true;
+  if (/^(前夫|前妻|丈夫|妻子|老婆|老公|婆婆|公公|岳父|岳母|父亲|母亲|爸爸|妈妈|爷爷|奶奶|哥哥|姐姐|弟弟|妹妹|孩子|儿子|女儿)$/.test(value)) return true;
+  return false;
 }
 
 function normalizePropName(name: string) {
@@ -860,6 +1059,22 @@ function normalizeSceneName(name: string, characterNameSet = new Set<string>()) 
     if (keyword) return keyword;
   }
   return cleanAssetName(cleaned);
+}
+
+function normalizeSceneAssetCandidate(name: string, characterNameSet = new Set<string>()) {
+  const value = normalizeSceneName(name, characterNameSet);
+  if (!value) return "";
+
+  const exactKeyword = findLongestKeyword(value, SCENE_KEYWORDS.map((item) => item.keyword));
+  if (exactKeyword && exactKeyword === value) return exactKeyword;
+
+  const matchedKeyword = findLongestKeyword(value, SCENE_KEYWORDS.map((item) => item.keyword));
+  if (matchedKeyword && (looksLikePlotEventName(value) || value.length > matchedKeyword.length + 4)) {
+    return matchedKeyword;
+  }
+
+  if (looksLikePlotEventName(value)) return "";
+  return value;
 }
 
 function cleanAssetName(value: string) {
@@ -932,6 +1147,10 @@ function looksLikePropName(name: string) {
   return PROP_KEYWORDS.some((item) => name.includes(item.keyword));
 }
 
+function inferPropType(name: string) {
+  return PROP_KEYWORDS.find((item) => name.includes(item.keyword))?.type || "剧情道具";
+}
+
 function isProperPropAssetName(name: string) {
   const value = cleanAssetName(name);
   if (!value || value.length < 2 || value.length > 12) return false;
@@ -948,6 +1167,10 @@ function isProperSceneAssetName(name: string) {
 
 function inferSceneType(name: string) {
   return SCENE_KEYWORDS.find((item) => name.includes(item.keyword))?.type || "场景空间";
+}
+
+function looksLikePlotEventName(name: string) {
+  return /(抓奸|确诊|怀了|生下|抱住|击打|带婆婆去|想看|发现|赶走|晕倒|死亡|去世|重生|逆袭|抢了|护妻|团灭|复仇|表白|结婚|离婚|争吵|打脸|揭穿|威胁|绑架|逃跑|追车|开会|冲突|反派|男主|女主|老婆|婆婆|孩子|双胞胎|二胎|五感共享|外挂|剧本|剧情|那条街道|门被|把脉)/.test(name);
 }
 
 function looksLikeSceneOrAction(name: string) {

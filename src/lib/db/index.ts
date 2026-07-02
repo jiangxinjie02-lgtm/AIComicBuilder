@@ -120,7 +120,8 @@ function isCurrentSchemaSnapshot(sqlite: SqliteConnection) {
     tableExists(sqlite, "shot_assets") &&
     tableExists(sqlite, "agents") &&
     columnExists(sqlite, "agents", "platform") &&
-    tableExists(sqlite, "agent_bindings")
+    tableExists(sqlite, "agent_bindings") &&
+    tableExists(sqlite, "import_states")
   );
 }
 
@@ -153,6 +154,29 @@ function baselineMigrations(
   })();
 }
 
+export function ensureImportStatesTable() {
+  const sqlite = getSqlite();
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "import_states" (
+      "project_id" text PRIMARY KEY NOT NULL,
+      "current_step" integer DEFAULT 0 NOT NULL,
+      "step_status" text,
+      "full_text" text DEFAULT '',
+      "review_issues" text,
+      "story_analysis" text,
+      "characters" text,
+      "items" text,
+      "environments" text,
+      "voices" text,
+      "relationships" text,
+      "episodes" text,
+      "confirmed_episode_indexes" text,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+}
+
 export function runMigrations() {
   const sqlite = getSqlite();
   const migrationsFolder = path.resolve("drizzle");
@@ -163,12 +187,14 @@ export function runMigrations() {
       "[DB] Existing schema detected without migration history. Baselining migrations...",
     );
     baselineMigrations(sqlite, migrationsFolder);
+    ensureImportStatesTable();
     return;
   }
 
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { migrate } = require("drizzle-orm/better-sqlite3/migrator");
   migrate(createDb(), { migrationsFolder });
+  ensureImportStatesTable();
 }
 
 // Proxy preserves the `db` export API — lazy-inits on first property access

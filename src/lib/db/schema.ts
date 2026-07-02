@@ -242,6 +242,27 @@ export const importLogs = sqliteTable("import_logs", {
     .$defaultFn(() => new Date()),
 });
 
+export const importStates = sqliteTable("import_states", {
+  projectId: text("project_id")
+    .primaryKey()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  currentStep: integer("current_step").notNull().default(0),
+  stepStatus: text("step_status", { mode: "json" }),
+  fullText: text("full_text").default(""),
+  reviewIssues: text("review_issues", { mode: "json" }),
+  storyAnalysis: text("story_analysis", { mode: "json" }),
+  characters: text("characters", { mode: "json" }),
+  items: text("items", { mode: "json" }),
+  environments: text("environments", { mode: "json" }),
+  voices: text("voices", { mode: "json" }),
+  relationships: text("relationships", { mode: "json" }),
+  episodes: text("episodes", { mode: "json" }),
+  confirmedEpisodeIndexes: text("confirmed_episode_indexes", { mode: "json" }),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const promptTemplates = sqliteTable("prompt_templates", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),

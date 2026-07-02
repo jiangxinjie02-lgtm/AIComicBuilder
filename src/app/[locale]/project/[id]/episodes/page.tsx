@@ -1,19 +1,23 @@
 "use client";
 
-import { useEffect, useState, useCallback, use } from "react";
+import { useEffect, useState, use, useMemo, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import {
+  AlertCircle,
+  ArrowLeft,
   Check,
   ChevronDown,
   Download,
-  FileUp,
+  Film,
+  FileText,
+  ImageIcon,
   Layers,
   Loader2,
   Merge,
-  Play,
   Plus,
   Upload,
   Users,
+  VideoIcon,
   X,
 } from "lucide-react";
 import { uploadUrl } from "@/lib/utils/upload-url";
@@ -21,6 +25,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { EpisodeDialog } from "@/components/editor/episode-dialog";
 import { useEpisodeStore, type Episode } from "@/stores/episode-store";
+import { useModelStore, type ModelRef } from "@/stores/model-store";
 import { apiFetch } from "@/lib/api-fetch";
 import Link from "next/link";
 
@@ -38,6 +43,368 @@ function formatEpisodeChipLabel(episode: Episode) {
   return `E${episode.sequence}${title ? ` ${title}` : ""}`;
 }
 
+type ShotAssetType =
+  | "first_frame"
+  | "last_frame"
+  | "reference"
+  | "keyframe_video"
+  | "reference_video";
+
+interface ShotAsset {
+  id: string;
+  type: ShotAssetType;
+  sequenceInType: number;
+  isActive: number;
+  prompt: string;
+  fileUrl: string | null;
+  status: "pending" | "generating" | "completed" | "failed";
+  characters: string[] | null;
+  meta?: { sceneName?: string } | null;
+}
+
+interface EpisodeCharacter {
+  id: string;
+  name: string;
+  description: string;
+  visualHint?: string | null;
+  referenceImage: string | null;
+  scope?: string;
+}
+
+interface EpisodeShot {
+  id: string;
+  sequence: number;
+  prompt: string;
+  videoPrompt: string | null;
+  videoScript: string | null;
+  motionScript: string | null;
+  cameraDirection: string;
+  duration: number;
+  sceneId?: string | null;
+  compositionGuide?: string | null;
+  status: string;
+  dialogues?: Array<{ characterName: string; text: string; sequence: number }>;
+  assets?: ShotAsset[];
+}
+
+interface EpisodeDetail {
+  id: string;
+  episodeId: string;
+  title: string;
+  idea?: string | null;
+  script?: string | null;
+  description?: string | null;
+  keywords?: string | null;
+  generationMode: "keyframe" | "reference";
+  characters: EpisodeCharacter[];
+  shots: EpisodeShot[];
+  versions?: Array<{ id: string; label: string; versionNum: number; createdAt: number }>;
+}
+
+interface StoryboardScene {
+  id: string;
+  name: string;
+  shots: EpisodeShot[];
+}
+
+interface DraftScene {
+  id: string;
+  name: string;
+  prompt: string;
+  environment: string[];
+  props: string[];
+}
+
+type AssetCategory = "characters" | "environments" | "items";
+
+interface LibraryAsset {
+  id: string;
+  name: string;
+  category: AssetCategory;
+  subtitle: string;
+  imageUrl?: string | null;
+  description?: string | null;
+  visualHint?: string | null;
+}
+
+interface ImportAssetLike {
+  name?: string;
+  description?: string;
+  visualHint?: string;
+  assetId?: string;
+  category?: string;
+  role?: string;
+  scope?: string;
+  imageUrl?: string;
+  variants?: Array<{ imageUrl?: string; name?: string }>;
+  faceTemplate?: { url?: string | null } | null;
+}
+
+type SceneAssetSelections = Record<string, Partial<Record<AssetCategory, string[]>>>;
+
+function getActiveAsset(shot: EpisodeShot, type: ShotAssetType, sequenceInType = 0) {
+  return (shot.assets || []).find(
+    (asset) => asset.isActive === 1 && asset.type === type && asset.sequenceInType === sequenceInType
+  );
+}
+
+function getActiveAssets(shot: EpisodeShot, type: ShotAssetType) {
+  return (shot.assets || [])
+    .filter((asset) => asset.isActive === 1 && asset.type === type)
+    .sort((a, b) => a.sequenceInType - b.sequenceInType);
+}
+
+function getShotVideoUrl(shot: EpisodeShot, mode: "keyframe" | "reference") {
+  return getActiveAsset(shot, mode === "reference" ? "reference_video" : "keyframe_video")?.fileUrl || null;
+}
+
+function getSceneReferenceName(shot: EpisodeShot) {
+  const refName = getActiveAssets(shot, "reference").find((asset) => asset.meta?.sceneName)?.meta?.sceneName;
+  if (refName) return refName;
+  const prompt = `${shot.prompt || ""} ${shot.videoScript || ""}`;
+  const match = prompt.match(/(?:场景|地点|环境)[：:]\s*([^，。,.\n]{2,18})/);
+  return match?.[1]?.trim() || `场景 ${shot.sceneId ? shot.sceneId.slice(-4) : Math.ceil(shot.sequence / 3)}`;
+}
+
+function groupShotsByScene(shots: EpisodeShot[]): StoryboardScene[] {
+  const groups = new Map<string, StoryboardScene>();
+  for (const shot of shots) {
+    const sceneName = getSceneReferenceName(shot);
+    const id = shot.sceneId || sceneName || `scene-${Math.ceil(shot.sequence / 3)}`;
+    const existing = groups.get(id);
+    if (existing) {
+      existing.shots.push(shot);
+    } else {
+      groups.set(id, { id, name: sceneName, shots: [shot] });
+    }
+  }
+  return Array.from(groups.values());
+}
+
+function compactText(value: string | null | undefined, max = 180) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function uniqueCharacters(characters: EpisodeCharacter[]) {
+  const seen = new Set<string>();
+  return characters.filter((character) => {
+    const key = character.id || character.name;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueTextItems(items: string[], max = 8) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of items) {
+    const value = item.replace(/[【】\[\]（）()，,。.:：;；]/g, "").trim();
+    if (!value || value.length < 2 || seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+    if (result.length >= max) break;
+  }
+  return result;
+}
+
+function uniqueLibraryAssets(assets: LibraryAsset[]) {
+  const seen = new Set<string>();
+  return assets.filter((asset) => {
+    const key = `${asset.category}:${asset.name}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function assetImageUrl(asset: ImportAssetLike) {
+  return asset.imageUrl || asset.faceTemplate?.url || asset.variants?.find((variant) => variant.imageUrl)?.imageUrl || null;
+}
+
+function importAssetsToLibraryAssets(
+  category: AssetCategory,
+  assets: ImportAssetLike[] | undefined,
+  subtitle: string
+) {
+  return uniqueLibraryAssets(
+    (Array.isArray(assets) ? assets : [])
+      .filter((asset) => asset.name?.trim())
+      .map((asset, index) => ({
+        id: `${category}:${asset.assetId || asset.name}:${index}`,
+        name: asset.name!.trim(),
+        category,
+        subtitle: asset.role || asset.scope || asset.category || subtitle,
+        imageUrl: assetImageUrl(asset),
+        description: asset.description,
+        visualHint: asset.visualHint,
+      }))
+  );
+}
+
+function characterToLibraryAsset(character: EpisodeCharacter): LibraryAsset {
+  return {
+    id: `characters:${character.id || character.name}`,
+    name: character.name,
+    category: "characters",
+    subtitle: character.referenceImage ? (character.scope === "guest" ? "客串角色" : "角色参考") : "待补图",
+    imageUrl: character.referenceImage,
+    description: character.description,
+    visualHint: character.visualHint,
+  };
+}
+
+function virtualAsset(sceneId: string, category: AssetCategory, name: string, subtitle: string): LibraryAsset {
+  return {
+    id: `virtual:${sceneId}:${category}:${name}`,
+    name,
+    category,
+    subtitle,
+  };
+}
+
+function getSceneAssetOptions(
+  scene: DraftScene,
+  category: AssetCategory,
+  pools: Record<AssetCategory, LibraryAsset[]>
+) {
+  if (category === "characters") return pools.characters;
+  if (category === "environments") {
+    const virtuals = (scene.environment.length ? scene.environment : [scene.name]).map((name) =>
+      virtualAsset(scene.id, "environments", name, "场景")
+    );
+    return uniqueLibraryAssets([...pools.environments, ...virtuals]);
+  }
+  const virtuals = scene.props.map((name) => virtualAsset(scene.id, "items", name, "物品"));
+  return uniqueLibraryAssets([...pools.items, ...virtuals]);
+}
+
+function inferDefaultAssetIds(scene: DraftScene, assets: LibraryAsset[], category: AssetCategory) {
+  const text = `${scene.name} ${scene.prompt}`;
+  const matched = assets.filter((asset) => text.includes(asset.name));
+  if (matched.length) return matched.slice(0, 8).map((asset) => asset.id);
+  if (category === "characters") return assets.slice(0, 6).map((asset) => asset.id);
+  if (category === "environments") return assets.slice(0, 3).map((asset) => asset.id);
+  return [];
+}
+
+function getVideoDurationOptions(modelId?: string | null) {
+  const model = (modelId || "").toLowerCase();
+  if (model.includes("minimax")) return [6, 10];
+  if (model.includes("kling") || model.includes("wan")) return [5, 10, 15];
+  if (model.includes("seedance-1-0")) return [5];
+  if (model.includes("veo")) return [8];
+  if (model.includes("vidu")) return [4, 8, 12, 16];
+  return [5, 8, 10, 12];
+}
+
+function getVideoResolutionOptions(modelId?: string | null) {
+  const model = (modelId || "").toLowerCase();
+  if (model.includes("minimax")) return ["768P"];
+  if (model.includes("wan")) return ["720P"];
+  if (model.includes("seedance") || model.includes("kling") || model.includes("vidu")) return ["720p", "1080p"];
+  return ["720p"];
+}
+
+function modelRefKey(ref: ModelRef | null) {
+  return ref ? `${ref.providerId}:${ref.modelId}` : "";
+}
+
+function splitSceneNameParts(name: string) {
+  return uniqueTextItems(
+    name
+      .replace(/^场景\s*\d+\s*[:：-]?/i, "")
+      .split(/[\/|｜、，,]/)
+      .map((part) => part.trim())
+  );
+}
+
+function inferPropsFromText(text: string) {
+  const candidates = [
+    "吉普车",
+    "汽车",
+    "车轮",
+    "轮胎",
+    "雨刷器",
+    "挡风玻璃",
+    "玻璃",
+    "水坑",
+    "泥水",
+    "手机",
+    "伞",
+    "剑",
+    "刀",
+    "门",
+    "窗",
+    "桌",
+    "椅",
+    "信件",
+  ];
+  return uniqueTextItems(candidates.filter((item) => text.includes(item)), 6);
+}
+
+function parseDraftScenes(source: string | null | undefined): DraftScene[] {
+  const text = String(source || "").trim();
+  if (!text) return [];
+
+  const matches = Array.from(text.matchAll(/【\s*(场景\s*\d+\s*[:：][^】]+)\s*】/g));
+  if (matches.length === 0) {
+    return [
+      {
+        id: "draft-scene-1",
+        name: "场景草稿",
+        prompt: compactText(text, 620),
+        environment: [],
+        props: inferPropsFromText(text),
+      },
+    ];
+  }
+
+  return matches.map((match, index) => {
+    const start = (match.index || 0) + match[0].length;
+    const end = matches[index + 1]?.index ?? text.length;
+    const name = match[1].replace(/\s+/g, " ").trim();
+    const prompt = `${match[0]}${text.slice(start, end)}`.trim();
+    return {
+      id: `draft-scene-${index + 1}`,
+      name,
+      prompt: compactText(prompt, 620),
+      environment: splitSceneNameParts(name),
+      props: inferPropsFromText(prompt),
+    };
+  });
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function ReferenceGroup({
+  title,
+  empty,
+  children,
+}: {
+  title: string;
+  empty: string;
+  children: ReactNode;
+}) {
+  const items = Array.isArray(children) ? children.filter(Boolean) : children;
+  const isEmpty = Array.isArray(items) ? items.length === 0 : !items;
+  return (
+    <div className="space-y-2">
+      <div className="text-xs font-semibold text-[--text-secondary]">{title}</div>
+      {isEmpty ? (
+        <div className="rounded-lg border border-dashed border-[--border-subtle] px-3 py-3 text-xs text-[--text-muted]">
+          {empty}
+        </div>
+      ) : (
+        <div className="flex flex-wrap gap-2">{items}</div>
+      )}
+    </div>
+  );
+}
+
 export default function EpisodesPage({
   params,
 }: {
@@ -52,9 +419,10 @@ export default function EpisodesPage({
     loading,
     fetchEpisodes,
     createEpisode,
-    deleteEpisode,
     updateEpisode,
   } = useEpisodeStore();
+  const providers = useModelStore((s) => s.providers);
+  const defaultVideoModel = useModelStore((s) => s.defaultVideoModel);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [editingEpisode, setEditingEpisode] = useState<Episode | null>(null);
@@ -64,10 +432,127 @@ export default function EpisodesPage({
   const [merging, setMerging] = useState(false);
   const [mergedVideoUrl, setMergedVideoUrl] = useState<string | null>(null);
   const [episodeListOpen, setEpisodeListOpen] = useState(true);
+  const [activeEpisodeId, setActiveEpisodeId] = useState<string | null>(null);
+  const [episodeDetail, setEpisodeDetail] = useState<EpisodeDetail | null>(null);
+  const [projectCharacters, setProjectCharacters] = useState<EpisodeCharacter[]>([]);
+  const [importCharacterAssets, setImportCharacterAssets] = useState<LibraryAsset[]>([]);
+  const [environmentAssets, setEnvironmentAssets] = useState<LibraryAsset[]>([]);
+  const [itemAssets, setItemAssets] = useState<LibraryAsset[]>([]);
+  const [sceneAssetSelections, setSceneAssetSelections] = useState<SceneAssetSelections>({});
+  const [assetPicker, setAssetPicker] = useState<{ sceneId: string; category: AssetCategory } | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [expandedSceneIds, setExpandedSceneIds] = useState<Set<string>>(new Set());
+  const [columnFractions, setColumnFractions] = useState({ left: 1, middle: 1.35, right: 1 });
+  const [savingShotId, setSavingShotId] = useState<string | null>(null);
+  const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
+  const [selectedVideoModel, setSelectedVideoModel] = useState<ModelRef | null>(null);
+  const [selectedVideoResolution, setSelectedVideoResolution] = useState("720p");
+  const [selectedVideoDuration, setSelectedVideoDuration] = useState(5);
 
   useEffect(() => {
     fetchEpisodes(projectId);
   }, [projectId, fetchEpisodes]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/projects/${projectId}/characters`)
+      .then((res) => res.json())
+      .then((data: EpisodeCharacter[]) => {
+        if (!cancelled) setProjectCharacters(Array.isArray(data) ? data : []);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error("Project characters load error:", err);
+          setProjectCharacters([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/projects/${projectId}/import/logs`)
+      .then((res) => res.json())
+      .then((logs: Array<{ step: number; status: string; metadata?: unknown }>) => {
+        if (cancelled) return;
+        const assetLog = [...(Array.isArray(logs) ? logs : [])]
+          .reverse()
+          .find((log) => log.step === 3 && log.status === "done" && log.metadata);
+        const metadata = assetLog?.metadata as
+          | {
+              characters?: ImportAssetLike[];
+              environments?: ImportAssetLike[];
+              items?: ImportAssetLike[];
+            }
+          | undefined;
+        setImportCharacterAssets(importAssetsToLibraryAssets("characters", metadata?.characters, "导入角色"));
+        setEnvironmentAssets(importAssetsToLibraryAssets("environments", metadata?.environments, "场景"));
+        setItemAssets(importAssetsToLibraryAssets("items", metadata?.items, "物品"));
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error("Import asset library load error:", err);
+          setImportCharacterAssets([]);
+          setEnvironmentAssets([]);
+          setItemAssets([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (episodes.length === 0) {
+      setActiveEpisodeId(null);
+      setEpisodeDetail(null);
+      return;
+    }
+    if (!activeEpisodeId || !episodes.some((episode) => episode.id === activeEpisodeId)) {
+      setActiveEpisodeId(episodes[0].id);
+    }
+  }, [episodes, activeEpisodeId]);
+
+  useEffect(() => {
+    if (!activeEpisodeId) return;
+    let cancelled = false;
+    setDetailLoading(true);
+    apiFetch(`/api/projects/${projectId}/episodes/${activeEpisodeId}`)
+      .then((res) => res.json())
+      .then((data: EpisodeDetail) => {
+        if (!cancelled) {
+          setEpisodeDetail(data);
+          setPromptDrafts((prev) => {
+            const next = { ...prev };
+            for (const shot of data.shots || []) {
+              if (!(shot.id in next)) {
+                next[shot.id] = shot.videoPrompt || shot.prompt || shot.videoScript || "";
+              }
+            }
+            return next;
+          });
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error("Episode detail load error:", err);
+          toast.error(err instanceof Error ? err.message : "分集详情加载失败");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, activeEpisodeId]);
+
+  useEffect(() => {
+    setExpandedSceneIds(new Set());
+    setPromptDrafts({});
+  }, [activeEpisodeId]);
 
   // Close video modal on Escape
   useEffect(() => {
@@ -89,19 +574,6 @@ export default function EpisodesPage({
     await updateEpisode(projectId, editingEpisode.id, data);
     setEditingEpisode(null);
   }
-
-  async function handleDelete(episode: Episode) {
-    if (episodes.length <= 1) {
-      toast.error(t("cannotDeleteLast"));
-      return;
-    }
-    if (!confirm(t("deleteConfirm"))) return;
-    await deleteEpisode(projectId, episode.id);
-  }
-
-  const handlePlayVideo = useCallback((episode: Episode) => {
-    setPlayingEpisode(episode);
-  }, []);
 
   function toggleSelect(episode: Episode) {
     setSelectedIds((prev) => {
@@ -145,13 +617,36 @@ export default function EpisodesPage({
     }
   }
 
-  function episodeDetailHref(episode: Episode) {
-    return `/${locale}/project/${projectId}/episodes/${episode.id}/script`;
+  async function saveShotPrompt(shot: EpisodeShot) {
+    const nextPrompt = promptDrafts[shot.id] ?? "";
+    setSavingShotId(shot.id);
+    try {
+      await apiFetch(`/api/projects/${projectId}/shots/${shot.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoPrompt: nextPrompt }),
+      });
+      setEpisodeDetail((prev) =>
+        prev
+          ? {
+              ...prev,
+              shots: prev.shots.map((item) =>
+                item.id === shot.id ? { ...item, videoPrompt: nextPrompt } : item
+              ),
+            }
+          : prev
+      );
+      toast.success(`镜头 ${shot.sequence} 提示词已保存`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "保存提示词失败");
+    } finally {
+      setSavingShotId(null);
+    }
   }
 
   function chipClassName(episode: Episode, selected: boolean, selectable: boolean) {
     const base =
-      "inline-flex h-11 max-w-[360px] shrink-0 items-center gap-1.5 rounded-full px-4 text-sm font-semibold transition-all";
+      "inline-flex h-9 max-w-[280px] shrink-0 items-center gap-1.5 rounded-full px-4 text-xs font-semibold transition-all";
     if (selectionMode) {
       if (!selectable) {
         return `${base} cursor-not-allowed bg-black/[0.04] text-[--text-muted] opacity-45`;
@@ -159,6 +654,10 @@ export default function EpisodesPage({
       return selected
         ? `${base} border border-primary/60 bg-primary/10 text-primary shadow-sm`
         : `${base} bg-black/[0.04] text-[--text-secondary] hover:bg-primary/8 hover:text-primary`;
+    }
+
+    if (episode.id === activeEpisodeId) {
+      return `${base} border border-primary/60 bg-primary/10 text-primary shadow-sm`;
     }
 
     return episode.finalVideoUrl
@@ -197,14 +696,607 @@ export default function EpisodesPage({
     }
 
     return (
-      <Link
+      <button
         key={episode.id}
-        href={episodeDetailHref(episode)}
+        type="button"
+        onClick={() => setActiveEpisodeId(episode.id)}
         className={chipClassName(episode, false, selectable)}
         title={label}
       >
         {content}
-      </Link>
+      </button>
+    );
+  }
+
+  function toggleScene(sceneId: string) {
+    setExpandedSceneIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(sceneId)) next.delete(sceneId);
+      else next.add(sceneId);
+      return next;
+    });
+  }
+
+  const activeEpisode = useMemo(
+    () => episodes.find((episode) => episode.id === activeEpisodeId) || episodes[0],
+    [episodes, activeEpisodeId]
+  );
+
+  const storyboardScenes = useMemo(
+    () => groupShotsByScene(episodeDetail?.shots || []),
+    [episodeDetail?.shots]
+  );
+
+  const draftScenes = useMemo(() => {
+    const source =
+      episodeDetail?.script ||
+      episodeDetail?.idea ||
+      episodeDetail?.description ||
+      activeEpisode?.script ||
+      activeEpisode?.idea ||
+      activeEpisode?.description ||
+      "";
+    return parseDraftScenes(source);
+  }, [
+    activeEpisode?.description,
+    activeEpisode?.idea,
+    activeEpisode?.script,
+    episodeDetail?.description,
+    episodeDetail?.idea,
+    episodeDetail?.script,
+  ]);
+
+  const characterAssets = useMemo(() => {
+    const projectAssets = uniqueCharacters([...(episodeDetail?.characters || []), ...projectCharacters]).map(characterToLibraryAsset);
+    return uniqueLibraryAssets([...projectAssets, ...importCharacterAssets]);
+  }, [episodeDetail?.characters, importCharacterAssets, projectCharacters]);
+
+  const assetPools = useMemo<Record<AssetCategory, LibraryAsset[]>>(
+    () => ({
+      characters: characterAssets,
+      environments: environmentAssets,
+      items: itemAssets,
+    }),
+    [characterAssets, environmentAssets, itemAssets]
+  );
+
+  const fallbackDraftScenes = useMemo<DraftScene[]>(
+    () =>
+      draftScenes.length
+        ? draftScenes
+        : [
+            {
+              id: "draft-scene-empty",
+              name: "场景草稿",
+              prompt: "请在这里填写本集第一组分镜的视频提示词。可以包含剧情动作、角色调度、镜头运动、环境氛围和画面风格。",
+              environment: [],
+              props: [],
+            },
+          ],
+    [draftScenes]
+  );
+
+  const videoModelOptions = useMemo(
+    () =>
+      providers
+        .filter((provider) => provider.capability === "video")
+        .flatMap((provider) =>
+          provider.models
+            .filter((model) => model.checked)
+            .map((model) => ({
+              key: `${provider.id}:${model.id}`,
+              providerId: provider.id,
+              providerName: provider.name,
+              protocol: provider.protocol,
+              modelId: model.id,
+              label: model.name || model.id,
+            }))
+        ),
+    [providers]
+  );
+
+  const activeVideoModel = useMemo(
+    () => videoModelOptions.find((option) => option.key === modelRefKey(selectedVideoModel)) || videoModelOptions[0],
+    [selectedVideoModel, videoModelOptions]
+  );
+
+  const videoResolutionOptions = useMemo(
+    () => getVideoResolutionOptions(activeVideoModel?.modelId),
+    [activeVideoModel?.modelId]
+  );
+
+  const videoDurationOptions = useMemo(
+    () => getVideoDurationOptions(activeVideoModel?.modelId),
+    [activeVideoModel?.modelId]
+  );
+
+  useEffect(() => {
+    if (selectedVideoModel && videoModelOptions.some((option) => option.key === modelRefKey(selectedVideoModel))) return;
+    const fallback =
+      (defaultVideoModel &&
+        videoModelOptions.find((option) => option.key === modelRefKey(defaultVideoModel))) ||
+      videoModelOptions[0];
+    setSelectedVideoModel(fallback ? { providerId: fallback.providerId, modelId: fallback.modelId } : null);
+  }, [defaultVideoModel, selectedVideoModel, videoModelOptions]);
+
+  useEffect(() => {
+    if (!videoResolutionOptions.includes(selectedVideoResolution)) {
+      setSelectedVideoResolution(videoResolutionOptions[0] || "720p");
+    }
+  }, [selectedVideoResolution, videoResolutionOptions]);
+
+  useEffect(() => {
+    if (!videoDurationOptions.includes(selectedVideoDuration)) {
+      setSelectedVideoDuration(videoDurationOptions[0] || 5);
+    }
+  }, [selectedVideoDuration, videoDurationOptions]);
+
+  useEffect(() => {
+    setSceneAssetSelections((prev) => {
+      let changed = false;
+      const next: SceneAssetSelections = { ...prev };
+      for (const scene of fallbackDraftScenes) {
+        const characterOptions = getSceneAssetOptions(scene, "characters", assetPools);
+        const environmentOptions = getSceneAssetOptions(scene, "environments", assetPools);
+        const itemOptions = getSceneAssetOptions(scene, "items", assetPools);
+        const current = next[scene.id] || {};
+        const defaults = {
+          characters: inferDefaultAssetIds(scene, characterOptions, "characters"),
+          environments: inferDefaultAssetIds(scene, environmentOptions, "environments"),
+          items: inferDefaultAssetIds(scene, itemOptions, "items"),
+        };
+        const patched = { ...current };
+        let sceneChanged = false;
+        (["characters", "environments", "items"] as AssetCategory[]).forEach((category) => {
+          if (patched[category] === undefined && defaults[category].length > 0) {
+            patched[category] = defaults[category];
+            sceneChanged = true;
+          }
+        });
+        if (sceneChanged) {
+          next[scene.id] = patched;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [assetPools, fallbackDraftScenes]);
+
+  const generationMode = episodeDetail?.generationMode || "keyframe";
+  const totalShots = episodeDetail?.shots.length || 0;
+  const visibleSceneCount = storyboardScenes.length || draftScenes.length;
+  const shotsWithVideos =
+    episodeDetail?.shots.filter((shot) => getShotVideoUrl(shot, generationMode)).length || 0;
+
+  function startColumnResize(side: "left" | "right", event: ReactPointerEvent<HTMLButtonElement>) {
+    const startX = event.clientX;
+    const start = { ...columnFractions };
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    function handleMove(moveEvent: PointerEvent) {
+      const delta = (moveEvent.clientX - startX) / 180;
+      if (side === "left") {
+        setColumnFractions({
+          left: clamp(start.left + delta, 0.65, 2.1),
+          middle: clamp(start.middle - delta, 0.85, 2.4),
+          right: start.right,
+        });
+      } else {
+        setColumnFractions({
+          left: start.left,
+          middle: clamp(start.middle + delta, 0.85, 2.4),
+          right: clamp(start.right - delta, 0.65, 2.1),
+        });
+      }
+    }
+
+    function handleUp() {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    }
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp, { once: true });
+  }
+
+  function charactersForScene(scene: StoryboardScene) {
+    if (!episodeDetail) return [];
+    const availableCharacters = uniqueCharacters([...episodeDetail.characters, ...projectCharacters]);
+    const names = new Set<string>();
+    for (const shot of scene.shots) {
+      shot.dialogues?.forEach((dialogue) => names.add(dialogue.characterName));
+      (shot.assets || []).forEach((asset) => asset.characters?.forEach((name) => names.add(name)));
+      availableCharacters.forEach((character) => {
+        const text = `${shot.prompt || ""} ${shot.videoScript || ""} ${shot.videoPrompt || ""}`;
+        if (text.includes(character.name)) names.add(character.name);
+      });
+    }
+    const matched = availableCharacters.filter((character) => names.has(character.name));
+    return matched.length ? matched : availableCharacters.slice(0, 6);
+  }
+
+  function referenceAssetsForScene(scene: StoryboardScene) {
+    const activeRefs = scene.shots.flatMap((shot) =>
+      getActiveAssets(shot, "reference").map((asset) => ({ asset, shot }))
+    );
+    const environment = activeRefs.filter(({ asset }) => asset.meta?.sceneName || asset.fileUrl);
+    const props = activeRefs.filter(({ asset }) => !asset.meta?.sceneName && (!asset.characters || asset.characters.length === 0));
+    return {
+      environment: environment.length ? environment : activeRefs.slice(0, 3),
+      props: props.slice(0, 6),
+    };
+  }
+
+  function renderAssetThumb(label: string, subtitle: string, src?: string | null) {
+    return (
+      <div className="inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-[--border-subtle] bg-white px-2 py-1 shadow-sm">
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-full bg-[--surface] text-[10px] font-bold text-primary">
+          {src ? (
+            <img src={uploadUrl(src)} alt={label} className="h-full w-full object-cover" />
+          ) : (
+            label.slice(0, 2)
+          )}
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-xs font-semibold leading-tight text-[--text-primary]">{label}</div>
+          <div className="truncate text-[10px] leading-tight text-[--text-muted]">{subtitle}</div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderReferenceColumn(scene: StoryboardScene) {
+    const sceneRefs = referenceAssetsForScene(scene);
+    const characters = charactersForScene(scene);
+    const sortedCharacters = [...characters].sort((a, b) => Number(Boolean(b.referenceImage)) - Number(Boolean(a.referenceImage)));
+    return (
+      <div className="space-y-3">
+        <ReferenceGroup title="角色" empty="暂无角色素材">
+          {sortedCharacters.map((character) => (
+            <Link
+              key={character.id}
+              href={`/${locale}/project/${projectId}/characters`}
+              title={character.name}
+            >
+              {renderAssetThumb(
+                character.name,
+                character.referenceImage
+                  ? character.scope === "guest" ? "客串角色参考" : "主要角色参考"
+                  : "资产库待补图",
+                character.referenceImage
+              )}
+            </Link>
+          ))}
+        </ReferenceGroup>
+        <ReferenceGroup title="环境" empty="暂无环境素材">
+          {sceneRefs.environment.map(({ asset, shot }) => (
+            <div key={asset.id}>
+              {renderAssetThumb(asset.meta?.sceneName || getSceneReferenceName(shot), `镜头 ${shot.sequence}`, asset.fileUrl)}
+            </div>
+          ))}
+        </ReferenceGroup>
+        <ReferenceGroup title="物品" empty="暂无物品素材">
+          {sceneRefs.props.map(({ asset, shot }) => (
+            <div key={asset.id}>
+              {renderAssetThumb(asset.prompt ? compactText(asset.prompt, 16) : `参考 ${asset.sequenceInType + 1}`, `镜头 ${shot.sequence}`, asset.fileUrl)}
+            </div>
+          ))}
+        </ReferenceGroup>
+      </div>
+    );
+  }
+
+  function renderPromptColumn(scene: StoryboardScene) {
+    return (
+      <div className="space-y-3">
+        {scene.shots.map((shot) => {
+          const draft = promptDrafts[shot.id] ?? shot.videoPrompt ?? shot.prompt ?? shot.videoScript ?? "";
+          const original = shot.videoPrompt || shot.prompt || shot.videoScript || "";
+          const dirty = draft !== original;
+          return (
+            <div key={shot.id} className="rounded-2xl border-2 border-black bg-[#d2d2d0] p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="font-mono text-xs font-bold text-black">镜头 {shot.sequence}</div>
+                <div className="flex items-center gap-2">
+                  <span className="rounded bg-black/70 px-2 py-0.5 text-[10px] text-white">{shot.duration || 0}s</span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={dirty ? "default" : "outline"}
+                    disabled={savingShotId === shot.id || !dirty}
+                    onClick={() => saveShotPrompt(shot)}
+                    className="h-7 rounded-full px-3 text-[11px]"
+                  >
+                    {savingShotId === shot.id && <Loader2 className="h-3 w-3 animate-spin" />}
+                    保存
+                  </Button>
+                </div>
+              </div>
+              <textarea
+                value={draft}
+                onChange={(event) =>
+                  setPromptDrafts((prev) => ({ ...prev, [shot.id]: event.target.value }))
+                }
+                placeholder="这里编辑该镜头的视频提示词，可根据剧情、动作和镜头要求人工微调。"
+                className="min-h-[128px] w-full resize-y rounded-xl border border-black/30 bg-white/70 p-3 font-mono text-xs leading-relaxed text-black outline-none focus:border-primary"
+              />
+              <div className="mt-2 grid gap-1 text-[10px] text-black/60">
+                {shot.videoScript && <div className="line-clamp-2">视频脚本：{shot.videoScript}</div>}
+                {shot.motionScript && <div className="line-clamp-2">动作：{shot.motionScript}</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderResizeHandle(side: "left" | "right", label: string) {
+    return (
+      <button
+        type="button"
+        aria-label={label}
+        onPointerDown={(event) => startColumnResize(side, event)}
+        className="group hidden cursor-col-resize items-stretch justify-center bg-transparent px-0 xl:flex"
+      >
+        <span className="w-px bg-black/20 transition-colors group-hover:bg-primary/60" />
+      </button>
+    );
+  }
+
+  function renderVideoSettingsBar(sceneDuration?: number) {
+    const durationOptions =
+      sceneDuration && !videoDurationOptions.includes(sceneDuration)
+        ? [...videoDurationOptions, sceneDuration].sort((a, b) => a - b)
+        : videoDurationOptions;
+    return (
+      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-black/80 p-2 text-[10px] text-white">
+        <label className="flex items-center gap-1.5">
+          <span className="font-semibold">模型</span>
+          <select
+            value={modelRefKey(selectedVideoModel)}
+            onChange={(event) => {
+              const option = videoModelOptions.find((item) => item.key === event.target.value);
+              setSelectedVideoModel(option ? { providerId: option.providerId, modelId: option.modelId } : null);
+            }}
+            className="h-7 max-w-[180px] rounded-md border border-white/20 bg-white px-2 text-xs font-semibold text-black outline-none"
+          >
+            {videoModelOptions.length === 0 ? (
+              <option value="">未配置视频模型</option>
+            ) : (
+              videoModelOptions.map((option) => (
+                <option key={option.key} value={option.key}>
+                  {option.label}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        <label className="flex items-center gap-1.5">
+          <span className="font-semibold">分辨率</span>
+          <select
+            value={selectedVideoResolution}
+            onChange={(event) => setSelectedVideoResolution(event.target.value)}
+            className="h-7 rounded-md border border-white/20 bg-white px-2 text-xs font-semibold text-black outline-none"
+          >
+            {videoResolutionOptions.map((resolution) => (
+              <option key={resolution} value={resolution}>
+                {resolution}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-1.5">
+          <span className="font-semibold">时长</span>
+          <select
+            value={sceneDuration || selectedVideoDuration}
+            onChange={(event) => setSelectedVideoDuration(Number(event.target.value))}
+            className="h-7 rounded-md border border-white/20 bg-white px-2 text-xs font-semibold text-black outline-none"
+          >
+            {durationOptions.map((duration) => (
+              <option key={duration} value={duration}>
+                {duration}s
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    );
+  }
+
+  function renderTextChip(label: string, subtitle: string) {
+    return (
+      <span className="inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-[--border-subtle] bg-white px-2.5 py-1 text-xs font-semibold text-[--text-primary] shadow-sm">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary/60" />
+        <span className="truncate">{label}</span>
+        <span className="shrink-0 text-[10px] font-normal text-[--text-muted]">{subtitle}</span>
+      </span>
+    );
+  }
+
+  function toggleSceneAsset(sceneId: string, category: AssetCategory, assetId: string, defaultIds: string[]) {
+    setSceneAssetSelections((prev) => {
+      const current = prev[sceneId]?.[category] ?? defaultIds;
+      const selected = current.includes(assetId);
+      return {
+        ...prev,
+        [sceneId]: {
+          ...prev[sceneId],
+          [category]: selected ? current.filter((id) => id !== assetId) : [...current, assetId],
+        },
+      };
+    });
+  }
+
+  function selectedAssetsForScene(scene: DraftScene, category: AssetCategory) {
+    const options = getSceneAssetOptions(scene, category, assetPools);
+    const selectedIds = sceneAssetSelections[scene.id]?.[category];
+    const defaultIds = selectedIds ?? inferDefaultAssetIds(scene, options, category);
+    const byId = new Map(options.map((asset) => [asset.id, asset]));
+    return defaultIds.map((id) => byId.get(id)).filter(Boolean) as LibraryAsset[];
+  }
+
+  function renderAssetPicker(scene: DraftScene, category: AssetCategory, options: LibraryAsset[]) {
+    const open = assetPicker?.sceneId === scene.id && assetPicker.category === category;
+    if (!open) return null;
+    const defaultIds = inferDefaultAssetIds(scene, options, category);
+    const selected = new Set(sceneAssetSelections[scene.id]?.[category] ?? defaultIds);
+    return (
+      <div className="rounded-xl border border-black/10 bg-white p-2 shadow-sm">
+        {options.length === 0 ? (
+          <div className="px-2 py-3 text-xs text-[--text-muted]">素材库暂无可选素材</div>
+        ) : (
+          <div className="max-h-52 space-y-1 overflow-y-auto pr-1">
+            {options.map((asset) => {
+              const checked = selected.has(asset.id);
+              return (
+                <button
+                  key={asset.id}
+                  type="button"
+                  onClick={() => toggleSceneAsset(scene.id, category, asset.id, defaultIds)}
+                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition ${
+                    checked ? "bg-primary/10 text-primary" : "hover:bg-black/[0.04]"
+                  }`}
+                  title={asset.description || asset.visualHint || asset.name}
+                >
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-full bg-[--surface] text-[10px] font-bold">
+                    {asset.imageUrl ? (
+                      <img src={uploadUrl(asset.imageUrl)} alt={asset.name} className="h-full w-full object-cover" />
+                    ) : (
+                      asset.name.slice(0, 2)
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-semibold">{asset.name}</span>
+                    <span className="block truncate text-[10px] text-[--text-muted]">{asset.subtitle}</span>
+                  </span>
+                  {checked && <Check className="h-3.5 w-3.5 shrink-0" />}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function renderEditableReferenceGroup(
+    scene: DraftScene,
+    category: AssetCategory,
+    title: string,
+    empty: string
+  ) {
+    const options = getSceneAssetOptions(scene, category, assetPools);
+    const selectedAssets = selectedAssetsForScene(scene, category);
+    const pickerOpen = assetPicker?.sceneId === scene.id && assetPicker.category === category;
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-xs font-semibold text-[--text-secondary]">{title}</div>
+          <button
+            type="button"
+            onClick={() =>
+              setAssetPicker((prev) =>
+                prev?.sceneId === scene.id && prev.category === category ? null : { sceneId: scene.id, category }
+              )
+            }
+            className="inline-flex h-6 items-center gap-1 rounded-full border border-black/10 bg-white px-2 text-[10px] font-semibold text-[--text-secondary] hover:border-primary/40 hover:text-primary"
+          >
+            <Plus className="h-3 w-3" />
+            编辑
+          </button>
+        </div>
+        {selectedAssets.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-[--border-subtle] px-3 py-3 text-xs text-[--text-muted]">
+            {empty}
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {selectedAssets.map((asset) =>
+              asset.imageUrl || category === "characters" ? (
+                <button
+                  key={asset.id}
+                  type="button"
+                  onClick={() => setAssetPicker({ sceneId: scene.id, category })}
+                  title={asset.description || asset.visualHint || asset.name}
+                  className="text-left"
+                >
+                  {renderAssetThumb(asset.name, asset.subtitle, asset.imageUrl)}
+                </button>
+              ) : (
+                <button
+                  key={asset.id}
+                  type="button"
+                  onClick={() => setAssetPicker({ sceneId: scene.id, category })}
+                  title={asset.description || asset.visualHint || asset.name}
+                  className="text-left"
+                >
+                  {renderTextChip(asset.name, asset.subtitle)}
+                </button>
+              )
+            )}
+          </div>
+        )}
+        {pickerOpen && renderAssetPicker(scene, category, options)}
+      </div>
+    );
+  }
+
+  function renderDraftReferenceColumn(scene: DraftScene) {
+    return (
+      <div className="space-y-4">
+        {renderEditableReferenceGroup(scene, "characters", "角色", "资产库暂无角色图片")}
+        {renderEditableReferenceGroup(scene, "environments", "环境", "暂无场景参考图")}
+        {renderEditableReferenceGroup(scene, "items", "物品", "暂无物品参考图")}
+        <Link
+          href={`/${locale}/project/${projectId}/characters`}
+          className="inline-flex text-[11px] font-semibold text-primary hover:underline"
+        >
+          去资产库补图
+        </Link>
+      </div>
+    );
+  }
+
+  function renderDraftSceneCard(scene: DraftScene, sceneIndex: number) {
+    return (
+      <article key={scene.id} className="overflow-hidden rounded-xl bg-[#e8e8e6] p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="truncate text-2xl font-bold text-[--text-primary]">
+              S{String(sceneIndex + 1).padStart(2, "0")} - {scene.name}
+            </h3>
+            <p className="mt-1 text-xs text-[--text-muted]">脚本场景草稿 · 等待拆成正式镜头</p>
+          </div>
+        </div>
+        <div
+          className="grid min-h-[300px] grid-cols-1 gap-3 xl:grid-cols-[var(--storyboard-cols)]"
+          style={{
+            ["--storyboard-cols" as string]: `${columnFractions.left}fr 8px ${columnFractions.middle}fr 8px ${columnFractions.right}fr`,
+          }}
+        >
+          <section className="min-w-0 bg-[#d2d2d0] p-4">
+            <h4 className="mb-4 text-center text-2xl font-bold text-black">参考素材位置</h4>
+            {renderDraftReferenceColumn(scene)}
+          </section>
+          {renderResizeHandle("left", "拖动调整参考素材和提示词宽度")}
+          <section className="min-w-0 bg-[#d2d2d0] p-4">
+            <h4 className="mb-4 text-center text-2xl font-bold text-black">提示词位置</h4>
+            <textarea
+              defaultValue={scene.prompt}
+              className="mx-auto min-h-[160px] w-full max-w-[88%] resize-y rounded-2xl border-2 border-black bg-white/70 p-4 text-xs leading-relaxed text-black outline-none"
+            />
+            {renderVideoSettingsBar()}
+          </section>
+          {renderResizeHandle("right", "拖动调整提示词和视频宽度")}
+          <section className="min-w-0 bg-[#d2d2d0] p-4">
+            <h4 className="mb-4 text-center text-2xl font-bold text-black">视频生成位置</h4>
+            <div className="flex min-h-[200px] items-center justify-center text-sm font-semibold text-black/50">
+              等待生成视频
+            </div>
+          </section>
+        </div>
+      </article>
     );
   }
 
@@ -219,57 +1311,48 @@ export default function EpisodesPage({
     );
   }
 
+  const workflowNavItems = [
+    { label: "文本解析", icon: FileText },
+    { label: "剧情审阅", icon: AlertCircle },
+    { label: "资产设定", icon: Users },
+    { label: "自动分集", icon: Layers },
+    { label: "创建分集", icon: Plus },
+  ];
+
   return (
-    <div className="flex-1 overflow-y-auto bg-[--surface] p-6 pb-24 lg:pb-6">
-      {/* Header */}
-      <div className="mb-6 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/8">
-            <Layers className="h-5 w-5 text-primary" />
-          </div>
-          <div>
-            <h2 className="font-display text-xl font-bold tracking-tight text-[--text-primary]">
-              {t("title")}
-            </h2>
-            <p className="text-xs text-[--text-muted]">
-              {episodes.length} {t("count")}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
+    <div className="flex-1 overflow-y-auto bg-white pb-24 lg:pb-6">
+      <div className="shrink-0 border-b border-[--border-subtle] bg-white px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
           <Link
-            href={`/${locale}/project/${projectId}/import`}
-            className="inline-flex items-center gap-1.5 rounded-[10px] border border-[--border-subtle] bg-white px-3.5 py-2 text-sm font-medium text-[--text-secondary] shadow-sm transition-all hover:border-primary/20 hover:text-primary"
+            href={`/${locale}`}
+            className="flex h-10 w-[180px] shrink-0 items-center gap-2 rounded-lg px-2 text-sm font-semibold text-[--text-primary] transition-colors hover:bg-[--surface] hover:text-primary md:w-[220px]"
+            title={t("title")}
           >
-            <FileUp className="h-4 w-4" />
-            {t("importRecord")}
+            <ArrowLeft className="h-4 w-4" />
+            <span className="truncate">返回项目</span>
           </Link>
-          <Link
-            href={`/${locale}/project/${projectId}/characters`}
-            className="inline-flex items-center gap-1.5 rounded-[10px] border border-[--border-subtle] bg-white px-3.5 py-2 text-sm font-medium text-[--text-secondary] shadow-sm transition-all hover:border-primary/20 hover:text-primary"
-          >
-            <Users className="h-4 w-4" />
-            {t("characters")}
-          </Link>
-          <Button
-            variant="outline"
-            onClick={() => {
-              if (selectionMode) {
-                exitSelectionMode();
-              } else {
-                setSelectionMode(true);
-              }
-            }}
-            className="rounded-[10px]"
-            disabled={episodes.filter((e) => e.finalVideoUrl).length < 2}
-          >
-            <Merge className="mr-1.5 h-4 w-4" />
-            {selectionMode ? t("mergeCancel") : t("mergeVideos")}
-          </Button>
-          <Button onClick={() => setCreateOpen(true)} className="rounded-[10px]">
-            <Plus className="mr-1.5 h-4 w-4" />
-            {t("create")}
-          </Button>
+
+          <div className="flex min-w-[760px] flex-1 gap-2">
+            {workflowNavItems.map(({ label, icon: Icon }) => (
+              <Link
+                key={label}
+                href={`/${locale}/project/${projectId}/import`}
+                className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent bg-[--surface] px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:bg-primary/5 hover:text-primary"
+              >
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white">
+                  <Icon className="h-4 w-4" />
+                </div>
+                <span className="truncate text-xs font-medium xl:text-sm">{label}</span>
+              </Link>
+            ))}
+            <span className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-primary/40 bg-primary/10 px-2.5 text-left text-primary shadow-sm">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-primary">
+                <Layers className="h-4 w-4" />
+              </div>
+              <span className="truncate text-xs font-semibold xl:text-sm">分集管理</span>
+              <div className="absolute inset-x-3 bottom-0 h-[3px] rounded-t-full bg-primary" />
+            </span>
+          </div>
         </div>
       </div>
 
@@ -299,18 +1382,24 @@ export default function EpisodesPage({
           </div>
         </div>
       ) : (
-        <div className="space-y-3">
-          <section className="rounded-lg border border-[--border-subtle] bg-white px-4 py-4">
+        <div className="space-y-2">
+          <section
+            className={`relative z-20 bg-white pb-3 transition-all ${
+              episodeListOpen
+                ? "rounded-2xl px-3 pt-3 shadow-[0_12px_34px_rgba(15,23,42,0.12)] ring-1 ring-black/5"
+                : ""
+            }`}
+          >
             <div className="flex items-start gap-3">
-              <span className="mt-3 shrink-0 text-sm font-semibold text-[--text-secondary]">
+              <span className="mt-2 shrink-0 text-xl font-bold text-black">
                 分集:
               </span>
               <div className="relative min-w-0 flex-1">
                 <div
                   className={`flex gap-2.5 ${
                     episodeListOpen
-                      ? "max-h-[420px] flex-wrap overflow-y-auto pr-1"
-                      : "h-11 flex-nowrap overflow-hidden"
+                      ? "max-h-[120px] flex-wrap overflow-y-auto pr-1"
+                      : "h-9 flex-nowrap overflow-hidden"
                   }`}
                 >
                   {episodes.map((episode) => renderEpisodeChip(episode))}
@@ -322,24 +1411,189 @@ export default function EpisodesPage({
               <Button
                 variant="outline"
                 onClick={() => setEpisodeListOpen((open) => !open)}
-                className="h-11 shrink-0 rounded-full border-primary/30 px-4 text-primary hover:border-primary/50 hover:bg-primary/8"
+                className="h-9 shrink-0 rounded-full border-black/40 px-4 text-xs font-semibold text-black hover:border-primary/50 hover:bg-primary/8"
               >
                 {episodeListOpen ? "收起" : `展开全部 ${episodes.length} 集`}
                 <ChevronDown
                   className={`h-4 w-4 transition-transform ${episodeListOpen ? "rotate-180" : ""}`}
                 />
               </Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  if (selectionMode) exitSelectionMode();
+                  else setSelectionMode(true);
+                }}
+                className="h-9 shrink-0 rounded-full border-black/40 px-4 text-xs font-semibold text-black hover:border-primary/50 hover:bg-primary/8"
+                disabled={episodes.filter((e) => e.finalVideoUrl).length < 2}
+              >
+                <Merge className="mr-1.5 h-3.5 w-3.5" />
+                {selectionMode ? t("mergeCancel") : t("mergeVideos")}
+              </Button>
+              <Button onClick={() => setCreateOpen(true)} className="h-9 shrink-0 rounded-full px-4 text-xs">
+                <Plus className="mr-1.5 h-3.5 w-3.5" />
+                {t("create")}
+              </Button>
             </div>
           </section>
 
           {!selectionMode && (
-            <button
-              onClick={() => setCreateOpen(true)}
-              className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-[--border-subtle] bg-white px-4 py-4 text-sm font-medium text-[--text-muted] transition-all hover:border-primary hover:bg-primary/[0.02] hover:text-primary"
-            >
-              <Plus className="h-4 w-4" />
-              {t("create")}
-            </button>
+            <section className="overflow-hidden bg-white">
+              <div className="flex flex-wrap items-center justify-between gap-3 px-1 py-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <Film className="h-4 w-4 text-primary" />
+                    <h3 className="truncate text-sm font-semibold text-[--text-primary]">
+                      {activeEpisode ? formatEpisodeChipLabel(activeEpisode) : "分镜工作台"}
+                    </h3>
+                    {detailLoading && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
+                  </div>
+                  <p className="mt-1 text-xs text-[--text-muted]">
+                    {episodeDetail
+                      ? `${visibleSceneCount} 个场景 · ${episodeDetail.shots.length} 个镜头 · ${episodeDetail.characters.length || projectCharacters.length} 个角色参考`
+                      : "选择上方分集后查看该集分镜"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="rounded-full bg-black/[0.04] px-3 py-1 text-xs font-semibold text-[--text-muted]">
+                    已生成视频 {shotsWithVideos}/{totalShots}
+                  </span>
+                </div>
+              </div>
+
+              {detailLoading ? (
+                <div className="flex min-h-[360px] items-center justify-center">
+                  <div className="flex flex-col items-center gap-3 text-sm text-[--text-muted]">
+                    <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                    加载分镜中...
+                  </div>
+                </div>
+              ) : !episodeDetail || storyboardScenes.length === 0 ? (
+                <div className="max-h-[calc(100vh-220px)] space-y-5 overflow-y-auto bg-white p-3">
+                  {fallbackDraftScenes.map((scene, sceneIndex) => renderDraftSceneCard(scene, sceneIndex))}
+                </div>
+              ) : (
+                <div className="max-h-[calc(100vh-220px)] space-y-5 overflow-y-auto bg-white p-3">
+                  {storyboardScenes.map((scene, sceneIndex) => {
+                    const expanded = expandedSceneIds.has(scene.id);
+                    const videoShot = scene.shots.find((shot) =>
+                      getShotVideoUrl(shot, episodeDetail.generationMode)
+                    );
+                    const videoUrl = videoShot ? getShotVideoUrl(videoShot, episodeDetail.generationMode) : null;
+                    return (
+                      <article key={scene.id} className="overflow-hidden rounded-xl bg-[#e8e8e6] p-4">
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                          <button
+                            type="button"
+                            onClick={() => toggleScene(scene.id)}
+                            className="flex min-w-0 items-center gap-3 text-left"
+                          >
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 font-mono text-xs font-bold text-primary">
+                              {expanded ? "−" : "+"}
+                            </span>
+                            <span className="min-w-0">
+                              <span className="block truncate text-2xl font-bold text-[--text-primary]">
+                                S{String(sceneIndex + 1).padStart(2, "0")} - {scene.name}
+                              </span>
+                              <span className="text-xs text-[--text-muted]">
+                                {scene.shots.length} 个小镜头 · 可展开查看明细
+                              </span>
+                            </span>
+                          </button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => toggleScene(scene.id)}
+                            className="shrink-0 rounded-full bg-white/80"
+                          >
+                            {expanded ? "收起" : "展开"}
+                            <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} />
+                          </Button>
+                        </div>
+
+                        <div
+                          className="grid min-h-[310px] grid-cols-1 gap-3 xl:grid-cols-[var(--storyboard-cols)]"
+                          style={{
+                            ["--storyboard-cols" as string]: `${columnFractions.left}fr 8px ${columnFractions.middle}fr 8px ${columnFractions.right}fr`,
+                          }}
+                        >
+                          <section className="min-w-0 bg-[#d2d2d0] p-4">
+                            <h4 className="mb-4 text-center text-2xl font-bold text-black">参考素材位置</h4>
+                            {renderReferenceColumn(scene)}
+                          </section>
+
+                          {renderResizeHandle("left", "拖动调整参考素材和提示词宽度")}
+
+                          <section className="min-w-0 bg-[#d2d2d0] p-4">
+                            <h4 className="mb-4 text-center text-2xl font-bold text-black">提示词位置</h4>
+                            {renderPromptColumn(scene)}
+                            {renderVideoSettingsBar(scene.shots.reduce((sum, shot) => sum + (shot.duration || 0), 0))}
+                          </section>
+
+                          {renderResizeHandle("right", "拖动调整提示词和视频宽度")}
+
+                          <section className="min-w-0 bg-[#d2d2d0] p-4">
+                            <h4 className="mb-4 text-center text-2xl font-bold text-black">视频生成位置</h4>
+                            <div className="flex min-h-[238px] items-center justify-center rounded-xl border border-[--border-subtle] bg-white p-3">
+                              {videoUrl ? (
+                                <video src={uploadUrl(videoUrl)} controls className="max-h-[260px] w-full rounded-lg bg-black object-contain" />
+                              ) : (
+                                <div className="flex flex-col items-center gap-3 text-center text-sm text-[--text-muted]">
+                                  <VideoIcon className="h-8 w-8 text-[--text-muted]" />
+                                  <span>{scene.name}</span>
+                                  <span className="text-xs">等待生成视频</span>
+                                </div>
+                              )}
+                            </div>
+                          </section>
+                        </div>
+
+                        {expanded && (
+                          <div className="space-y-2 border-t border-[--border-subtle] bg-white px-3 py-3">
+                            {scene.shots.map((shot) => {
+                              const thumb =
+                                getActiveAsset(shot, "first_frame")?.fileUrl ||
+                                getActiveAssets(shot, "reference")[0]?.fileUrl ||
+                                getActiveAsset(shot, "last_frame")?.fileUrl;
+                              const shotVideo = getShotVideoUrl(shot, episodeDetail.generationMode);
+                              return (
+                                <div
+                                  key={shot.id}
+                                  className="grid gap-3 rounded-lg border border-[--border-subtle] bg-[--surface]/40 p-3 md:grid-cols-[72px_minmax(0,1fr)_120px]"
+                                >
+                                  <div className="flex h-12 w-full items-center justify-center overflow-hidden rounded-md bg-white">
+                                    {thumb ? (
+                                      <img src={uploadUrl(thumb)} alt={`镜头 ${shot.sequence}`} className="h-full w-full object-cover" />
+                                    ) : (
+                                      <ImageIcon className="h-5 w-5 text-[--text-muted]" />
+                                    )}
+                                  </div>
+                                  <div className="min-w-0">
+                                    <div className="font-mono text-xs font-bold text-primary">镜头 {shot.sequence}</div>
+                                    <div className="mt-1 line-clamp-2 text-xs leading-relaxed text-[--text-secondary]">
+                                      {compactText(shot.videoPrompt || shot.prompt || shot.videoScript, 220) || "暂无提示词"}
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center justify-end">
+                                    <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${
+                                      shotVideo
+                                        ? "bg-emerald-50 text-emerald-700"
+                                        : "bg-black/[0.04] text-[--text-muted]"
+                                    }`}>
+                                      {shotVideo ? "已生成" : "未生成"}
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
           )}
         </div>
       )}

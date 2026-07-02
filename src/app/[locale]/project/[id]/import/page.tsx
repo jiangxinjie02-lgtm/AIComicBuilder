@@ -7,14 +7,13 @@ import { useRouter } from "next/navigation";
 import {
   Upload, FileText, Users, Layers, Sparkles,
   Loader2, Check, X, ArrowLeft, AlertCircle,
-  ImageIcon, Images,
+  ImageIcon, Images, Plus, ChevronDown, History,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelStore } from "@/stores/model-store";
-import { useProjectStore } from "@/stores/project-store";
 import { useModelGuard } from "@/hooks/use-model-guard";
 import { toast } from "sonner";
 
@@ -49,6 +48,7 @@ interface AssetVariant {
   prompt?: string;
   imageUrl?: string;
   history?: Array<Record<string, unknown>>;
+  editInstruction?: string;
 }
 
 interface ExtractedAsset {
@@ -74,6 +74,7 @@ interface ExtractedAsset {
 
 type AssetTab = "characters" | "items" | "environments" | "voices";
 type WorkbenchAsset = ExtractedAsset & { scope?: "main" | "guest" };
+type StepStatus = Record<Step, "idle" | "running" | "done" | "error">;
 
 function getAssetKey(asset: WorkbenchAsset, index: number, tab: AssetTab) {
   return asset.assetId || `${tab}:${asset.name}:${index}`;
@@ -102,6 +103,21 @@ interface LogEntry {
   createdAt: string | number;
 }
 
+interface ImportDraftState {
+  currentStep?: number;
+  stepStatus?: Partial<Record<Step, "idle" | "running" | "done" | "error">>;
+  fullText?: string | null;
+  reviewIssues?: StoryReviewIssue[] | null;
+  storyAnalysis?: StoryAssetAnalysis | null;
+  characters?: ExtractedCharacter[] | null;
+  items?: ExtractedAsset[] | null;
+  environments?: ExtractedAsset[] | null;
+  voices?: ExtractedAsset[] | null;
+  relationships?: Array<{ characterA: string; characterB: string; relationType: string; description?: string }> | null;
+  episodes?: SplitEpisode[] | null;
+  confirmedEpisodeIndexes?: number[] | null;
+}
+
 interface StoryReviewIssue {
   category: "prohibited" | "logic" | "continuity" | "setting" | "other";
   severity: "high" | "medium" | "low";
@@ -113,6 +129,23 @@ interface StoryReviewIssue {
   replaceMode?: "first" | "all";
   applied?: boolean;
 }
+
+interface StoryAssetAnalysis {
+  storyMeta?: {
+    time?: string;
+    background?: string;
+    visualStyleBase?: string;
+    genre?: string;
+    locationBackground?: string;
+  };
+  assets?: {
+    characters?: Array<{ name: string; role?: string; description?: string }>;
+    scenes?: Array<{ name: string; type?: string; description?: string }>;
+    props?: Array<{ name: string; type?: string; description?: string }>;
+  };
+}
+
+type StoryAssetSectionKey = "characters" | "scenes" | "props";
 
 type Step = 1 | 2 | 3 | 4 | 5;
 
@@ -135,13 +168,15 @@ export default function ImportPage({
   const t = useTranslations("import");
   const textGuard = useModelGuard("text");
   const getModelConfig = useModelStore((s) => s.getModelConfig);
-  const projectTitle = useProjectStore((s) => s.project?.title);
   const localLogSeq = useRef(0);
   const splitRunningRef = useRef(false);
+  const draftHydratedRef = useRef(false);
+  const skipNextDraftSaveRef = useRef(false);
+  const saveDraftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Pipeline state
   const [currentStep, setCurrentStep] = useState<Step | 0>(0);
-  const [stepStatus, setStepStatus] = useState<Record<Step, "idle" | "running" | "done" | "error">>({
+  const [stepStatus, setStepStatus] = useState<StepStatus>({
     1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle",
   });
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -156,6 +191,7 @@ export default function ImportPage({
   // Step 1 result
   const [fullText, setFullText] = useState("");
   const [reviewIssues, setReviewIssues] = useState<StoryReviewIssue[]>([]);
+  const [storyAnalysis, setStoryAnalysis] = useState<StoryAssetAnalysis | null>(null);
   const [selectedIssueIndexes, setSelectedIssueIndexes] = useState<Set<number>>(() => new Set());
   const [activeIssueIndex, setActiveIssueIndex] = useState<number | null>(null);
   const reviewTextRef = useRef<HTMLTextAreaElement>(null);
@@ -172,6 +208,8 @@ export default function ImportPage({
 
   // Step 3 result
   const [episodes, setEpisodes] = useState<SplitEpisode[]>([]);
+  const [expandedEpisodeIndexes, setExpandedEpisodeIndexes] = useState<Set<number>>(() => new Set());
+  const [confirmedEpisodeIndexes, setConfirmedEpisodeIndexes] = useState<Set<number>>(() => new Set());
 
   // History mode
   const [historyMode, setHistoryMode] = useState(false);
@@ -179,13 +217,74 @@ export default function ImportPage({
   const [activeAssetTab, setActiveAssetTab] = useState<AssetTab>("characters");
   const [activeAssetKey, setActiveAssetKey] = useState("");
   const [assetGeneratingTarget, setAssetGeneratingTarget] = useState<string | null>(null);
+  const [assetUploadingTarget, setAssetUploadingTarget] = useState<string | null>(null);
+  const [assetEditingTarget, setAssetEditingTarget] = useState<string | null>(null);
 
-  // Load existing logs on mount
+  const buildDraftPayload = useCallback((): ImportDraftState => ({
+    currentStep,
+    stepStatus,
+    fullText,
+    reviewIssues,
+    storyAnalysis,
+    characters,
+    items,
+    environments,
+    voices,
+    relationships,
+    episodes,
+    confirmedEpisodeIndexes: Array.from(confirmedEpisodeIndexes),
+  }), [
+    currentStep,
+    stepStatus,
+    fullText,
+    reviewIssues,
+    storyAnalysis,
+    characters,
+    items,
+    environments,
+    voices,
+    relationships,
+    episodes,
+    confirmedEpisodeIndexes,
+  ]);
+
+  const saveDraft = useCallback(async (payload?: ImportDraftState) => {
+    try {
+      await apiFetch(`/api/projects/${projectId}/import/state`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload ?? buildDraftPayload()),
+      });
+    } catch (err) {
+      console.error("Import draft save error:", err);
+    }
+  }, [buildDraftPayload, projectId]);
+
+  const resetDraftPayload = useCallback((): ImportDraftState => ({
+    currentStep: 0,
+    stepStatus: { 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+    fullText: "",
+    reviewIssues: [],
+    storyAnalysis: null,
+    characters: [],
+    items: [],
+    environments: [],
+    voices: [],
+    relationships: [],
+    episodes: [],
+    confirmedEpisodeIndexes: [],
+  }), []);
+
+  // Load existing draft/logs on mount
   useEffect(() => {
-    async function loadLogs() {
+    async function loadDraftAndLogs() {
       try {
-        const res = await apiFetch(`/api/projects/${projectId}/import/logs`);
-        const data = await res.json();
+        const [draftRes, logsRes] = await Promise.all([
+          apiFetch(`/api/projects/${projectId}/import/state`),
+          apiFetch(`/api/projects/${projectId}/import/logs`),
+        ]);
+        const draft = (await draftRes.json()) as ImportDraftState | null;
+        const data = await logsRes.json();
         if (data.length > 0) {
           setLogs(data);
           setHistoryMode(true);
@@ -196,9 +295,10 @@ export default function ImportPage({
           const parseLog = data.find((l: LogEntry) => l.step === 1 && l.status === "done" && l.metadata);
           const parseMeta = parseLog?.metadata as { text?: string } | undefined;
           const storyLog = data.find((l: LogEntry) => l.step === 2 && l.status === "done" && l.metadata);
-          const storyMeta = storyLog?.metadata as { text?: string; preview?: string } | undefined;
+          const storyMeta = storyLog?.metadata as { text?: string; preview?: string; storyAnalysis?: StoryAssetAnalysis | null } | undefined;
           const restoredText = storyMeta?.text || parseMeta?.text || storyMeta?.preview;
           if (restoredText) setFullText(restoredText);
+          if (storyMeta?.storyAnalysis) setStoryAnalysis(storyMeta.storyAnalysis);
 
           const assetLog = data.find((l: LogEntry) => l.step === 3 && l.status === "done" && l.metadata);
           const assetMeta = assetLog?.metadata as {
@@ -216,7 +316,11 @@ export default function ImportPage({
 
           const splitLog = data.find((l: LogEntry) => l.step === 4 && l.status === "done" && l.metadata);
           const splitMeta = splitLog?.metadata as { episodes?: SplitEpisode[] } | undefined;
-          if (splitMeta?.episodes) setEpisodes(splitMeta.episodes);
+          if (splitMeta?.episodes) {
+            setEpisodes(splitMeta.episodes);
+            setExpandedEpisodeIndexes(new Set());
+            setConfirmedEpisodeIndexes(new Set());
+          }
 
           for (let s = 1; s <= 5; s++) {
             const stepLogs = data.filter((l: LogEntry) => l.step === s);
@@ -226,12 +330,54 @@ export default function ImportPage({
             }
           }
         }
+
+        if (draft) {
+          if (typeof draft.currentStep === "number") {
+            setCurrentStep(Math.max(0, Math.min(5, draft.currentStep)) as Step | 0);
+          }
+          if (draft.stepStatus) {
+            setStepStatus((prev) => ({ ...prev, ...draft.stepStatus }));
+          }
+          if (typeof draft.fullText === "string") setFullText(draft.fullText);
+          if (Array.isArray(draft.reviewIssues)) setReviewIssues(draft.reviewIssues);
+          if (draft.storyAnalysis !== undefined) setStoryAnalysis(draft.storyAnalysis ?? null);
+          if (Array.isArray(draft.characters)) setCharacters(draft.characters);
+          if (Array.isArray(draft.items)) setItems(draft.items);
+          if (Array.isArray(draft.environments)) setEnvironments(draft.environments);
+          if (Array.isArray(draft.voices)) setVoices(draft.voices);
+          if (Array.isArray(draft.relationships)) setRelationships(draft.relationships);
+          if (Array.isArray(draft.episodes)) {
+            setEpisodes(draft.episodes);
+            setExpandedEpisodeIndexes(new Set());
+          }
+          if (Array.isArray(draft.confirmedEpisodeIndexes)) {
+            setConfirmedEpisodeIndexes(new Set(draft.confirmedEpisodeIndexes));
+          }
+          storyReviewedRef.current = draft.stepStatus?.[2] === "done";
+        }
       } catch {
-        // No logs, fresh import
+        // No draft/logs, fresh import
+      } finally {
+        draftHydratedRef.current = true;
       }
     }
-    loadLogs();
+    loadDraftAndLogs();
   }, [projectId]);
+
+  useEffect(() => {
+    if (!draftHydratedRef.current) return;
+    if (skipNextDraftSaveRef.current) {
+      skipNextDraftSaveRef.current = false;
+      return;
+    }
+    if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
+    saveDraftTimerRef.current = setTimeout(() => {
+      saveDraft();
+    }, 1000);
+    return () => {
+      if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
+    };
+  }, [saveDraft]);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -257,14 +403,18 @@ export default function ImportPage({
     setCurrentStep(0);
     setFullText("");
     setReviewIssues([]);
+    setStoryAnalysis(null);
     setCharacters([]);
     setItems([]);
     setEnvironments([]);
     setVoices([]);
     setRelationships([]);
     setEpisodes([]);
+    setExpandedEpisodeIndexes(new Set());
+    setConfirmedEpisodeIndexes(new Set());
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
-  }, [t]);
+    void saveDraft(resetDraftPayload());
+  }, [resetDraftPayload, saveDraft, t]);
 
   // ── Step 1: Parse, then stop for story review ──
   async function startPipeline() {
@@ -276,14 +426,18 @@ export default function ImportPage({
     setLogs([]);
     setFullText("");
     setReviewIssues([]);
+    setStoryAnalysis(null);
     setCharacters([]);
     setItems([]);
     setEnvironments([]);
     setVoices([]);
     setRelationships([]);
     setEpisodes([]);
+    setExpandedEpisodeIndexes(new Set());
+    setConfirmedEpisodeIndexes(new Set());
     storyReviewedRef.current = false;
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
+    await saveDraft(resetDraftPayload());
 
     // Clear old logs
     await apiFetch(`/api/projects/${projectId}/import/logs`, { method: "DELETE" });
@@ -309,6 +463,12 @@ export default function ImportPage({
       addLog(1, "done", `解析完成，共 ${data.charCount} 字`);
       setStepStatus((prev) => ({ ...prev, 1: "done" }));
       setCurrentStep(2);
+      await saveDraft({
+        ...resetDraftPayload(),
+        currentStep: 2,
+        stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+        fullText: data.text,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Parse failed";
       addLog(1, "error", `文件解析失败: ${msg}`);
@@ -333,7 +493,7 @@ export default function ImportPage({
       const res = await apiFetch(`/api/projects/${projectId}/import/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, modelConfig: getModelConfig() }),
+        body: JSON.stringify({ text, modelConfig: getModelConfig(), reviewConcurrency: 3 }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -341,9 +501,11 @@ export default function ImportPage({
       }
       const data = await res.json() as {
         issues: StoryReviewIssue[];
+        storyAnalysis?: StoryAssetAnalysis | null;
         usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
       };
       setReviewIssues(data.issues || []);
+      setStoryAnalysis(data.storyAnalysis || null);
       const usageParts = [
         typeof data.usage?.inputTokens === "number" ? `输入 ${data.usage.inputTokens}` : null,
         typeof data.usage?.outputTokens === "number" ? `输出 ${data.usage.outputTokens}` : null,
@@ -352,53 +514,18 @@ export default function ImportPage({
       const usageSuffix = usageParts.length > 0 ? `，token：${usageParts.join(" / ")}` : "";
       addLog(2, "done", data.issues?.length ? `AI 剧情审阅完成，发现 ${data.issues.length} 个问题${usageSuffix}` : `AI 剧情审阅完成，未发现明显问题${usageSuffix}`);
       setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+      await saveDraft({
+        ...buildDraftPayload(),
+        currentStep: 2,
+        stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
+        fullText: text,
+        reviewIssues: data.issues || [],
+        storyAnalysis: data.storyAnalysis || null,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Review failed";
       addLog(2, "error", `AI 剧情审阅失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 2: "error" }));
-    }
-  }
-
-  function goToStep(step: Step) {
-    setHistoryMode(false);
-    setSelectedStep(null);
-    setCurrentStep(step);
-
-    if (step <= 2) {
-      storyReviewedRef.current = false;
-      setCharacters([]);
-      setItems([]);
-      setEnvironments([]);
-      setVoices([]);
-      setRelationships([]);
-      setEpisodes([]);
-      setStepStatus((prev) => ({
-        ...prev,
-        2: "idle",
-        3: "idle",
-        4: "idle",
-        5: "idle",
-      }));
-      return;
-    }
-
-    if (step === 3) {
-      setEpisodes([]);
-      setStepStatus((prev) => ({
-        ...prev,
-        3: prev[3] === "idle" ? "done" : prev[3],
-        4: "idle",
-        5: "idle",
-      }));
-      return;
-    }
-
-    if (step === 4) {
-      setStepStatus((prev) => ({
-        ...prev,
-        4: prev[4] === "idle" ? "done" : prev[4],
-        5: "idle",
-      }));
     }
   }
 
@@ -576,13 +703,91 @@ export default function ImportPage({
         step: 2,
         status: "done",
         message: `剧情审阅通过，共 ${fullText.length} 字`,
-        metadata: { charCount: fullText.length, preview: fullText.slice(0, 2000), text: fullText },
+        metadata: { charCount: fullText.length, preview: fullText.slice(0, 2000), text: fullText, storyAnalysis },
       }),
     });
     setCurrentStep(3);
     setStepStatus((prev) => ({ ...prev, 2: "done" }));
     addLog(2, "done", `剧情审阅通过，共 ${fullText.length} 字`);
+    await saveDraft({
+      ...buildDraftPayload(),
+      currentStep: 3,
+      stepStatus: { ...stepStatus, 2: "done" },
+      fullText,
+      reviewIssues,
+      storyAnalysis,
+    });
     await runCharacterExtract();
+  }
+
+  function ensureEditableStoryAnalysis(): StoryAssetAnalysis {
+    return {
+      storyMeta: storyAnalysis?.storyMeta || {},
+      assets: {
+        characters: storyAnalysis?.assets?.characters || [],
+        scenes: storyAnalysis?.assets?.scenes || [],
+        props: storyAnalysis?.assets?.props || [],
+      },
+    };
+  }
+
+  function updateStoryMetaField(field: keyof NonNullable<StoryAssetAnalysis["storyMeta"]>, value: string) {
+    setStoryAnalysis((prev) => ({
+      ...(prev || {}),
+      storyMeta: {
+        ...(prev?.storyMeta || {}),
+        [field]: value,
+      },
+      assets: prev?.assets || { characters: [], scenes: [], props: [] },
+    }));
+  }
+
+  function updateStoryAssetItem(section: StoryAssetSectionKey, index: number, patch: Record<string, string>) {
+    setStoryAnalysis((prev) => {
+      const base = prev || ensureEditableStoryAnalysis();
+      const assets = {
+        characters: base.assets?.characters || [],
+        scenes: base.assets?.scenes || [],
+        props: base.assets?.props || [],
+      };
+      const list = [...assets[section]];
+      list[index] = { ...list[index], ...patch };
+      return { ...base, assets: { ...assets, [section]: list } };
+    });
+  }
+
+  function addStoryAssetItem(section: StoryAssetSectionKey) {
+    setStoryAnalysis((prev) => {
+      const base = prev || ensureEditableStoryAnalysis();
+      const assets = {
+        characters: base.assets?.characters || [],
+        scenes: base.assets?.scenes || [],
+        props: base.assets?.props || [],
+      };
+      const blank =
+        section === "characters"
+          ? { name: "", role: "配角", description: "" }
+          : { name: "", type: section === "scenes" ? "场景空间" : "剧情道具", description: "" };
+      return { ...base, assets: { ...assets, [section]: [...assets[section], blank] } };
+    });
+  }
+
+  function removeStoryAssetItem(section: StoryAssetSectionKey, index: number) {
+    setStoryAnalysis((prev) => {
+      if (!prev) return prev;
+      const assets = {
+        characters: prev.assets?.characters || [],
+        scenes: prev.assets?.scenes || [],
+        props: prev.assets?.props || [],
+      };
+      return {
+        ...prev,
+        assets: {
+          ...assets,
+          [section]: assets[section].filter((_, itemIndex) => itemIndex !== index),
+        },
+      };
+    });
   }
 
   // ── Step 3: Asset setting foundation - character extraction ──
@@ -601,7 +806,7 @@ export default function ImportPage({
       const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: fullText }),
+        body: JSON.stringify({ text: fullText, storyAnalysis }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -617,6 +822,16 @@ export default function ImportPage({
       const guestCount = data.characters.length - mainCount;
       addLog(3, "done", `资产设定完成: ${mainCount} 个主角, ${guestCount} 个配角, ${(data.items || []).length} 个物品, ${(data.environments || []).length} 个环境, ${(data.voices || []).length} 个音色`);
       setStepStatus((prev) => ({ ...prev, 3: "done" }));
+      await saveDraft({
+        ...buildDraftPayload(),
+        currentStep: 3,
+        stepStatus: { ...stepStatus, 3: "done" },
+        characters: data.characters,
+        items: data.items || [],
+        environments: data.environments || [],
+        voices: data.voices || [],
+        relationships: data.relationships || [],
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Extract failed";
       addLog(3, "error", `资产设定失败: ${msg}`);
@@ -634,6 +849,12 @@ export default function ImportPage({
   // ── Step 4: Split (triggered by user after reviewing asset settings) ──
   async function runSplit() {
     if (splitRunningRef.current || stepStatus[4] === "running") return;
+    const assets = [...characters, ...items, ...environments, ...voices];
+    const unconfirmedAssets = assets.filter((asset) => asset.confirmed === false);
+    if (!assets.length || unconfirmedAssets.length > 0) {
+      toast.error(`请先确认全部资产（${assets.length - unconfirmedAssets.length}/${assets.length}）`);
+      return;
+    }
 
     splitRunningRef.current = true;
     setCurrentStep(4);
@@ -658,8 +879,17 @@ export default function ImportPage({
       }
       const data = await res.json();
       setEpisodes(data.episodes);
+      setExpandedEpisodeIndexes(new Set());
+      setConfirmedEpisodeIndexes(new Set());
       addLog(4, "done", `分集完成，共 ${data.episodes.length} 集`);
       setStepStatus((prev) => ({ ...prev, 4: "done" }));
+      await saveDraft({
+        ...buildDraftPayload(),
+        currentStep: 4,
+        stepStatus: { ...stepStatus, 4: "done" },
+        episodes: data.episodes,
+        confirmedEpisodeIndexes: [],
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Split failed";
       addLog(4, "error", `分集失败: ${msg}`);
@@ -671,6 +901,11 @@ export default function ImportPage({
 
   // ── Step 5: Generate (triggered by user after reviewing episodes) ──
   async function runGenerate() {
+    if (episodes.length === 0 || confirmedEpisodeIndexes.size !== episodes.length) {
+      toast.error(t("confirmAllEpisodesRequired"));
+      return;
+    }
+
     setCurrentStep(5);
     setStepStatus((prev) => ({ ...prev, 5: "running" }));
     addLog(5, "running", `创建 ${episodes.length} 集和角色...`);
@@ -733,10 +968,103 @@ export default function ImportPage({
     setEpisodes((prev) =>
       prev.map((ep, i) => (i === idx ? { ...ep, [field]: value } : ep))
     );
+    setConfirmedEpisodeIndexes((prev) => {
+      if (!prev.has(idx)) return prev;
+      const next = new Set(prev);
+      next.delete(idx);
+      return next;
+    });
   }
 
   function removeEpisode(idx: number) {
     setEpisodes((prev) => prev.filter((_, i) => i !== idx));
+    setExpandedEpisodeIndexes((prev) => {
+      const next = new Set<number>();
+      prev.forEach((index) => {
+        if (index < idx) next.add(index);
+        if (index > idx) next.add(index - 1);
+      });
+      return next;
+    });
+    setConfirmedEpisodeIndexes((prev) => {
+      const next = new Set<number>();
+      prev.forEach((index) => {
+        if (index < idx) next.add(index);
+        if (index > idx) next.add(index - 1);
+      });
+      return next;
+    });
+  }
+
+  function toggleEpisodeExpanded(idx: number) {
+    setExpandedEpisodeIndexes((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) {
+        next.delete(idx);
+      } else {
+        next.add(idx);
+      }
+      return next;
+    });
+  }
+
+  function confirmEpisode(idx: number) {
+    setConfirmedEpisodeIndexes((prev) => {
+      const next = new Set(prev);
+      next.add(idx);
+      return next;
+    });
+  }
+
+  function confirmAllEpisodes() {
+    setConfirmedEpisodeIndexes(new Set(episodes.map((_, index) => index)));
+  }
+
+  function goToStep(step: Step) {
+    setHistoryMode(false);
+    setSelectedStep(null);
+    setCurrentStep(step);
+
+    if (step <= 2) {
+      storyReviewedRef.current = false;
+      setCharacters([]);
+      setItems([]);
+      setEnvironments([]);
+      setVoices([]);
+      setRelationships([]);
+      setEpisodes([]);
+      setExpandedEpisodeIndexes(new Set());
+      setConfirmedEpisodeIndexes(new Set());
+      setStepStatus((prev) => ({
+        ...prev,
+        2: "idle",
+        3: "idle",
+        4: "idle",
+        5: "idle",
+      }));
+      return;
+    }
+
+    if (step === 3) {
+      setEpisodes([]);
+      setExpandedEpisodeIndexes(new Set());
+      setConfirmedEpisodeIndexes(new Set());
+      setStepStatus((prev) => ({
+        ...prev,
+        3: prev[3] === "idle" ? "done" : prev[3],
+        4: "idle",
+        5: "idle",
+      }));
+      return;
+    }
+
+    if (step === 4) {
+      setStepStatus((prev) => ({
+        ...prev,
+        4: prev[4] === "idle" ? "done" : prev[4],
+        5: "idle",
+      }));
+    }
   }
 
   const stepIcon = (status: string) => {
@@ -844,6 +1172,36 @@ export default function ImportPage({
     };
   }
 
+  function makeManualHistoryEntry(result: Record<string, unknown>, note: string) {
+    return {
+      at: new Date().toISOString(),
+      provider: result.provider || "manual-upload",
+      status: result.status || "succeeded",
+      imageUrl: result.imageUrl || "",
+      note,
+    };
+  }
+
+  function formatHistoryTime(value: unknown) {
+    if (typeof value !== "string") return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function getHistoryLabel(entry: Record<string, unknown>) {
+    const provider = typeof entry.provider === "string" ? entry.provider : "history";
+    const status = typeof entry.status === "string" ? entry.status : "";
+    const instruction = typeof entry.editInstruction === "string" ? entry.editInstruction : "";
+    const note = typeof entry.note === "string" ? entry.note : "";
+    return instruction || note || `${provider}${status ? ` · ${status}` : ""}`;
+  }
+
   function patchWorkbenchAsset(
     tab: AssetTab,
     assetIndex: number,
@@ -857,7 +1215,7 @@ export default function ImportPage({
     tab: AssetTab,
     assetIndex: number,
     variantIndex?: number,
-    options: { quiet?: boolean; keepBusy?: boolean } = {},
+    options: { quiet?: boolean; keepBusy?: boolean; referenceImages?: string[] } = {},
   ) {
     if (tab === "voices") return false;
     const sourceList = tab === "characters" ? characters : tab === "items" ? items : environments;
@@ -887,7 +1245,10 @@ export default function ImportPage({
           size: sizeForAssetTab(tab),
           targetName: target.name,
           targetType: variant ? "variant" : "main",
-          referenceImages: asset.faceTemplate?.url ? [asset.faceTemplate.url] : [],
+          referenceImages: [
+            ...(options.referenceImages || []),
+            ...(asset.faceTemplate?.url ? [asset.faceTemplate.url] : []),
+          ],
         }),
       });
       const result = await res.json();
@@ -951,6 +1312,171 @@ export default function ImportPage({
     await generateWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, variantIndex);
   }
 
+  async function generateActiveWorkbenchVariantsFromMain() {
+    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
+    const asset = activeWorkbenchAsset;
+    if (!asset?.imageUrl) {
+      toast.error("请先生成或上传主图");
+      return;
+    }
+    const variants = asset.variants || [];
+    if (!variants.length) return;
+
+    setAssetGeneratingTarget(`${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`);
+    let successCount = 0;
+    for (let variantIndex = 0; variantIndex < variants.length; variantIndex += 1) {
+      const ok = await generateWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, variantIndex, {
+        quiet: true,
+        keepBusy: true,
+        referenceImages: [asset.imageUrl],
+      });
+      if (ok) successCount += 1;
+    }
+    setAssetGeneratingTarget(null);
+    toast.success(`已生成 ${successCount}/${variants.length} 个变体`);
+  }
+
+  async function uploadWorkbenchImage(file: File, variantIndex?: number) {
+    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
+    if (!file.type.startsWith("image/")) {
+      toast.error("请选择图片文件");
+      return;
+    }
+    const targetKey = `${activeAssetTab}:${activeWorkbenchAssetIndex}:${variantIndex ?? "main"}`;
+    setAssetUploadingTarget(targetKey);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("targetType", typeof variantIndex === "number" ? "variant" : "main");
+      formData.append("targetName", typeof variantIndex === "number"
+        ? activeWorkbenchAsset?.variants?.[variantIndex]?.name || ""
+        : activeWorkbenchAsset?.name || "");
+
+      const res = await apiFetch(`/api/projects/${projectId}/import/upload-image`, {
+        method: "POST",
+        body: formData,
+      });
+      const result = await res.json();
+      if (result.status === "error") throw new Error(result.error || "上传失败");
+
+      patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+        const historyEntry = makeManualHistoryEntry(result, "手动上传");
+        if (typeof variantIndex === "number") {
+          const variants = [...(current.variants || [])];
+          const currentVariant = variants[variantIndex];
+          if (!currentVariant) return current;
+          variants[variantIndex] = {
+            ...currentVariant,
+            imageUrl: result.imageUrl || "",
+            history: [historyEntry, ...(currentVariant.history || [])],
+          };
+          return { ...current, variants };
+        }
+        return {
+          ...current,
+          imageUrl: result.imageUrl || "",
+          history: [historyEntry, ...(current.history || [])],
+        };
+      });
+
+      toast.success("图片已上传");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "上传失败");
+    } finally {
+      setAssetUploadingTarget(null);
+    }
+  }
+
+  function updateVariantEditInstruction(variantIndex: number, editInstruction: string) {
+    if (activeWorkbenchAssetIndex < 0) return;
+    patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+      const variants = [...(current.variants || [])];
+      const currentVariant = variants[variantIndex];
+      if (!currentVariant) return current;
+      variants[variantIndex] = { ...currentVariant, editInstruction };
+      return { ...current, variants };
+    });
+  }
+
+  async function editWorkbenchVariant(variantIndex: number) {
+    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
+    const asset = activeWorkbenchAsset;
+    const variant = asset?.variants?.[variantIndex];
+    if (!asset || !variant) return;
+    if (!variant.imageUrl) {
+      toast.error("请先生成或上传变体图");
+      return;
+    }
+    const editInstruction = String(variant.editInstruction || "").trim();
+    if (!editInstruction) {
+      toast.error("请先填写改图要求");
+      return;
+    }
+
+    const targetKey = `${activeAssetTab}:${activeWorkbenchAssetIndex}:${variantIndex}`;
+    setAssetEditingTarget(targetKey);
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/import/edit-image`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageUrl: variant.imageUrl,
+          editPrompt: editInstruction,
+          prompt: variant.prompt || asset.prompt || "",
+          negativePrompt: asset.negativePrompt,
+          category: assetCategoryForTab(activeAssetTab),
+          asset,
+          size: sizeForAssetTab(activeAssetTab),
+          targetName: variant.name,
+          targetType: "variant-edit",
+        }),
+      });
+      const result = await res.json();
+      if (result.status === "error") throw new Error(result.error || "改图失败");
+
+      patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+        const variants = [...(current.variants || [])];
+        const currentVariant = variants[variantIndex];
+        if (!currentVariant) return current;
+        const historyEntry = {
+          ...makeHistoryEntry(result),
+          editInstruction,
+          sourceImageUrl: currentVariant.imageUrl || "",
+        };
+        variants[variantIndex] = {
+          ...currentVariant,
+          imageUrl: result.imageUrl || currentVariant.imageUrl,
+          editInstruction: "",
+          history: [historyEntry, ...(currentVariant.history || [])],
+        };
+        return { ...current, variants };
+      });
+
+      toast.success("变体已改图");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "改图失败";
+      patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+        const variants = [...(current.variants || [])];
+        const currentVariant = variants[variantIndex];
+        if (!currentVariant) return current;
+        variants[variantIndex] = {
+          ...currentVariant,
+          history: [{
+            at: new Date().toISOString(),
+            provider: "jimapi:image-edit",
+            status: "failed",
+            editInstruction,
+            error: msg,
+          }, ...(currentVariant.history || [])],
+        };
+        return { ...current, variants };
+      });
+      toast.error(msg);
+    } finally {
+      setAssetEditingTarget(null);
+    }
+  }
+
   async function generateCurrentAssetTab() {
     if (activeAssetTab === "voices") return;
     const tab = activeAssetTab;
@@ -978,6 +1504,69 @@ export default function ImportPage({
     return { label: t("assetVoices"), count: voices.length };
   }
 
+  function makeBlankAsset(tab: AssetTab): WorkbenchAsset {
+    const label = assetTabInfo(tab).label;
+    const nextIndex = (tab === "characters"
+      ? characters.length
+      : tab === "items"
+        ? items.length
+        : tab === "environments"
+          ? environments.length
+          : voices.length) + 1;
+    const name = `新${label}${nextIndex}`;
+    return {
+      name,
+      frequency: 1,
+      description: "",
+      visualHint: name,
+      confirmed: false,
+      assetId: `manual-${tab}-${Date.now()}`,
+      category: assetCategoryForTab(tab),
+      role: tab === "characters" ? "自定义角色" : label,
+      roleKey: "manual",
+      episodes: [],
+      prompt: "",
+      negativePrompt: tab === "voices" ? "" : "",
+      variants: [],
+      imageUrl: "",
+      history: [],
+      mainImageName: name,
+      tags: ["手动添加"],
+      ...(tab === "characters" ? { scope: "guest" as const } : {}),
+    };
+  }
+
+  function addWorkbenchAsset(tab: AssetTab) {
+    const asset = makeBlankAsset(tab);
+    const key = getAssetKey(asset, tab === "characters"
+      ? characters.length
+      : tab === "items"
+        ? items.length
+        : tab === "environments"
+          ? environments.length
+          : voices.length, tab);
+    if (tab === "characters") {
+      setCharacters((prev) => [...prev, asset as ExtractedCharacter]);
+    } else if (tab === "items") {
+      setItems((prev) => [...prev, asset]);
+    } else if (tab === "environments") {
+      setEnvironments((prev) => [...prev, asset]);
+    } else {
+      setVoices((prev) => [...prev, asset]);
+    }
+    setActiveAssetTab(tab);
+    setActiveAssetKey(key);
+    toast.success(`已添加${assetTabInfo(tab).label}`);
+  }
+
+  function confirmAllWorkbenchAssets() {
+    setCharacters((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
+    setItems((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
+    setEnvironments((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
+    setVoices((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
+    toast.success("已一键确定全部资产");
+  }
+
   function getAssetPreviewLabel(asset: WorkbenchAsset, tab: AssetTab) {
     if (tab === "voices") return t("assetVoicePrompt");
     return asset.mainImageName || asset.visualHint || asset.name;
@@ -989,22 +1578,63 @@ export default function ImportPage({
     setting: t("reviewCategorySetting"),
     other: t("reviewCategoryOther"),
   };
+  const reviewAssetSections = [
+    {
+      key: "characters",
+      label: "人物",
+      icon: Users,
+      items: storyAnalysis?.assets?.characters || [],
+      roleField: "role",
+      getSubText: (item: { role?: string; description?: string }) => item.role || item.description || "角色资产",
+    },
+    {
+      key: "scenes",
+      label: "场景",
+      icon: Layers,
+      items: storyAnalysis?.assets?.scenes || [],
+      roleField: "type",
+      getSubText: (item: { type?: string; description?: string }) => item.type || item.description || "环境资产",
+    },
+    {
+      key: "props",
+      label: "物品",
+      icon: ImageIcon,
+      items: storyAnalysis?.assets?.props || [],
+      roleField: "type",
+      getSubText: (item: { type?: string; description?: string }) => item.type || item.description || "道具资产",
+    },
+  ];
+  const reviewAssetTotal = reviewAssetSections.reduce((sum, section) => sum + section.items.length, 0);
+  const storyMetaRows = [
+    ["time", "时间", storyAnalysis?.storyMeta?.time],
+    ["background", "背景", storyAnalysis?.storyMeta?.background],
+    ["visualStyleBase", "风格", storyAnalysis?.storyMeta?.visualStyleBase],
+  ] as const;
 
+  const confirmedEpisodeCount = confirmedEpisodeIndexes.size;
+  const allEpisodesConfirmed = episodes.length > 0 && confirmedEpisodeCount === episodes.length;
+  const episodeConfirmProgress = t("episodeConfirmProgress", {
+    confirmed: confirmedEpisodeCount,
+    total: episodes.length,
+  });
+  const allWorkbenchAssets = [...characters, ...items, ...environments, ...voices];
+  const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed !== false).length;
+  const allAssetsConfirmed = allWorkbenchAssets.length > 0 && confirmedAssetCount === allWorkbenchAssets.length;
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-[--surface]">
       {/* Top: Steps navigation */}
       <div className="shrink-0 border-b border-[--border-subtle] bg-white px-3 py-2">
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
           <button
-            onClick={() => router.push(`/${locale}/project/${projectId}/episodes`)}
+            onClick={() => router.push(`/${locale}`)}
             className="flex h-10 w-[180px] shrink-0 items-center gap-2 rounded-lg px-2 text-sm font-semibold text-[--text-primary] transition-colors hover:bg-[--surface] hover:text-primary md:w-[220px]"
-            title={projectTitle || t("title")}
+            title="返回项目"
           >
             <ArrowLeft className="h-4 w-4" />
-            <span className="truncate">{projectTitle || t("title")}</span>
+            <span className="truncate">返回项目</span>
           </button>
 
-          <div className="flex min-w-[660px] flex-1 gap-2">
+          <div className="flex min-w-[760px] flex-1 gap-2">
             {STEPS.map(({ num, icon: Icon, label }) => {
               const isClickable = stepStatus[num] !== "idle" || currentStep >= num;
               const isSelected = selectedStep === num;
@@ -1034,6 +1664,16 @@ export default function ImportPage({
                 </button>
               );
             })}
+            <button
+              type="button"
+              onClick={() => router.push(`/${locale}/project/${projectId}/episodes`)}
+              className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent bg-[--surface] px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:bg-primary/5 hover:text-primary"
+            >
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white">
+                <Layers className="h-4 w-4" />
+              </div>
+              <span className="truncate text-xs font-medium xl:text-sm">分集管理</span>
+            </button>
           </div>
         </div>
       </div>
@@ -1101,7 +1741,7 @@ export default function ImportPage({
 
         {/* Story review gate (AI review, then human approval) */}
         {showStoryReview && (
-          <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4">
+          <div className="mx-auto flex w-full max-w-[1500px] flex-1 flex-col gap-4">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h3 className="font-display text-lg font-bold text-[--text-primary]">
@@ -1130,7 +1770,7 @@ export default function ImportPage({
               </div>
             </div>
 
-            <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_360px] gap-4">
+            <div className="grid min-h-0 flex-1 grid-cols-[minmax(520px,1fr)_300px_360px] gap-4">
               <div className="flex min-h-0 flex-col rounded-xl border border-[--border-subtle] bg-white">
                 <div className="flex flex-wrap items-center gap-2 border-b border-[--border-subtle] p-3">
                   <Input
@@ -1168,6 +1808,120 @@ export default function ImportPage({
                   onChange={(e) => setFullText(e.target.value)}
                   className="h-[60vh] resize-none border-0 bg-transparent font-mono text-sm leading-relaxed shadow-none focus-visible:ring-0"
                 />
+                </div>
+              </div>
+
+              <div className="flex min-h-0 flex-col rounded-xl border border-[--border-subtle] bg-white">
+                <div className="flex items-center justify-between border-b border-[--border-subtle] p-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[--text-primary]">资产</div>
+                    <div className="text-xs text-[--text-muted]">
+                      {reviewRunning ? "AI 正在解析资产" : `共 ${reviewAssetTotal} 个资产草稿`}
+                    </div>
+                  </div>
+                  <span className="rounded-full bg-[--surface] px-2 py-0.5 text-xs font-semibold text-[--text-muted]">
+                    AI
+                  </span>
+                </div>
+
+                <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+                  {reviewRunning && (
+                    <div className="flex items-center gap-2 rounded-lg bg-primary/5 p-3 text-sm text-primary">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      正在解析人物、场景和物品
+                    </div>
+                  )}
+
+                  {!reviewRunning && !storyAnalysis && (
+                    <div className="rounded-lg bg-emerald-50 p-3 text-sm leading-relaxed text-emerald-700">
+                      点击“AI 审阅”后，这里会显示人物、场景、物品和统一故事设定。
+                    </div>
+                  )}
+
+                  {!reviewRunning && storyAnalysis && (
+                    <div className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
+                      <div className="mb-2 text-xs font-bold text-[--text-secondary]">故事设定</div>
+                      <div className="space-y-2">
+                        {storyMetaRows.map(([field, label, value]) => (
+                          <div key={field} className="space-y-1">
+                            <label className="text-[10px] font-semibold text-[--text-muted]">{label}</label>
+                            <Textarea
+                              value={value || ""}
+                              onChange={(e) => updateStoryMetaField(field, e.target.value)}
+                              className="min-h-16 resize-none rounded-lg bg-white text-xs leading-relaxed"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {!reviewRunning && reviewAssetSections.map((section) => {
+                    const Icon = section.icon;
+                    return (
+                      <div key={section.key} className="rounded-lg border border-[--border-subtle]">
+                        <div className="flex items-center justify-between border-b border-[--border-subtle] px-3 py-2">
+                          <div className="flex items-center gap-2 text-sm font-semibold text-[--text-primary]">
+                            <Icon className="h-4 w-4 text-primary" />
+                            {section.label}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-[--text-muted]">{section.items.length}</span>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => addStoryAssetItem(section.key as StoryAssetSectionKey)}
+                              className="h-7 px-2"
+                            >
+                              <Plus className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </div>
+                        <div className="max-h-44 overflow-y-auto p-2">
+                          {section.items.length === 0 ? (
+                            <div className="rounded-md border border-dashed border-[--border-subtle] p-3 text-center text-xs text-[--text-muted]">
+                              暂无{section.label}
+                            </div>
+                          ) : (
+                            section.items.map((item, index) => (
+                              <div key={`${section.key}:${index}`} className="mb-2 space-y-1.5 rounded-md bg-[--surface] p-2 last:mb-0">
+                                <div className="flex items-center gap-1.5">
+                                  <Input
+                                    value={item.name || ""}
+                                    onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { name: e.target.value })}
+                                    placeholder={`${section.label}名称`}
+                                    className="h-8 min-w-0 flex-1 rounded-lg bg-white text-xs font-semibold"
+                                  />
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => removeStoryAssetItem(section.key as StoryAssetSectionKey, index)}
+                                    className="h-8 w-8 shrink-0 p-0"
+                                  >
+                                    <X className="h-3.5 w-3.5" />
+                                  </Button>
+                                </div>
+                                <Input
+                                  value={(section.roleField === "role" ? (item as { role?: string }).role : (item as { type?: string }).type) || ""}
+                                  onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { [section.roleField]: e.target.value })}
+                                  placeholder={section.roleField === "role" ? "角色定位" : "类型"}
+                                  className="h-8 rounded-lg bg-white text-xs"
+                                />
+                                <Textarea
+                                  value={item.description || ""}
+                                  onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { description: e.target.value })}
+                                  placeholder="描述"
+                                  className="min-h-16 resize-none rounded-lg bg-white text-xs leading-relaxed"
+                                />
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -1323,13 +2077,32 @@ export default function ImportPage({
                 </h3>
                 <p className="mt-1 text-sm text-[--text-muted]">{t("reviewAssetsHint")}</p>
               </div>
-              <Button onClick={runSplit} disabled={stepStatus[4] === "running"} className="rounded-xl">
-                {stepStatus[4] === "running" && <Loader2 className="size-4 animate-spin" />}
-                {t("confirmAndSplit")}
-              </Button>
+              <div className="flex items-center gap-3">
+                <div className={`text-xs font-semibold ${allAssetsConfirmed ? "text-emerald-600" : "text-amber-600"}`}>
+                  资产确认 {confirmedAssetCount}/{allWorkbenchAssets.length}
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={confirmAllWorkbenchAssets}
+                  disabled={allWorkbenchAssets.length === 0 || allAssetsConfirmed}
+                  className="rounded-xl"
+                >
+                  <Check className="size-4" />
+                  一键全部确定
+                </Button>
+                <Button
+                  onClick={runSplit}
+                  disabled={stepStatus[4] === "running" || !allAssetsConfirmed}
+                  className="rounded-xl"
+                >
+                  {stepStatus[4] === "running" && <Loader2 className="size-4 animate-spin" />}
+                  {t("confirmAndSplit")}
+                </Button>
+              </div>
             </div>
 
-            <div className="grid min-h-0 flex-1 grid-cols-[270px_minmax(0,1fr)_420px] overflow-hidden rounded-xl border border-[--border-subtle] bg-white shadow-sm">
+            <div className="grid min-h-0 flex-1 grid-cols-[270px_minmax(0,1fr)] overflow-hidden rounded-xl border border-[--border-subtle] bg-white shadow-sm">
               <aside className="flex min-h-0 flex-col border-r border-[--border-subtle] bg-[--surface]">
                 <div className="flex h-12 items-center justify-between border-b border-[--border-subtle] px-3">
                   <div className="text-sm font-bold text-[--text-primary]">{t("assetTypes")}</div>
@@ -1344,12 +2117,32 @@ export default function ImportPage({
                       <button
                         key={tab}
                         onClick={() => setActiveAssetTab(tab)}
-                        className={`rounded-lg border p-2 text-left transition-colors ${
+                        className={`group relative rounded-lg border p-2 pr-9 text-left transition-colors ${
                           activeAssetTab === tab
                             ? "border-primary/50 bg-primary/10 text-primary"
                             : "border-[--border-subtle] bg-white text-[--text-primary] hover:border-[--border-hover]"
                         }`}
                       >
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            addWorkbenchAsset(tab);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key !== "Enter" && event.key !== " ") return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            addWorkbenchAsset(tab);
+                          }}
+                          className={`absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md border text-[--text-muted] transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary ${
+                            activeAssetTab === tab ? "border-primary/30 bg-white/70 text-primary" : "border-[--border-subtle] bg-[--surface]"
+                          }`}
+                          aria-label={`添加${info.label}`}
+                        >
+                          <Plus className="size-3.5" />
+                        </span>
                         <div className="text-xs font-bold">{info.label}</div>
                         <div className="mt-1 text-[10px] text-[--text-muted]">{info.count}</div>
                       </button>
@@ -1393,7 +2186,7 @@ export default function ImportPage({
                 </div>
               </aside>
 
-              <section className="min-h-0 overflow-y-auto border-r border-[--border-subtle] p-4">
+              <section className="min-h-0 overflow-y-auto p-4">
                 {activeWorkbenchAsset ? (
                   <div className="space-y-4">
                     <div className="flex items-start justify-between gap-3">
@@ -1411,132 +2204,154 @@ export default function ImportPage({
                           </span>
                         </div>
                       </div>
-                      <label className="flex shrink-0 items-center gap-2 text-xs font-semibold text-[--text-secondary]">
-                        <input
-                          type="checkbox"
-                          checked={activeWorkbenchAsset.confirmed !== false}
-                          onChange={(event) => updateActiveWorkbenchAsset({ confirmed: event.target.checked })}
-                          className="h-4 w-4 accent-primary"
-                        />
-                        {t("assetConfirmedToggle")}
-                      </label>
+                      <button
+                        type="button"
+                        onClick={() => updateActiveWorkbenchAsset({ confirmed: activeWorkbenchAsset.confirmed === false })}
+                        className={`flex h-11 shrink-0 items-center gap-2 rounded-xl border px-4 text-sm font-bold transition-colors ${
+                          activeWorkbenchAsset.confirmed !== false
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                            : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
+                        }`}
+                      >
+                        <Check className="size-4" />
+                        {activeWorkbenchAsset.confirmed !== false ? "已确认" : "确认资产"}
+                      </button>
                     </div>
 
-                    <div className="grid gap-3 rounded-xl border border-[--border-subtle] bg-[--surface] p-3">
-                      <div className="grid gap-1">
-                        <div className="text-xs font-bold text-[--text-secondary]">{t("assetDescription")}</div>
-                        <p className="text-xs leading-relaxed text-[--text-muted]">{activeWorkbenchAsset.description || "-"}</p>
-                      </div>
-                      {activeAssetTab === "characters" && (
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => updateActiveWorkbenchAsset({ scope: activeWorkbenchAsset.scope === "main" ? "guest" : "main" })}
-                            className={`rounded-lg px-2 py-1 text-xs font-bold ${
-                              activeWorkbenchAsset.scope === "main"
-                                ? "bg-blue-50 text-blue-600"
-                                : "bg-purple-50 text-purple-600"
-                            }`}
-                          >
-                            {activeWorkbenchAsset.scope === "main" ? t("main") : t("guest")}
-                          </button>
-                          <span className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || ""}</span>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="grid gap-2">
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-bold text-[--text-secondary]">
-                          {activeAssetTab === "voices" ? t("assetVoicePrompt") : t("assetPrompt")}
-                        </label>
-                        <span className="text-[10px] text-[--text-muted]">{t("assetCustomEdit")}</span>
-                      </div>
-                      <Textarea
-                        value={activeWorkbenchAsset.prompt || ""}
-                        onChange={(event) => updateActiveWorkbenchAsset({ prompt: event.target.value })}
-                        className="min-h-[360px] resize-y rounded-xl bg-white font-mono text-xs leading-relaxed"
-                      />
-                    </div>
-
-                    {activeAssetTab !== "voices" && (
-                      <div className="grid gap-2">
-                        <label className="text-xs font-bold text-[--text-secondary]">{t("assetNegativePrompt")}</label>
-                        <Textarea
-                          value={activeWorkbenchAsset.negativePrompt || ""}
-                          onChange={(event) => updateActiveWorkbenchAsset({ negativePrompt: event.target.value })}
-                          className="min-h-20 resize-y rounded-xl bg-white text-xs leading-relaxed"
-                        />
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="flex h-full items-center justify-center rounded-xl border border-dashed border-[--border-subtle] text-sm text-[--text-muted]">
-                    {t("assetEmpty")}
-                  </div>
-                )}
-              </section>
-
-              <aside className="min-h-0 overflow-y-auto p-4">
-                {activeWorkbenchAsset ? (
-                  <div className="space-y-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0 flex-1">
-                        <div className="text-xs font-bold text-[--text-secondary]">{t("assetMainImageName")}</div>
-                        <Input
-                          value={getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab)}
-                          onChange={(event) => updateActiveWorkbenchAsset({ mainImageName: event.target.value, visualHint: event.target.value })}
-                          disabled={activeAssetTab === "voices"}
-                          className="mt-1 h-9 rounded-lg text-xs font-semibold"
-                        />
-                      </div>
-                      {activeAssetTab !== "voices" && (
-                        <div className="flex shrink-0 flex-col gap-2 pt-5">
-                          <Button
-                            size="sm"
-                            onClick={() => generateActiveWorkbenchAsset()}
-                            disabled={Boolean(assetGeneratingTarget)}
-                            className="rounded-lg"
-                          >
-                            {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
-                              <Loader2 className="size-3.5 animate-spin" />
-                            ) : (
-                              <ImageIcon className="size-3.5" />
-                            )}
-                            {activeWorkbenchAsset.imageUrl ? t("assetRegenerateMain") : t("assetGenerateMain")}
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={generateCurrentAssetTab}
-                            disabled={Boolean(assetGeneratingTarget)}
-                            className="rounded-lg"
-                          >
-                            {assetGeneratingTarget ? (
-                              <Loader2 className="size-3.5 animate-spin" />
-                            ) : (
-                              <Images className="size-3.5" />
-                            )}
-                            {t("assetGenerateCurrentType")}
-                          </Button>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="flex aspect-[16/10] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
-                      {activeWorkbenchAsset.imageUrl ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img src={activeWorkbenchAsset.imageUrl} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
-                      ) : (
-                        <div className="grid gap-1 text-center">
-                          <div className="text-sm font-bold text-[--text-primary]">
-                            {activeAssetTab === "voices" ? activeWorkbenchAsset.name : t("assetNoImage")}
+                    <div className="grid gap-4 lg:grid-cols-2">
+                      <div className="grid min-h-[520px] gap-3 rounded-xl border border-[--border-subtle] bg-white p-3">
+                        <div className="grid gap-3 rounded-xl border border-[--border-subtle] bg-[--surface] p-3">
+                          <div className="grid gap-1">
+                            <div className="text-xs font-bold text-[--text-secondary]">{t("assetDescription")}</div>
+                            <p className="text-xs leading-relaxed text-[--text-muted]">{activeWorkbenchAsset.description || "-"}</p>
                           </div>
-                          <div className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || assetTabInfo(activeAssetTab).label}</div>
+                          {activeAssetTab === "characters" && (
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => updateActiveWorkbenchAsset({ scope: activeWorkbenchAsset.scope === "main" ? "guest" : "main" })}
+                                className={`rounded-lg px-2 py-1 text-xs font-bold ${
+                                  activeWorkbenchAsset.scope === "main"
+                                    ? "bg-blue-50 text-blue-600"
+                                    : "bg-purple-50 text-purple-600"
+                                }`}
+                              >
+                                {activeWorkbenchAsset.scope === "main" ? t("main") : t("guest")}
+                              </button>
+                              <span className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || ""}</span>
+                            </div>
+                          )}
                         </div>
-                      )}
+
+                        <div className="grid gap-2">
+                          <div className="flex items-center justify-between">
+                            <label className="text-xs font-bold text-[--text-secondary]">
+                              {activeAssetTab === "voices" ? t("assetVoicePrompt") : t("assetPrompt")}
+                            </label>
+                            <span className="text-[10px] text-[--text-muted]">{t("assetCustomEdit")}</span>
+                          </div>
+                          <Textarea
+                            value={activeWorkbenchAsset.prompt || ""}
+                            onChange={(event) => updateActiveWorkbenchAsset({ prompt: event.target.value })}
+                            className="min-h-[320px] flex-1 resize-y rounded-xl bg-white font-mono text-xs leading-relaxed"
+                          />
+                        </div>
+
+                        {activeAssetTab !== "voices" && (
+                          <div className="grid gap-2">
+                            <label className="text-xs font-bold text-[--text-secondary]">{t("assetNegativePrompt")}</label>
+                            <Textarea
+                              value={activeWorkbenchAsset.negativePrompt || ""}
+                              onChange={(event) => updateActiveWorkbenchAsset({ negativePrompt: event.target.value })}
+                              className="min-h-20 resize-y rounded-xl bg-white text-xs leading-relaxed"
+                            />
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="grid min-h-[520px] content-start gap-3 rounded-xl border border-[--border-subtle] bg-white p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-bold text-[--text-secondary]">{t("assetMainImageName")}</div>
+                            <Input
+                              value={getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab)}
+                              onChange={(event) => updateActiveWorkbenchAsset({ mainImageName: event.target.value, visualHint: event.target.value })}
+                              disabled={activeAssetTab === "voices"}
+                              className="mt-1 h-9 rounded-lg text-xs font-semibold"
+                            />
+                          </div>
+                          {activeAssetTab !== "voices" && (
+                            <div className="flex shrink-0 flex-wrap justify-end gap-2 pt-5">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={Boolean(assetUploadingTarget)}
+                                className="relative overflow-hidden rounded-lg"
+                              >
+                                {assetUploadingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <Upload className="size-3.5" />
+                                )}
+                                上传主图
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  className="absolute inset-0 cursor-pointer opacity-0"
+                                  onChange={(event) => {
+                                    const selectedFile = event.target.files?.[0];
+                                    event.target.value = "";
+                                    if (selectedFile) void uploadWorkbenchImage(selectedFile);
+                                  }}
+                                />
+                              </Button>
+                              <Button
+                                size="sm"
+                                onClick={() => generateActiveWorkbenchAsset()}
+                                disabled={Boolean(assetGeneratingTarget)}
+                                className="rounded-lg"
+                              >
+                                {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <ImageIcon className="size-3.5" />
+                                )}
+                                {activeWorkbenchAsset.imageUrl ? t("assetRegenerateMain") : t("assetGenerateMain")}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={generateCurrentAssetTab}
+                                disabled={Boolean(assetGeneratingTarget)}
+                                className="rounded-lg"
+                              >
+                                {assetGeneratingTarget ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <Images className="size-3.5" />
+                                )}
+                                {t("assetGenerateCurrentType")}
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex aspect-[16/10] min-h-[360px] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
+                          {activeWorkbenchAsset.imageUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={activeWorkbenchAsset.imageUrl} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
+                          ) : (
+                            <div className="grid gap-1 text-center">
+                              <div className="text-sm font-bold text-[--text-primary]">
+                                {activeAssetTab === "voices" ? activeWorkbenchAsset.name : t("assetNoImage")}
+                              </div>
+                              <div className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || assetTabInfo(activeAssetTab).label}</div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
                     </div>
 
-                    <div className="space-y-2">
+                    <div className="space-y-3 border-t border-[--border-subtle] pt-4">
                       <div className="flex items-center justify-between">
                         <div>
                           <div className="text-sm font-bold text-[--text-primary]">{t("assetVariants")}</div>
@@ -1544,19 +2359,40 @@ export default function ImportPage({
                             {activeAssetTab === "voices" ? t("assetVoiceVariantsHint") : t("assetImageVariantsHint")}
                           </div>
                         </div>
-                        <span className="rounded-full bg-[--surface] px-2 py-0.5 text-xs font-semibold text-[--text-muted]">
-                          {activeWorkbenchAsset.variants?.length || 0}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          {activeAssetTab !== "voices" && (
+                            <Button
+                              size="sm"
+                              onClick={generateActiveWorkbenchVariantsFromMain}
+                              disabled={
+                                !activeWorkbenchAsset.imageUrl
+                                || !activeWorkbenchAsset.variants?.length
+                                || Boolean(assetGeneratingTarget)
+                              }
+                              className="rounded-lg"
+                            >
+                              {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:variants` ? (
+                                <Loader2 className="size-3.5 animate-spin" />
+                              ) : (
+                                <Images className="size-3.5" />
+                              )}
+                              批量生成变体
+                            </Button>
+                          )}
+                          <span className="rounded-full bg-[--surface] px-2 py-0.5 text-xs font-semibold text-[--text-muted]">
+                            {activeWorkbenchAsset.variants?.length || 0}
+                          </span>
+                        </div>
                       </div>
                       {activeWorkbenchAsset.variants?.length ? (
-                        <div className="grid gap-2">
+                        <div className="grid gap-4 lg:grid-cols-2">
                           {activeWorkbenchAsset.variants.map((variant, index) => (
-                            <div key={variant.id || `${variant.name}:${index}`} className="rounded-xl border border-[--border-subtle] bg-white p-3">
+                            <div key={variant.id || `${variant.name}:${index}`} className="flex min-h-[180px] flex-col rounded-xl border border-[--border-subtle] bg-white p-4">
                               <div className="flex items-start justify-between gap-2">
                                 <div className="min-w-0">
                                   <div className="truncate text-xs font-bold text-[--text-primary]">{variant.name}</div>
                                   {variant.description && (
-                                    <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-[--text-muted]">{variant.description}</p>
+                                    <p className="mt-2 line-clamp-3 text-[11px] leading-relaxed text-[--text-muted]">{variant.description}</p>
                                   )}
                                 </div>
                                 {variant.imageUrl && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">OK</span>}
@@ -1564,24 +2400,105 @@ export default function ImportPage({
                               {variant.imageUrl && (
                                 <div className="mt-2 overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
                                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                                  <img src={variant.imageUrl} alt={variant.name} className="h-24 w-full object-contain" />
+                                  <img src={variant.imageUrl} alt={variant.name} className="h-56 w-full object-contain" />
                                 </div>
                               )}
                               {activeAssetTab !== "voices" && (
-                                <div className="mt-2 flex items-center justify-end">
-                                  <Button
-                                    size="xs"
-                                    variant="outline"
-                                    onClick={() => generateActiveWorkbenchAsset(index)}
-                                    disabled={Boolean(assetGeneratingTarget)}
-                                  >
-                                    {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
-                                      <Loader2 className="size-3 animate-spin" />
-                                    ) : (
-                                      <ImageIcon className="size-3" />
-                                    )}
-                                    {variant.imageUrl ? t("assetRegenerateVariant") : t("assetGenerateVariant")}
-                                  </Button>
+                                <div className="mt-auto grid gap-3 pt-4">
+                                  <div className="flex flex-wrap items-center justify-end gap-2">
+                                    <Button
+                                      size="xs"
+                                      variant="outline"
+                                      disabled={Boolean(assetUploadingTarget)}
+                                      className="relative overflow-hidden"
+                                    >
+                                      {assetUploadingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                        <Loader2 className="size-3 animate-spin" />
+                                      ) : (
+                                        <Upload className="size-3" />
+                                      )}
+                                      上传
+                                      <input
+                                        type="file"
+                                        accept="image/*"
+                                        className="absolute inset-0 cursor-pointer opacity-0"
+                                        onChange={(event) => {
+                                          const selectedFile = event.target.files?.[0];
+                                          event.target.value = "";
+                                          if (selectedFile) void uploadWorkbenchImage(selectedFile, index);
+                                        }}
+                                      />
+                                    </Button>
+                                    <Button
+                                      size="xs"
+                                      variant="outline"
+                                      onClick={() => generateActiveWorkbenchAsset(index)}
+                                      disabled={Boolean(assetGeneratingTarget)}
+                                    >
+                                      {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                        <Loader2 className="size-3 animate-spin" />
+                                      ) : (
+                                        <ImageIcon className="size-3" />
+                                      )}
+                                      {variant.imageUrl ? t("assetRegenerateVariant") : t("assetGenerateVariant")}
+                                    </Button>
+                                  </div>
+
+                                  <div className="grid gap-2 rounded-lg border border-[--border-subtle] bg-[--surface] p-2">
+                                    <Textarea
+                                      value={variant.editInstruction || ""}
+                                      onChange={(event) => updateVariantEditInstruction(index, event.target.value)}
+                                      placeholder="输入变体改图要求，例如：换成深色外套，表情更疲惫，保持同一人物"
+                                      className="min-h-20 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                                    />
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-[10px] text-[--text-muted]">基于当前变体图进行修改</span>
+                                      <Button
+                                        size="xs"
+                                        onClick={() => editWorkbenchVariant(index)}
+                                        disabled={Boolean(assetEditingTarget) || !variant.imageUrl || !variant.editInstruction?.trim()}
+                                      >
+                                        {assetEditingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                          <Loader2 className="size-3 animate-spin" />
+                                        ) : (
+                                          <Sparkles className="size-3" />
+                                        )}
+                                        变体改图
+                                      </Button>
+                                    </div>
+                                  </div>
+
+                                  {variant.history?.length ? (
+                                    <details className="rounded-lg border border-[--border-subtle] bg-white px-2 py-1.5">
+                                      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[11px] font-semibold text-[--text-secondary]">
+                                        <History className="size-3" />
+                                        历史 {variant.history.length}
+                                      </summary>
+                                      <div className="mt-2 grid max-h-36 gap-1 overflow-y-auto">
+                                        {variant.history.slice(0, 8).map((entry, historyIndex) => (
+                                          <button
+                                            key={`${entry.at || historyIndex}:${historyIndex}`}
+                                            type="button"
+                                            onClick={() => {
+                                              const historyImageUrl = typeof entry.imageUrl === "string" ? entry.imageUrl : "";
+                                              if (!historyImageUrl) return;
+                                              patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+                                                const variants = [...(current.variants || [])];
+                                                const currentVariant = variants[index];
+                                                if (!currentVariant) return current;
+                                                variants[index] = { ...currentVariant, imageUrl: historyImageUrl };
+                                                return { ...current, variants };
+                                              });
+                                            }}
+                                            className="grid gap-0.5 rounded border border-transparent px-2 py-1 text-left text-[10px] hover:border-[--border-hover] hover:bg-[--surface]"
+                                          >
+                                            <span className="truncate font-medium text-[--text-primary]">{getHistoryLabel(entry)}</span>
+                                            <span className="truncate text-[--text-muted]">{formatHistoryTime(entry.at)}</span>
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </details>
+                                  ) : null}
                                 </div>
                               )}
                             </div>
@@ -1599,7 +2516,7 @@ export default function ImportPage({
                     {t("assetEmpty")}
                   </div>
                 )}
-              </aside>
+              </section>
             </div>
           </div>
         )}
@@ -1607,61 +2524,159 @@ export default function ImportPage({
         {/* Episodes review (after step 3) */}
         {showEpReview && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="font-display text-lg font-bold text-[--text-primary]">
-                {t("reviewEpisodes")} ({episodes.length})
-              </h3>
-              <Button onClick={runGenerate} className="rounded-xl">
-                {t("confirmAndGenerate")}
-              </Button>
-            </div>
-            <p className="text-sm text-[--text-muted]">{t("reviewEpisodesHint")}</p>
-            <div className="space-y-3">
-              {episodes.map((ep, idx) => (
-                <div
-                  key={`${ep.title}:${idx}`}
-                  className="rounded-xl border border-[--border-subtle] bg-white p-4"
-                >
-                  <div className="mb-2 flex items-center gap-3">
-                    <span className="shrink-0 rounded-md bg-primary/10 px-2 py-0.5 font-mono text-xs font-semibold text-primary">
-                      EP.{String(idx + 1).padStart(2, "0")}
-                    </span>
-                    <Input
-                      value={ep.title}
-                      onChange={(e) => updateEpisode(idx, "title", e.target.value)}
-                      className="h-8 text-sm font-semibold"
-                    />
-                    <button
-                      onClick={() => removeEpisode(idx)}
-                      className="shrink-0 text-[--text-muted] hover:text-red-500"
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
-                  </div>
-                  <p className="text-xs text-[--text-muted]">{ep.description}</p>
-                  {ep.characters && ep.characters.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {ep.characters.map((name, charIdx) => {
-                        const isMain = characters.some((c) => c.name === name && c.scope === "main");
-                        return (
-                          <span key={`${name}:${charIdx}`} className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isMain ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"}`}>
-                            {name}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  )}
-                  {ep.keywords && (
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {ep.keywords.split(/[,，]/).map((kw) => kw.trim()).filter(Boolean).map((kw, kwIdx) => (
-                        <span key={`${kw}:${kwIdx}`} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">
-                          {kw}
-                        </span>
-                      ))}
-                    </div>
-                  )}
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="font-display text-lg font-bold text-[--text-primary]">
+                  {t("reviewEpisodes")} ({episodes.length})
+                </h3>
+                <p className="mt-1 text-sm text-[--text-muted]">{t("reviewEpisodesHint")}</p>
+                <div className="mt-2 text-xs font-semibold text-[--text-secondary]">
+                  {episodeConfirmProgress}
                 </div>
-              ))}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  onClick={confirmAllEpisodes}
+                  disabled={episodes.length === 0 || allEpisodesConfirmed}
+                  className="rounded-xl"
+                >
+                  <Check className="size-4" />
+                  {t("confirmAllEpisodes")}
+                </Button>
+                <Button
+                  onClick={runGenerate}
+                  disabled={!allEpisodesConfirmed || stepStatus[5] === "running"}
+                  className="rounded-xl"
+                >
+                  {stepStatus[5] === "running" && <Loader2 className="size-4 animate-spin" />}
+                  {t("confirmAndGenerate")}
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-3">
+              {episodes.map((ep, idx) => {
+                const isExpanded = expandedEpisodeIndexes.has(idx);
+                const isConfirmed = confirmedEpisodeIndexes.has(idx);
+                const keywords = ep.keywords.split(/[,，]/).map((kw) => kw.trim()).filter(Boolean);
+
+                return (
+                  <div
+                    key={`${ep.title}:${idx}`}
+                    className={`overflow-hidden rounded-xl border bg-white transition-colors ${
+                      isConfirmed ? "border-emerald-200" : "border-[--border-subtle]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-3 p-4">
+                      <button
+                        type="button"
+                        onClick={() => toggleEpisodeExpanded(idx)}
+                        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[--border-subtle] text-[--text-muted] transition-colors hover:border-[--border-hover] hover:text-[--text-primary]"
+                        aria-label={isExpanded ? t("collapseEpisode") : t("expandEpisode")}
+                      >
+                        <ChevronDown className={`h-4 w-4 transition-transform ${isExpanded ? "rotate-180" : ""}`} />
+                      </button>
+                      <span className="shrink-0 rounded-md bg-primary/10 px-2 py-0.5 font-mono text-xs font-semibold text-primary">
+                        EP.{String(idx + 1).padStart(2, "0")}
+                      </span>
+                      <Input
+                        value={ep.title}
+                        onChange={(e) => updateEpisode(idx, "title", e.target.value)}
+                        className="h-8 min-w-0 text-sm font-semibold"
+                      />
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                        isConfirmed ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"
+                      }`}>
+                        {isConfirmed ? t("episodeConfirmed") : t("episodePendingConfirm")}
+                      </span>
+                      <Button
+                        variant={isConfirmed ? "outline" : "default"}
+                        size="sm"
+                        onClick={() => confirmEpisode(idx)}
+                        disabled={isConfirmed}
+                        className="shrink-0 rounded-lg"
+                      >
+                        <Check className="size-3.5" />
+                        {isConfirmed ? t("episodeConfirmed") : t("confirmEpisode")}
+                      </Button>
+                      <button
+                        onClick={() => removeEpisode(idx)}
+                        className="shrink-0 rounded-lg p-1.5 text-[--text-muted] transition-colors hover:bg-red-50 hover:text-red-500"
+                        aria-label={t("removeEpisode")}
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    {isExpanded && (
+                      <div className="grid gap-4 border-t border-[--border-subtle] bg-[--surface] p-4">
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <label className="grid gap-1">
+                            <span className="text-xs font-bold text-[--text-secondary]">{t("episodeDescription")}</span>
+                            <Textarea
+                              value={ep.description}
+                              onChange={(e) => updateEpisode(idx, "description", e.target.value)}
+                              className="min-h-24 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                            />
+                          </label>
+                          <label className="grid gap-1">
+                            <span className="text-xs font-bold text-[--text-secondary]">{t("episodeKeywords")}</span>
+                            <Textarea
+                              value={ep.keywords}
+                              onChange={(e) => updateEpisode(idx, "keywords", e.target.value)}
+                              className="min-h-24 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                            />
+                          </label>
+                        </div>
+                        <label className="grid gap-1">
+                          <span className="text-xs font-bold text-[--text-secondary]">{t("episodeIdea")}</span>
+                          <Textarea
+                            value={ep.idea}
+                            onChange={(e) => updateEpisode(idx, "idea", e.target.value)}
+                            className="min-h-56 resize-y rounded-lg bg-white font-mono text-xs leading-relaxed"
+                          />
+                        </label>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div>
+                            <div className="mb-2 text-xs font-bold text-[--text-secondary]">{t("episodeCharacters")}</div>
+                            {ep.characters && ep.characters.length > 0 ? (
+                              <div className="flex flex-wrap gap-1.5">
+                                {ep.characters.map((name, charIdx) => {
+                                  const isMain = characters.some((c) => c.name === name && c.scope === "main");
+                                  return (
+                                    <span key={`${name}:${charIdx}`} className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isMain ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"}`}>
+                                      {name}
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <div className="rounded-lg border border-dashed border-[--border-subtle] bg-white p-3 text-xs text-[--text-muted]">
+                                {t("episodeNoCharacters")}
+                              </div>
+                            )}
+                          </div>
+                          <div>
+                            <div className="mb-2 text-xs font-bold text-[--text-secondary]">{t("episodeKeywordsPreview")}</div>
+                            {keywords.length > 0 ? (
+                              <div className="flex flex-wrap gap-1.5">
+                                {keywords.map((kw, kwIdx) => (
+                                  <span key={`${kw}:${kwIdx}`} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                                    {kw}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="rounded-lg border border-dashed border-[--border-subtle] bg-white p-3 text-xs text-[--text-muted]">
+                                {t("episodeNoKeywords")}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

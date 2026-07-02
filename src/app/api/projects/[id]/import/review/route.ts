@@ -7,6 +7,11 @@ import { projects } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog, chunkText } from "@/lib/import-utils";
+import {
+  analyzeScriptAssets,
+  type StoryAssetAnalysis,
+  type StoryMetaAnalysis,
+} from "@/lib/asset-agent/analyze-script-assets";
 
 export const maxDuration = 300;
 
@@ -28,6 +33,11 @@ interface SensitiveTerm {
   group: string;
   reason: string;
 }
+
+type ParsedReviewJson = { issues?: Partial<ReviewIssue>[] } | Partial<ReviewIssue>[];
+
+const DEFAULT_REVIEW_CONCURRENCY = 3;
+const MAX_REVIEW_CONCURRENCY = 6;
 
 const SENSITIVE_TERMS: SensitiveTerm[] = [
   { term: "国徽", replacement: "虚构徽记", severity: "high", group: "国家标识/机关标志", reason: "涉及国家标志和机关形象" },
@@ -182,6 +192,17 @@ JSON 格式：
   ]
 }`;
 
+const STORY_ASSET_ANALYSIS_SYSTEM = `你是短剧/AI漫剧的剧本资产解析师。你要从完整剧本中抽取后续生成人物、场景、物品和统一视觉提示词所需的结构化信息。
+
+核心判断规则：
+- characters 只收录真实可复用人物资产。不要把“今生、前世、初期、中期、高潮、背景、性格、人物弧光、题材标签、男主角、女主角、黄金配角”等字段名/阶段名/角色类型当人物。
+- “老板、民警、团长、医生、护士、前夫、婆婆”等泛称默认不要收录，除非剧本把它作为一个稳定反复出现的具体角色且没有姓名。
+- scenes 只收录物理场景/地点/空间，例如“医院、沈家客厅、盘山公路”。不要收录剧情事件，例如“医院抓奸、医院确诊双胞胎、飙车去医院抱住老婆”；遇到这类表达，应归并成其中的物理地点“医院”。
+- props 只收录实体物品/道具，不收录抽象概念、剧情标签、情绪、人物关系。
+- storyMeta 要给后续所有生图提示词复用，简洁稳定，不要剧透式复述长剧情。
+
+只输出一个有效 JSON object，严禁输出 markdown、代码块、解释性前后缀。`;
+
 function buildReviewPrompt(chunk: string, index: number, total: number) {
   return `请审阅下面剧本分块，找出需要人工审核和可一键替换的问题。
 分块：${index + 1}/${total}
@@ -193,6 +214,37 @@ function buildReviewPrompt(chunk: string, index: number, total: number) {
 
 剧本文本：
 ${chunk}`;
+}
+
+function buildStoryAssetAnalysisPrompt(text: string) {
+  return `请解析下面剧本，输出故事元信息和资产草稿。
+
+返回 JSON 格式：
+{
+  "storyMeta": {
+    "time": "故事时间/年代/季节/昼夜倾向，不确定则写空字符串",
+    "background": "世界观、职业背景、社会关系背景",
+    "visualStyleBase": "统一视觉提示词基底，用于人物/场景/物品生图",
+    "genre": "题材类型",
+    "locationBackground": "主要地域或空间背景"
+  },
+  "assets": {
+    "characters": [
+      { "name": "真实人物姓名", "role": "男主角|女主角|主角|男配角|女配角|反派角色|配角", "description": "外形/身份/性格/关系摘要" }
+    ],
+    "scenes": [
+      { "name": "物理地点或空间名", "type": "医疗场景|居住空间|道路|办公场景|其他", "description": "空间特征和剧情用途" }
+    ],
+    "props": [
+      { "name": "实体物品名", "type": "通讯道具|文件|医疗物资|车辆|饰品|其他", "description": "物品用途和视觉特征" }
+    ]
+  }
+}
+
+数量建议：characters 最多 60 个，scenes 最多 80 个，props 最多 80 个。请尽量详细罗列剧本中可复用的具名人物、明确物理地点和有叙事功能的实体道具，但不要误收字段名、剧情事件、抽象概念。
+
+剧本文本：
+${text}`;
 }
 
 function normalizeIssue(issue: Partial<ReviewIssue>): ReviewIssue | null {
@@ -309,19 +361,19 @@ function escapeLooseStringQuotes(json: string) {
   return result;
 }
 
-function parseReviewJson(text: string) {
+function parseJsonObject(text: string) {
   const json = extractJSON(text)
     .replace(/[“”]/g, "\"")
     .replace(/[‘’]/g, "'");
 
   try {
-    return JSON.parse(json) as { issues?: Partial<ReviewIssue>[] } | Partial<ReviewIssue>[];
+    return JSON.parse(json) as unknown;
   } catch (firstError) {
     const repaired = repairJsonStringLines(json)
       .replace(/,\s*([}\]])/g, "$1");
 
     try {
-      return JSON.parse(repaired) as { issues?: Partial<ReviewIssue>[] } | Partial<ReviewIssue>[];
+      return JSON.parse(repaired) as unknown;
     } catch {
       // Continue to quote repair below.
     }
@@ -330,12 +382,16 @@ function parseReviewJson(text: string) {
       .replace(/,\s*([}\]])/g, "$1");
 
     try {
-      return JSON.parse(quoteRepaired) as { issues?: Partial<ReviewIssue>[] } | Partial<ReviewIssue>[];
+      return JSON.parse(quoteRepaired) as unknown;
     } catch {
       const message = firstError instanceof Error ? firstError.message : "Invalid review JSON";
       throw new ReviewJsonParseError(message, json.slice(0, 1000));
     }
   }
+}
+
+function parseReviewJson(text: string) {
+  return parseJsonObject(text) as ParsedReviewJson;
 }
 
 function formatUsage(usage?: {
@@ -455,6 +511,254 @@ function parseIssues(text: string, sourceText: string): ReviewIssue[] {
     .filter((issue): issue is ReviewIssue => issue !== null && sourceText.includes(issue.exactQuote));
 }
 
+function cleanAssetLabel(value: unknown) {
+  return String(value || "")
+    .replace(/[“”"「」『』《》【】（）()]/g, "")
+    .replace(/[，。！？；、,.!?;：:\s]+/g, "")
+    .trim()
+    .slice(0, 24);
+}
+
+function cleanMetaText(value: unknown, max = 220) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function looksLikeBadCharacterName(name: string) {
+  return (
+    !name ||
+    name.length < 2 ||
+    name.length > 8 ||
+    /^(今生|前世|重生前|重生后|前期|初期|中期|后期|高潮|开端|结尾|尾声|背景|性格|人设|设定|剧情|简介|梗概|主题|主线|支线|卖点|看点|题材标签|核心看点|人物弧光|角色弧光|性格反差|高光时刻)$/.test(name) ||
+    /(标签|看点|弧光|反差|时刻|阶段|背景|设定|剧情|简介|梗概|主题|主线|支线|卖点|金手指)$/.test(name) ||
+    /^(男主角?|女主角?|男一|女一|男配|女配|主角|配角|反派|黄金配角|渣男前夫)$/.test(name) ||
+    /^(老板|老首长|团长|民警|医生|护士|警察|司机|保镖|助理|秘书|律师|老师|学生|记者|军官|士兵|下属|领导|同事)$/.test(name) ||
+    /^(前夫|前妻|丈夫|妻子|老婆|老公|婆婆|公公|岳父|岳母|父亲|母亲|爸爸|妈妈|爷爷|奶奶|哥哥|姐姐|弟弟|妹妹|孩子|儿子|女儿)$/.test(name)
+  );
+}
+
+function looksLikePlotEventName(name: string) {
+  return /(抓奸|确诊|怀了|生下|抱住|击打|带婆婆去|想看|发现|赶走|晕倒|死亡|去世|重生|逆袭|抢了|护妻|团灭|复仇|表白|结婚|离婚|争吵|打脸|揭穿|威胁|绑架|逃跑|追车|开会|冲突|反派|男主|女主|老婆|婆婆|孩子|双胞胎|二胎|五感共享|外挂|剧本|剧情|把脉)/.test(name);
+}
+
+function normalizeSceneLabel(name: string) {
+  const sceneKeywords = [
+    "军区一号会议室", "军区医院", "医院中医科", "医院楼顶", "第一医院", "第二医院", "医院", "沈家客厅", "沈家厨房",
+    "盘山公路", "客厅", "卧室", "厨房", "餐厅", "会议室", "办公室", "走廊", "病房", "手术室", "急诊室",
+    "学校", "教室", "公司", "街道", "公路", "车站", "机场", "酒店", "天台", "楼顶",
+  ];
+  const keyword = sceneKeywords.sort((a, b) => b.length - a.length).find((item) => name.includes(item));
+  if (keyword && (looksLikePlotEventName(name) || name.length > keyword.length + 4)) return keyword;
+  if (looksLikePlotEventName(name)) return "";
+  return name;
+}
+
+function normalizeStoryAssetAnalysis(value: unknown): StoryAssetAnalysis | null {
+  const obj = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const storyMetaObj = obj.storyMeta && typeof obj.storyMeta === "object" ? obj.storyMeta as Record<string, unknown> : {};
+  const assetsObj = obj.assets && typeof obj.assets === "object" ? obj.assets as Record<string, unknown> : {};
+
+  const storyMeta: StoryMetaAnalysis = {
+    time: cleanMetaText(storyMetaObj.time, 120),
+    background: cleanMetaText(storyMetaObj.background, 180),
+    visualStyleBase: cleanMetaText(storyMetaObj.visualStyleBase, 220),
+    genre: cleanMetaText(storyMetaObj.genre, 80),
+    locationBackground: cleanMetaText(storyMetaObj.locationBackground, 120),
+  };
+
+  const characters = Array.isArray(assetsObj.characters) ? assetsObj.characters : [];
+  const scenes = Array.isArray(assetsObj.scenes) ? assetsObj.scenes : [];
+  const props = Array.isArray(assetsObj.props) ? assetsObj.props : [];
+
+  const seenCharacters = new Set<string>();
+  const seenScenes = new Set<string>();
+  const seenProps = new Set<string>();
+
+  const normalized: StoryAssetAnalysis = {
+    storyMeta,
+    assets: {
+      characters: characters
+        .map((item) => item && typeof item === "object" ? item as Record<string, unknown> : null)
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+        .map((item) => ({
+          name: cleanAssetLabel(item.name),
+          role: cleanMetaText(item.role, 40),
+          description: cleanMetaText(item.description, 180),
+        }))
+        .filter((item) => {
+          if (looksLikeBadCharacterName(item.name) || seenCharacters.has(item.name)) return false;
+          seenCharacters.add(item.name);
+          return true;
+        })
+        .slice(0, 60),
+      scenes: scenes
+        .map((item) => item && typeof item === "object" ? item as Record<string, unknown> : null)
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+        .map((item) => ({
+          name: normalizeSceneLabel(cleanAssetLabel(item.name)),
+          type: cleanMetaText(item.type, 60),
+          description: cleanMetaText(item.description, 180),
+        }))
+        .filter((item) => {
+          if (!item.name || seenScenes.has(item.name)) return false;
+          seenScenes.add(item.name);
+          return true;
+        })
+        .slice(0, 80),
+      props: props
+        .map((item) => item && typeof item === "object" ? item as Record<string, unknown> : null)
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+        .map((item) => ({
+          name: cleanAssetLabel(item.name),
+          type: cleanMetaText(item.type, 60),
+          description: cleanMetaText(item.description, 180),
+        }))
+        .filter((item) => {
+          if (!item.name || item.name.length < 2 || seenProps.has(item.name)) return false;
+          seenProps.add(item.name);
+          return true;
+        })
+        .slice(0, 80),
+    },
+  };
+
+  const hasMeta = Object.values(storyMeta).some(Boolean);
+  const hasAssets = Boolean(normalized.assets?.characters?.length || normalized.assets?.scenes?.length || normalized.assets?.props?.length);
+  return hasMeta || hasAssets ? normalized : null;
+}
+
+async function analyzeStoryAssets(
+  model: ReturnType<typeof createLanguageModel>,
+  jsonMode: { openai: { response_format: { type: "json_object" } } } | undefined,
+  text: string
+) {
+  const chunks = chunkText(text, 12000);
+  const targets = chunks.length > 1 ? chunks : [text.slice(0, 60000)];
+  const analyses: StoryAssetAnalysis[] = [];
+  const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+
+  for (const [index, chunk] of targets.entries()) {
+    const result = await generateText({
+      model,
+      system: STORY_ASSET_ANALYSIS_SYSTEM,
+      prompt: [
+        targets.length > 1
+          ? `这是完整剧本的第 ${index + 1}/${targets.length} 块。只抽取本块中实际出现的资产，名称保持原文一致。`
+          : "",
+        buildStoryAssetAnalysisPrompt(chunk),
+      ].filter(Boolean).join("\n\n"),
+      providerOptions: jsonMode,
+      temperature: 0.1,
+      maxRetries: 1,
+      maxOutputTokens: 12000,
+    });
+
+    usage.inputTokens += result.usage.inputTokens ?? 0;
+    usage.outputTokens += result.usage.outputTokens ?? 0;
+    usage.totalTokens += result.usage.totalTokens ?? 0;
+
+    const normalized = normalizeStoryAssetAnalysis(parseJsonObject(result.text));
+    if (normalized) analyses.push(normalized);
+  }
+
+  return {
+    analysis: mergeStoryAssetAnalyses(analyses),
+    usage: {
+      inputTokens: usage.inputTokens || undefined,
+      outputTokens: usage.outputTokens || undefined,
+      totalTokens: usage.totalTokens || undefined,
+    },
+  };
+}
+
+function mergeStoryAssetAnalyses(analyses: StoryAssetAnalysis[]) {
+  const storyMeta: StoryMetaAnalysis = {};
+  const characters = new Map<string, { name: string; role?: string; description?: string }>();
+  const scenes = new Map<string, { name: string; type?: string; description?: string }>();
+  const props = new Map<string, { name: string; type?: string; description?: string }>();
+
+  for (const analysis of analyses) {
+    const meta = analysis.storyMeta || {};
+    storyMeta.time ||= meta.time;
+    storyMeta.background ||= meta.background;
+    storyMeta.visualStyleBase ||= meta.visualStyleBase;
+    storyMeta.genre ||= meta.genre;
+    storyMeta.locationBackground ||= meta.locationBackground;
+
+    for (const item of analysis.assets?.characters || []) {
+      mergeStoryAssetItem(characters, item);
+    }
+    for (const item of analysis.assets?.scenes || []) {
+      mergeStoryAssetItem(scenes, item);
+    }
+    for (const item of analysis.assets?.props || []) {
+      mergeStoryAssetItem(props, item);
+    }
+  }
+
+  const merged: StoryAssetAnalysis = {
+    storyMeta,
+    assets: {
+      characters: [...characters.values()].slice(0, 60),
+      scenes: [...scenes.values()].slice(0, 80),
+      props: [...props.values()].slice(0, 80),
+    },
+  };
+
+  return normalizeStoryAssetAnalysis(merged);
+}
+
+function mergeStoryAssetItem<T extends { name: string; role?: string; type?: string; description?: string }>(
+  map: Map<string, T>,
+  item: T
+) {
+  const key = item.name;
+  if (!key) return;
+
+  const existing = map.get(key);
+  if (!existing) {
+    map.set(key, { ...item });
+    return;
+  }
+
+  if (!existing.role && item.role) existing.role = item.role;
+  if (!existing.type && item.type) existing.type = item.type;
+  if ((item.description || "").length > (existing.description || "").length) {
+    existing.description = item.description;
+  }
+}
+
+function buildRuleStoryAssetAnalysis(title: string, text: string, storyAnalysis?: StoryAssetAnalysis | null) {
+  const assetProject = analyzeScriptAssets({
+    title,
+    script: text,
+    storyAnalysis: storyAnalysis || null,
+    aspectRatio: "16:9",
+    targetSize: "1536x1024",
+    style: "真人实拍",
+  });
+
+  return normalizeStoryAssetAnalysis({
+    storyMeta: assetProject.summary.storyMeta || storyAnalysis?.storyMeta,
+    assets: {
+      characters: assetProject.assets.characters.map((asset) => ({
+        name: asset.name,
+        role: asset.role,
+        description: asset.description,
+      })),
+      scenes: assetProject.assets.scenes.map((asset) => ({
+        name: asset.name,
+        type: asset.role,
+        description: asset.description,
+      })),
+      props: assetProject.assets.props.map((asset) => ({
+        name: asset.name,
+        type: asset.role,
+        description: asset.description,
+      })),
+    },
+  });
+}
+
 function findSensitiveTermIssues(text: string): ReviewIssue[] {
   return SENSITIVE_TERMS
     .map((item) => ({ item, index: text.indexOf(item.term) }))
@@ -487,6 +791,28 @@ function dedupeIssues(issues: ReviewIssue[]) {
   }
 
   return deduped;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
+  );
+
+  return results;
 }
 
 function getFriendlyModelError(err: unknown, config: ProviderConfig): string {
@@ -529,6 +855,7 @@ export async function POST(
   const body = (await request.json()) as {
     text: string;
     modelConfig: { text: ProviderConfig | null };
+    reviewConcurrency?: number;
   };
 
   const textModelConfig = body.modelConfig?.text;
@@ -537,63 +864,112 @@ export async function POST(
   }
 
   const chunks = chunkText(body.text, 6000);
+  const reviewConcurrency = Math.max(
+    1,
+    Math.min(
+      MAX_REVIEW_CONCURRENCY,
+      Number.isFinite(body.reviewConcurrency) ? Number(body.reviewConcurrency) : DEFAULT_REVIEW_CONCURRENCY
+    )
+  );
   const model = createLanguageModel(textModelConfig);
   const jsonMode = supportsOpenAIJsonMode(textModelConfig)
-    ? { openai: { response_format: { type: "json_object" } } }
+    ? { openai: { response_format: { type: "json_object" as const } } }
     : undefined;
   const termIssues = findSensitiveTermIssues(body.text);
 
-  await addImportLog(projectId, 2, "running", `开始 AI 剧情审阅，共 ${chunks.length} 块，敏感词预扫描命中 ${termIssues.length} 项`);
+  await addImportLog(projectId, 2, "running", `开始 AI 剧情审阅，共 ${chunks.length} 块，敏感词预扫描命中 ${termIssues.length} 项，并发 ${reviewConcurrency}`);
 
   try {
     const aiIssues: ReviewIssue[] = [];
+    let storyAnalysis: StoryAssetAnalysis | null = null;
     let skippedChunks = 0;
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let totalTokens = 0;
 
-    for (let idx = 0; idx < chunks.length; idx++) {
-      await addImportLog(projectId, 2, "running", `AI 正在审阅第 ${idx + 1}/${chunks.length} 块...`);
-
-      const result = await generateText({
-        model,
-        system: REVIEW_SYSTEM,
-        prompt: buildReviewPrompt(chunks[idx], idx, chunks.length),
-        providerOptions: jsonMode,
-        temperature: 0.1,
-        maxRetries: 1,
-      });
-
+    try {
+      await addImportLog(projectId, 2, "running", "AI 正在解析故事时间、背景和资产草稿...");
+      const result = await analyzeStoryAssets(model, jsonMode, body.text);
+      storyAnalysis = result.analysis;
       totalInputTokens += result.usage.inputTokens ?? 0;
       totalOutputTokens += result.usage.outputTokens ?? 0;
       totalTokens += result.usage.totalTokens ?? 0;
+      await addImportLog(
+        projectId,
+        2,
+        "running",
+        storyAnalysis
+          ? `故事资产解析完成：角色 ${storyAnalysis.assets?.characters?.length || 0}、场景 ${storyAnalysis.assets?.scenes?.length || 0}、物品 ${storyAnalysis.assets?.props?.length || 0}${formatUsage(result.usage)}`
+          : `故事资产解析未返回可用结构，将使用规则 Agent 兜底${formatUsage(result.usage)}`
+      );
+    } catch (err) {
+      console.warn("[ImportReview] Story asset analysis failed, fallback to rule agent:", err);
+      await addImportLog(projectId, 2, "running", "故事资产解析失败，将使用规则 Agent 兜底，不影响剧情审阅。");
+    }
 
-      try {
-        const parsedIssues = parseIssues(result.text, chunks[idx]);
-        aiIssues.push(...parsedIssues);
-        const usedMarkdownFallback = parsedIssues.some((issue) => issue.title === "AI 返回了非 JSON 报告中的疑似问题片段");
-        await addImportLog(
-          projectId,
-          2,
-          "running",
-          usedMarkdownFallback
-            ? `第 ${idx + 1}/${chunks.length} 块 AI 返回非 JSON，已从报告中本地提取 ${parsedIssues.length} 条可定位片段${formatUsage(result.usage)}`
-            : `第 ${idx + 1}/${chunks.length} 块审阅完成${formatUsage(result.usage)}`
-        );
-      } catch (err) {
-        if (err instanceof ReviewJsonParseError) {
-          skippedChunks++;
-          console.error(`[ImportReview] Chunk ${idx + 1} JSON parse failed. Raw:\n${err.snippet}...`);
+    const ruleStoryAnalysis = buildRuleStoryAssetAnalysis(project.title, body.text, storyAnalysis);
+    storyAnalysis = mergeStoryAssetAnalyses([
+      ...(storyAnalysis ? [storyAnalysis] : []),
+      ...(ruleStoryAnalysis ? [ruleStoryAnalysis] : []),
+    ]);
+    if (storyAnalysis) {
+      await addImportLog(
+        projectId,
+        2,
+        "running",
+        `资产草稿已补全：角色 ${storyAnalysis.assets?.characters?.length || 0}、场景 ${storyAnalysis.assets?.scenes?.length || 0}、物品 ${storyAnalysis.assets?.props?.length || 0}`
+      );
+    }
+
+    const chunkResults = await mapWithConcurrency(
+      chunks,
+      reviewConcurrency,
+      async (chunk, idx) => {
+        await addImportLog(projectId, 2, "running", `AI 正在审阅第 ${idx + 1}/${chunks.length} 块...`);
+
+        const result = await generateText({
+          model,
+          system: REVIEW_SYSTEM,
+          prompt: buildReviewPrompt(chunk, idx, chunks.length),
+          providerOptions: jsonMode,
+          temperature: 0.1,
+          maxRetries: 1,
+        });
+
+        try {
+          const parsedIssues = parseIssues(result.text, chunk);
+          const usedMarkdownFallback = parsedIssues.some((issue) => issue.title === "AI 返回了非 JSON 报告中的疑似问题片段");
           await addImportLog(
             projectId,
             2,
             "running",
-            `第 ${idx + 1} 块 AI 返回的 JSON 格式异常，已跳过该块 AI 结果并继续审阅${formatUsage(result.usage)}。`
+            usedMarkdownFallback
+              ? `第 ${idx + 1}/${chunks.length} 块 AI 返回非 JSON，已从报告中本地提取 ${parsedIssues.length} 条可定位片段${formatUsage(result.usage)}`
+              : `第 ${idx + 1}/${chunks.length} 块审阅完成${formatUsage(result.usage)}`
           );
-          continue;
+          return { issues: parsedIssues, skipped: false, usage: result.usage };
+        } catch (err) {
+          if (err instanceof ReviewJsonParseError) {
+            console.error(`[ImportReview] Chunk ${idx + 1} JSON parse failed. Raw:\n${err.snippet}...`);
+            await addImportLog(
+              projectId,
+              2,
+              "running",
+              `第 ${idx + 1} 块 AI 返回的 JSON 格式异常，已跳过该块 AI 结果并继续审阅${formatUsage(result.usage)}。`
+            );
+            return { issues: [] as ReviewIssue[], skipped: true, usage: result.usage };
+          }
+          throw err;
         }
-        throw err;
       }
+    );
+
+    for (const chunkResult of chunkResults) {
+      aiIssues.push(...chunkResult.issues);
+      if (chunkResult.skipped) skippedChunks++;
+      totalInputTokens += chunkResult.usage.inputTokens ?? 0;
+      totalOutputTokens += chunkResult.usage.outputTokens ?? 0;
+      totalTokens += chunkResult.usage.totalTokens ?? 0;
     }
 
     const deduped = dedupeIssues([...termIssues, ...aiIssues]);
@@ -612,10 +988,10 @@ export async function POST(
       deduped.length > 0
         ? `AI 剧情审阅完成，发现 ${deduped.length} 个问题${skippedSuffix}${usageSuffix}`
         : `AI 剧情审阅完成，未发现明显问题${skippedSuffix}${usageSuffix}`,
-      { issues: deduped, usage, skippedChunks }
+      { issues: deduped, usage, skippedChunks, reviewConcurrency, storyAnalysis }
     );
 
-    return NextResponse.json({ issues: deduped, skippedChunks, usage });
+    return NextResponse.json({ issues: deduped, skippedChunks, usage, reviewConcurrency, storyAnalysis });
   } catch (err) {
     const msg = getFriendlyModelError(err, textModelConfig);
     console.error("[ImportReview] Story review failed:", err);
