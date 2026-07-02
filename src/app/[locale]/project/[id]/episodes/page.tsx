@@ -1770,8 +1770,8 @@ export default function EpisodesPage({
   ];
 
   return (
-    <div className="flex-1 overflow-y-auto bg-white pb-24 lg:pb-6">
-      <div className="shrink-0 border-b border-[--border-subtle] bg-white px-3 py-2">
+    <div className="flex-1 overflow-y-auto bg-frame-grid pb-24 lg:pb-6">
+      <div className="shrink-0 border-b border-[--border-subtle] bg-[#070A10]/88 px-3 py-2 backdrop-blur-xl">
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
           <Link
             href={`/${locale}`}
@@ -1787,9 +1787,9 @@ export default function EpisodesPage({
               <Link
                 key={label}
                 href={`/${locale}/project/${projectId}/import`}
-                className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent bg-[--surface] px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:bg-primary/5 hover:text-primary"
+                className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-[--border-subtle] bg-[--surface]/70 px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:border-primary/45 hover:bg-primary/10 hover:text-primary"
               >
-                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white">
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/12">
                   <Icon className="h-4 w-4" />
                 </div>
                 <span className="truncate text-xs font-medium xl:text-sm">{label}</span>
@@ -1808,11 +1808,11 @@ export default function EpisodesPage({
 
       {/* Episode chips */}
       {episodes.length === 0 ? (
-        <div className="flex min-h-[400px] flex-col items-center justify-center rounded-3xl border border-dashed border-[--border-subtle] bg-white/50 p-8 text-center">
-          <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-primary/15 to-accent/10">
+        <div className="frame-panel flex min-h-[400px] flex-col items-center justify-center rounded-lg border-dashed p-8 text-center">
+          <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-lg bg-gradient-to-br from-[--brand-cyan] via-[--brand-blue] to-[--brand-violet] shadow-[0_0_32px_rgba(47,107,255,0.35)]">
             <Layers className="h-7 w-7 text-primary" />
           </div>
-          <h3 className="font-display text-lg font-semibold text-[--text-primary]">
+          <h3 className="frame-gradient-text font-display text-lg font-extrabold">
             {t("title")}
           </h3>
           <p className="mt-2 max-w-sm text-sm text-[--text-secondary]">

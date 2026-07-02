@@ -149,7 +149,7 @@ export function AgentSection() {
   const isEditing = editingId !== null;
 
   return (
-    <div className="rounded-2xl border border-[--border-subtle] bg-white p-5">
+    <div className="frame-panel rounded-lg p-5">
       <div className="mb-4 flex items-center justify-between">
         <h3 className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.15em] text-[--text-muted]">
           <Bot className="h-3.5 w-3.5" />

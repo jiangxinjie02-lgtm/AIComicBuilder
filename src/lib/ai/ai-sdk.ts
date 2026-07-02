@@ -1,6 +1,7 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel } from "ai";
+import { splitConfiguredKeys } from "./key-pool";
 
 export interface ProviderConfig {
   protocol: string;
@@ -15,7 +16,7 @@ export function createLanguageModel(config: ProviderConfig): LanguageModel {
     case "openai": {
       const provider = createOpenAI({
         apiKey: config.apiKey,
-        baseURL: config.baseUrl,
+        baseURL: config.baseUrl || undefined,
       });
       return provider.chat(config.modelId);
     }
@@ -28,6 +29,40 @@ export function createLanguageModel(config: ProviderConfig): LanguageModel {
     default:
       throw new Error(`Unsupported protocol: ${config.protocol}`);
   }
+}
+
+function firstConfiguredApiKey(apiKeysEnv: string[], labelPrefix: string) {
+  return splitConfiguredKeys({ apiKey: "", apiKeysEnv, labelPrefix })[0]?.apiKey ?? "";
+}
+
+export function resolveLanguageModelConfig(config?: ProviderConfig | null): ProviderConfig | null {
+  if (config?.apiKey) return config;
+
+  if (process.env.OPENAI_API_KEYS || process.env.OPENAI_API_KEY) {
+    const apiKey = firstConfiguredApiKey(["OPENAI_API_KEYS", "OPENAI_API_KEY"], "openai");
+    if (apiKey) {
+      return {
+        protocol: "openai",
+        baseUrl: process.env.OPENAI_BASE_URL || "",
+        apiKey,
+        modelId: process.env.OPENAI_MODEL || "gpt-4o",
+      };
+    }
+  }
+
+  if (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY) {
+    const apiKey = firstConfiguredApiKey(["GEMINI_API_KEYS", "GEMINI_API_KEY"], "gemini");
+    if (apiKey) {
+      return {
+        protocol: "gemini",
+        baseUrl: process.env.GEMINI_BASE_URL || "",
+        apiKey,
+        modelId: process.env.GEMINI_MODEL || "gemini-2.0-flash",
+      };
+    }
+  }
+
+  return null;
 }
 
 export function supportsOpenAIJsonMode(config: ProviderConfig): boolean {

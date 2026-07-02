@@ -1166,13 +1166,13 @@ export default function ImportPage({
   const stepColor = (status: string, selected: boolean) => {
     const base = (() => {
       switch (status) {
-        case "running": return "border-primary/30 bg-primary/5 text-primary";
-        case "done": return "border-transparent bg-[--surface] text-[--text-primary]";
-        case "error": return "border-red-300 bg-red-50 text-red-500";
-        default: return "border-transparent bg-[--surface] text-[--text-muted]";
+        case "running": return "border-primary/45 bg-primary/10 text-primary";
+        case "done": return "border-[--success]/35 bg-[--success]/10 text-[--text-primary]";
+        case "error": return "border-red-400/45 bg-red-500/10 text-red-400";
+        default: return "border-[--border-subtle] bg-[--surface]/70 text-[--text-muted]";
       }
     })();
-    if (selected) return base + " !bg-primary/10 !border-primary/40 !text-primary shadow-sm";
+    if (selected) return base + " !bg-primary/12 !border-primary/60 !text-primary shadow-[0_0_24px_rgba(47,107,255,0.18)]";
     return base;
   };
 
@@ -1747,9 +1747,9 @@ export default function ImportPage({
   const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed !== false).length;
   const allAssetsConfirmed = allWorkbenchAssets.length > 0 && confirmedAssetCount === allWorkbenchAssets.length;
   return (
-    <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-[--surface]">
+    <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-frame-grid">
       {/* Top: Steps navigation */}
-      <div className="shrink-0 border-b border-[--border-subtle] bg-white px-3 py-2">
+      <div className="shrink-0 border-b border-[--border-subtle] bg-[#070A10]/88 px-3 py-2 backdrop-blur-xl">
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
           <button
             onClick={() => router.push(`/${locale}`)}
@@ -1772,7 +1772,7 @@ export default function ImportPage({
                     if (!isClickable) return;
                     goToStep(num);
                   }}
-                  className={`relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2.5 text-left transition-all duration-200 ${stepColor(stepStatus[num], isSelected)} ${isClickable ? "cursor-pointer hover:bg-primary/5" : ""}`}
+                  className={`relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2.5 text-left transition-all duration-200 ${stepColor(stepStatus[num], isSelected)} ${isClickable ? "cursor-pointer hover:border-primary/45 hover:bg-primary/10" : ""}`}
                 >
                   {isSelected && (
                     <div className="absolute inset-x-3 bottom-0 h-[3px] rounded-t-full bg-primary" />
@@ -1782,7 +1782,7 @@ export default function ImportPage({
                       ? isSelected ? "bg-primary/15 text-primary" : "bg-emerald-100 text-emerald-600"
                       : stepStatus[num] === "running" ? "bg-primary/15"
                       : stepStatus[num] === "error" ? "bg-red-100"
-                      : "bg-white"
+                       : "bg-[--surface]"
                   }`}>
                     {stepIcon(stepStatus[num]) || <Icon className="h-4 w-4" />}
                   </div>
@@ -1793,9 +1793,9 @@ export default function ImportPage({
             <button
               type="button"
               onClick={() => router.push(`/${locale}/project/${projectId}/episodes`)}
-              className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent bg-[--surface] px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:bg-primary/5 hover:text-primary"
+               className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-[--border-subtle] bg-[--surface]/70 px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:border-primary/45 hover:bg-primary/10 hover:text-primary"
             >
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/12">
                 <Layers className="h-4 w-4" />
               </div>
               <span className="truncate text-xs font-medium xl:text-sm">分集管理</span>
@@ -1811,12 +1811,12 @@ export default function ImportPage({
           <div className="mx-auto w-full max-w-xl space-y-6">
             {/* Drop zone */}
             <div
-              className={`relative flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed p-12 transition-colors ${
+              className={`relative flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-12 transition-colors ${
                 dragOver
                   ? "border-primary bg-primary/5"
                   : file
-                    ? "border-emerald-300 bg-emerald-50/50"
-                    : "border-[--border-subtle] bg-white"
+                    ? "border-emerald-400/60 bg-emerald-500/10"
+                    : "frame-panel border-[--border-subtle]"
               }`}
               onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
               onDragLeave={() => setDragOver(false)}

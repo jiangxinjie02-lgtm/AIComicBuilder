@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { generateText } from "ai";
-import { createLanguageModel, extractJSON, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
+import { createLanguageModel, extractJSON, resolveLanguageModelConfig, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
 import { db } from "@/lib/db";
 import { projects } from "@/lib/db/schema";
@@ -419,7 +419,7 @@ export async function POST(
     allCharacters: CharacterSummary[];
     allItems?: AssetSummary[];
     allEnvironments?: AssetSummary[];
-    modelConfig: { text: ProviderConfig | null };
+    modelConfig?: { text: ProviderConfig | null };
   };
 
   const explicitEpisodes = splitByExplicitEpisodeMarkers(body.text, body.allCharacters || []);
@@ -441,7 +441,7 @@ export async function POST(
     return NextResponse.json({ episodes: explicitEpisodes, mode: "explicit_markers" });
   }
 
-  const textModelConfig = body.modelConfig?.text;
+  const textModelConfig = resolveLanguageModelConfig(body.modelConfig?.text);
   if (!textModelConfig) {
     return NextResponse.json({ error: "No text model" }, { status: 400 });
   }
