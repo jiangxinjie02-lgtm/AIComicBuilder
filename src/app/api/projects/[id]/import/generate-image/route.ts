@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { projects } from "@/lib/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
+import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -55,6 +56,8 @@ interface GenerateImageBody {
 }
 
 const generatedDir = path.join(process.cwd(), "public", "generated");
+let imageKeyPool: ApiKeyPool | null = null;
+let imageKeyPoolSignature = "";
 
 export async function POST(
   request: Request,
@@ -112,8 +115,8 @@ export async function POST(
 
 async function callImage2(payload: ProviderPayload) {
   const endpoint = getImageEndpoint();
-  const apiKey = getImageApiKey();
-  if (!endpoint || !apiKey) {
+  const keyPool = getImageKeyPool();
+  if (!endpoint || !keyPool) {
     return {
       provider: "mock",
       status: "skipped",
@@ -123,50 +126,61 @@ async function callImage2(payload: ProviderPayload) {
     };
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    Number(process.env.IMAGE2_TIMEOUT_MS || 300000),
-  );
-
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(stripMetadataForProvider(payload)),
+    return await keyPool.withKey(async (entry) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Number(process.env.IMAGE2_TIMEOUT_MS || 300000),
+      );
+      const startedAt = Date.now();
+
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${entry.apiKey}`,
+          },
+          body: JSON.stringify(stripMetadataForProvider(payload)),
+        });
+
+        const text = await response.text();
+        let json: unknown;
+        try {
+          json = text ? JSON.parse(text) : {};
+        } catch {
+          json = { raw: text };
+        }
+
+        if (!response.ok) {
+          const error = getProviderError(json) || `image2 returned HTTP ${response.status}`;
+          console.warn(`[Image2] Provider error after ${Date.now() - startedAt}ms: ${error}`);
+          if (response.status === 429) throw new Error(error);
+          return {
+            provider: "jimapi:image2",
+            status: "error",
+            request: payload,
+            error,
+            raw: sanitizeProviderRaw(json),
+          };
+        }
+
+        const extracted = await extractImageResult(json, payload);
+        console.log(`[Image2] Succeeded in ${Date.now() - startedAt}ms; cached=${Boolean(extracted.savedPath)}`);
+        return {
+          provider: "jimapi:image2",
+          status: "succeeded",
+          request: payload,
+          imageUrl: extracted.imageUrl,
+          savedPath: extracted.savedPath,
+          raw: sanitizeProviderRaw(json),
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
     });
-
-    const text = await response.text();
-    let json: unknown;
-    try {
-      json = text ? JSON.parse(text) : {};
-    } catch {
-      json = { raw: text };
-    }
-
-    if (!response.ok) {
-      return {
-        provider: "jimapi:image2",
-        status: "error",
-        request: payload,
-        error: getProviderError(json) || `image2 returned HTTP ${response.status}`,
-        raw: sanitizeProviderRaw(json),
-      };
-    }
-
-    const extracted = await extractImageResult(json, payload);
-    return {
-      provider: "jimapi:image2",
-      status: "succeeded",
-      request: payload,
-      imageUrl: extracted.imageUrl,
-      savedPath: extracted.savedPath,
-      raw: sanitizeProviderRaw(json),
-    };
   } catch (error) {
     const message = error instanceof Error ? error.message : "image2 request failed";
     return {
@@ -177,8 +191,6 @@ async function callImage2(payload: ProviderPayload) {
         ? `image2 generation exceeded ${process.env.IMAGE2_TIMEOUT_MS || 300000}ms and was aborted.`
         : message,
     };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -189,8 +201,23 @@ function getImageEndpoint() {
   return `${base}/images/generations`;
 }
 
-function getImageApiKey() {
-  return process.env.JIMAPI_API_KEY || process.env.IMAGE2_API_KEY || "";
+function getImageKeyPool() {
+  const hasPoolKeys = Boolean(process.env.JIMAPI_API_KEYS || process.env.IMAGE2_API_KEYS);
+  const entries = splitConfiguredKeys({
+    apiKey: hasPoolKeys ? "" : process.env.JIMAPI_API_KEY || process.env.IMAGE2_API_KEY || "",
+    apiKeysEnv: ["JIMAPI_API_KEYS", "IMAGE2_API_KEYS"],
+    labelPrefix: "jimapi:image2",
+  });
+  if (entries.length === 0) return null;
+
+  const signature = entries.map((entry) => entry.apiKey).join("|");
+  if (!imageKeyPool || imageKeyPoolSignature !== signature) {
+    imageKeyPool = new ApiKeyPool(entries);
+    imageKeyPoolSignature = signature;
+    console.log(`[ImageKeyPool] jimapi:image2 loaded ${entries.length} API keys`);
+  }
+
+  return imageKeyPool;
 }
 
 function getImageModel() {
@@ -248,7 +275,11 @@ function sizeForCategory(category: string) {
 
 async function extractImageResult(json: unknown, payload: ProviderPayload) {
   const directUrl = extractImageUrl(json);
-  if (directUrl) return { imageUrl: directUrl, savedPath: "" };
+  if (directUrl) {
+    const saved = await saveRemoteImage(directUrl, payload);
+    if (saved) return saved;
+    return { imageUrl: directUrl, savedPath: "" };
+  }
 
   const b64 = extractImageBase64(json);
   if (!b64) return { imageUrl: "", savedPath: "" };
@@ -266,6 +297,41 @@ async function extractImageResult(json: unknown, payload: ProviderPayload) {
     imageUrl: `/generated/${filename}`,
     savedPath: outputPath,
   };
+}
+
+async function saveRemoteImage(imageUrl: string, payload: ProviderPayload) {
+  if (!/^https?:\/\//i.test(imageUrl)) return null;
+
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) return null;
+
+    const contentType = response.headers.get("content-type") || "";
+    const ext = imageExtensionFrom(contentType, imageUrl);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    await fs.mkdir(generatedDir, { recursive: true });
+    const safeAsset = slugify(
+      payload.metadata.assetName || payload.metadata.assetId || payload.metadata.targetName || "asset",
+    );
+    const filename = `${Date.now()}_${safeAsset}.${ext}`;
+    const outputPath = path.join(generatedDir, filename);
+    await fs.writeFile(outputPath, buffer);
+    return {
+      imageUrl: `/generated/${filename}`,
+      savedPath: outputPath,
+    };
+  } catch (err) {
+    console.warn("[Image2] Failed to cache remote image locally:", err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+function imageExtensionFrom(contentType: string, imageUrl: string) {
+  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
+  if (contentType.includes("webp")) return "webp";
+  if (contentType.includes("png")) return "png";
+  const ext = imageUrl.split("?")[0].split(".").pop()?.toLowerCase();
+  return ext && /^[a-z0-9]+$/.test(ext) ? ext : "png";
 }
 
 function extractImageUrl(value: unknown): string {

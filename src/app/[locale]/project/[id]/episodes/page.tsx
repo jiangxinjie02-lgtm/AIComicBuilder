@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use, useMemo, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useState, use, useMemo, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import {
   AlertCircle,
@@ -14,7 +14,10 @@ import {
   Layers,
   Loader2,
   Merge,
+  MoreHorizontal,
   Plus,
+  Copy,
+  Trash2,
   Upload,
   Users,
   VideoIcon,
@@ -80,6 +83,7 @@ interface EpisodeShot {
   motionScript: string | null;
   cameraDirection: string;
   duration: number;
+  versionId?: string | null;
   sceneId?: string | null;
   compositionGuide?: string | null;
   status: string;
@@ -113,6 +117,12 @@ interface DraftScene {
   prompt: string;
   environment: string[];
   props: string[];
+}
+
+interface StoredDraftScenes {
+  version: number;
+  sourceSignature: string;
+  scenes: DraftScene[];
 }
 
 type AssetCategory = "characters" | "environments" | "items";
@@ -285,7 +295,6 @@ function inferDefaultAssetIds(scene: DraftScene, assets: LibraryAsset[], categor
   const matched = assets.filter((asset) => text.includes(asset.name));
   if (matched.length) return matched.slice(0, 8).map((asset) => asset.id);
   if (category === "characters") return assets.slice(0, 6).map((asset) => asset.id);
-  if (category === "environments") return assets.slice(0, 3).map((asset) => asset.id);
   return [];
 }
 
@@ -344,36 +353,190 @@ function inferPropsFromText(text: string) {
   return uniqueTextItems(candidates.filter((item) => text.includes(item)), 6);
 }
 
-function parseDraftScenes(source: string | null | undefined): DraftScene[] {
+function draftSourceSignature(source: string, episodeSequence?: number) {
+  const normalized = source.replace(/\s+/g, " ").trim();
+  let hash = 0;
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash = (hash * 31 + normalized.charCodeAt(index)) >>> 0;
+  }
+  return `${episodeSequence || 0}:${normalized.length}:${hash.toString(36)}`;
+}
+
+function containsOtherEpisodeMarker(value: string, episodeSequence?: number) {
+  if (!episodeSequence) return false;
+  const text = String(value || "");
+  for (const match of text.matchAll(/第\s*(\d+)\s*集/g)) {
+    if (Number(match[1]) !== episodeSequence) return true;
+  }
+  for (const match of text.matchAll(/(?:^|[^\d])(\d+)\s*[-－—]\s*\d+\s+/g)) {
+    if (Number(match[1]) !== episodeSequence) return true;
+  }
+  return false;
+}
+
+function isDraftSceneListCompatible(
+  scenes: unknown,
+  parsedScenes: DraftScene[],
+  episodeSequence?: number
+): scenes is DraftScene[] {
+  if (!Array.isArray(scenes)) return false;
+  const validScenes = scenes.every(
+    (scene) =>
+      scene &&
+      typeof scene === "object" &&
+      typeof (scene as DraftScene).id === "string" &&
+      typeof (scene as DraftScene).name === "string" &&
+      typeof (scene as DraftScene).prompt === "string" &&
+      Array.isArray((scene as DraftScene).environment) &&
+      Array.isArray((scene as DraftScene).props)
+  );
+  if (!validScenes) return false;
+  if (
+    parsedScenes.length > 0 &&
+    scenes.length > Math.max(parsedScenes.length + 3, parsedScenes.length * 2)
+  ) {
+    return false;
+  }
+  return !scenes.some((scene) =>
+    containsOtherEpisodeMarker(`${scene.name}\n${scene.prompt}`, episodeSequence)
+  );
+}
+
+function normalizeSceneHeadingTitle(title: string) {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  const bracketed = normalized.match(/^【\s*([^】]+)\s*】$/);
+  return bracketed ? bracketed[1].replace(/\s+/g, " ").trim() : normalized;
+}
+
+function sceneHeadingInfo(title: string) {
+  const normalized = normalizeSceneHeadingTitle(title);
+  const numbered = normalized.match(/^(?:第\s*(\d+)\s*集\s*)?(\d+)\s*[-－—]\s*(\d+)\s+(.+)$/);
+  if (numbered) {
+    return {
+      episodeNumber: Number(numbered[1] || numbered[2]),
+      sceneKey: `${Number(numbered[2])}-${Number(numbered[3])}`,
+      name: numbered[4].trim(),
+    };
+  }
+
+  const scene = normalized.match(/^(场景\s*\d+)\s*[:：-]?\s*(.+)$/i);
+  if (scene) {
+    return {
+      episodeNumber: null,
+      sceneKey: scene[1].replace(/\s+/g, ""),
+      name: scene[2].trim(),
+    };
+  }
+
+  return {
+    episodeNumber: null,
+    sceneKey: normalized,
+    name: normalized,
+  };
+}
+
+function isSceneHeading(title: string) {
+  const normalized = normalizeSceneHeadingTitle(title);
+  return /(?:第\s*\d+\s*集\s*)?\d+\s*[-－—]\s*\d+\s+/.test(normalized) || /场景\s*\d+/i.test(normalized);
+}
+
+function parseDraftScenes(source: string | null | undefined, episodeSequence?: number): DraftScene[] {
   const text = String(source || "").trim();
   if (!text) return [];
 
-  const matches = Array.from(text.matchAll(/【\s*(场景\s*\d+\s*[:：][^】]+)\s*】/g));
-  if (matches.length === 0) {
+  const candidates: Array<{
+    index: number;
+    end: number;
+    title: string;
+    episodeNumber: number | null;
+    sceneKey: string;
+  }> = [];
+
+  for (const match of text.matchAll(/【\s*([^】]+)\s*】/g)) {
+    const title = normalizeSceneHeadingTitle(match[1]);
+    if (!isSceneHeading(title)) continue;
+    const info = sceneHeadingInfo(title);
+    candidates.push({
+      index: match.index || 0,
+      end: (match.index || 0) + match[0].length,
+      title,
+      episodeNumber: info.episodeNumber,
+      sceneKey: info.sceneKey,
+    });
+  }
+
+  const linePattern = /[^\r\n]+/g;
+  for (const match of text.matchAll(linePattern)) {
+    const title = normalizeSceneHeadingTitle(match[0]);
+    if (!isSceneHeading(title)) continue;
+    const info = sceneHeadingInfo(title);
+    candidates.push({
+      index: match.index || 0,
+      end: (match.index || 0) + match[0].length,
+      title,
+      episodeNumber: info.episodeNumber,
+      sceneKey: info.sceneKey,
+    });
+  }
+
+  const headings = candidates
+    .sort((a, b) => a.index - b.index)
+    .reduce<typeof candidates>((items, candidate) => {
+      const previous = items[items.length - 1];
+      if (
+        previous &&
+        previous.sceneKey === candidate.sceneKey &&
+        candidate.index <= previous.end + 120
+      ) {
+        previous.end = Math.max(previous.end, candidate.end);
+        previous.title = candidate.title;
+        return items;
+      }
+      items.push({ ...candidate });
+      return items;
+    }, []);
+
+  const filtered = headings.filter((candidate) => {
+    if (!episodeSequence || !candidate.episodeNumber) return true;
+    return candidate.episodeNumber === episodeSequence;
+  });
+
+  if (filtered.length === 0) {
     return [
       {
         id: "draft-scene-1",
         name: "场景草稿",
-        prompt: compactText(text, 620),
+        prompt: text,
         environment: [],
         props: inferPropsFromText(text),
       },
     ];
   }
 
-  return matches.map((match, index) => {
-    const start = (match.index || 0) + match[0].length;
-    const end = matches[index + 1]?.index ?? text.length;
-    const name = match[1].replace(/\s+/g, " ").trim();
-    const prompt = `${match[0]}${text.slice(start, end)}`.trim();
+  return filtered.map((heading, index) => {
+    const headingIndex = headings.findIndex((item) => item === heading);
+    const end = headings[headingIndex + 1]?.index ?? text.length;
+    const info = sceneHeadingInfo(heading.title);
+    const name = info.name || heading.title;
+    const prompt = `${heading.title}\n\n${text.slice(heading.end, end)}`.trim();
     return {
       id: `draft-scene-${index + 1}`,
       name,
-      prompt: compactText(prompt, 620),
+      prompt,
       environment: splitSceneNameParts(name),
       props: inferPropsFromText(prompt),
     };
   });
+}
+
+function createEmptyDraftScene(index: number): DraftScene {
+  return {
+    id: `draft-scene-manual-${Date.now()}-${index}`,
+    name: "场景草稿",
+    prompt: "",
+    environment: [],
+    props: [],
+  };
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -448,10 +611,74 @@ export default function EpisodesPage({
   const [selectedVideoModel, setSelectedVideoModel] = useState<ModelRef | null>(null);
   const [selectedVideoResolution, setSelectedVideoResolution] = useState("720p");
   const [selectedVideoDuration, setSelectedVideoDuration] = useState(5);
+  const [draftSceneEdits, setDraftSceneEdits] = useState<DraftScene[] | null>(null);
+  const [draftSceneMenuOpen, setDraftSceneMenuOpen] = useState<string | null>(null);
+  const [storyboardSceneMenuOpen, setStoryboardSceneMenuOpen] = useState<string | null>(null);
+  const [storyboardSceneActionId, setStoryboardSceneActionId] = useState<string | null>(null);
+
+  const activeEpisode = useMemo(
+    () => episodes.find((episode) => episode.id === activeEpisodeId) || episodes[0],
+    [episodes, activeEpisodeId]
+  );
+
+  const draftSceneSource = useMemo(
+    () =>
+      episodeDetail?.script ||
+      episodeDetail?.idea ||
+      episodeDetail?.description ||
+      activeEpisode?.script ||
+      activeEpisode?.idea ||
+      activeEpisode?.description ||
+      "",
+    [
+      activeEpisode?.description,
+      activeEpisode?.idea,
+      activeEpisode?.script,
+      episodeDetail?.description,
+      episodeDetail?.idea,
+      episodeDetail?.script,
+    ]
+  );
+
+  const draftSceneSourceSignature = useMemo(
+    () => draftSourceSignature(draftSceneSource, activeEpisode?.sequence),
+    [activeEpisode?.sequence, draftSceneSource]
+  );
+
+  const draftSceneStorageKey = activeEpisodeId
+    ? `episodeDraftScenes:v4:${projectId}:${activeEpisodeId}:${draftSceneSourceSignature}`
+    : null;
 
   useEffect(() => {
     fetchEpisodes(projectId);
   }, [projectId, fetchEpisodes]);
+
+  const applyEpisodeDetail = useCallback((data: EpisodeDetail) => {
+    setEpisodeDetail(data);
+    setPromptDrafts((prev) => {
+      const next = { ...prev };
+      for (const shot of data.shots || []) {
+        if (!(shot.id in next)) {
+          next[shot.id] = shot.videoPrompt || shot.prompt || shot.videoScript || "";
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const loadEpisodeDetail = useCallback(
+    async (episodeId: string, options?: { showLoading?: boolean }) => {
+      if (options?.showLoading) setDetailLoading(true);
+      try {
+        const res = await apiFetch(`/api/projects/${projectId}/episodes/${episodeId}`);
+        if (!res.ok) throw new Error(await res.text());
+        return (await res.json()) as EpisodeDetail;
+      } finally {
+        if (options?.showLoading) setDetailLoading(false);
+      }
+    },
+    [projectId]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -519,21 +746,9 @@ export default function EpisodesPage({
     if (!activeEpisodeId) return;
     let cancelled = false;
     setDetailLoading(true);
-    apiFetch(`/api/projects/${projectId}/episodes/${activeEpisodeId}`)
-      .then((res) => res.json())
-      .then((data: EpisodeDetail) => {
-        if (!cancelled) {
-          setEpisodeDetail(data);
-          setPromptDrafts((prev) => {
-            const next = { ...prev };
-            for (const shot of data.shots || []) {
-              if (!(shot.id in next)) {
-                next[shot.id] = shot.videoPrompt || shot.prompt || shot.videoScript || "";
-              }
-            }
-            return next;
-          });
-        }
+    loadEpisodeDetail(activeEpisodeId)
+      .then((data) => {
+        if (!cancelled) applyEpisodeDetail(data);
       })
       .catch((err) => {
         if (!cancelled) {
@@ -547,12 +762,63 @@ export default function EpisodesPage({
     return () => {
       cancelled = true;
     };
-  }, [projectId, activeEpisodeId]);
+  }, [activeEpisodeId, applyEpisodeDetail, loadEpisodeDetail]);
 
   useEffect(() => {
     setExpandedSceneIds(new Set());
     setPromptDrafts({});
+    setDraftSceneMenuOpen(null);
+    setStoryboardSceneMenuOpen(null);
+    setStoryboardSceneActionId(null);
   }, [activeEpisodeId]);
+
+  useEffect(() => {
+    if (!draftSceneStorageKey) {
+      setDraftSceneEdits(null);
+      return;
+    }
+    try {
+      if (activeEpisodeId) {
+        for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+          const key = localStorage.key(index);
+          if (
+            key &&
+            key.startsWith("episodeDraftScenes:") &&
+            key.includes(`:${projectId}:${activeEpisodeId}`) &&
+            key !== draftSceneStorageKey
+          ) {
+            localStorage.removeItem(key);
+          }
+        }
+      }
+      const raw = localStorage.getItem(draftSceneStorageKey);
+      const parsed = raw ? JSON.parse(raw) : null;
+      const stored = parsed as Partial<StoredDraftScenes> | null;
+      const scenes =
+        stored &&
+        stored.version === 4 &&
+        stored.sourceSignature === draftSceneSourceSignature &&
+        Array.isArray(stored.scenes) &&
+        !stored.scenes.some((scene) =>
+          containsOtherEpisodeMarker(`${scene.name}\n${scene.prompt}`, activeEpisode?.sequence)
+        )
+          ? stored.scenes
+          : null;
+      setDraftSceneEdits(scenes);
+    } catch {
+      setDraftSceneEdits(null);
+    }
+  }, [activeEpisode?.sequence, activeEpisodeId, draftSceneSourceSignature, draftSceneStorageKey, projectId]);
+
+  useEffect(() => {
+    if (!draftSceneStorageKey || draftSceneEdits === null) return;
+    const payload: StoredDraftScenes = {
+      version: 4,
+      sourceSignature: draftSceneSourceSignature,
+      scenes: draftSceneEdits,
+    };
+    localStorage.setItem(draftSceneStorageKey, JSON.stringify(payload));
+  }, [draftSceneEdits, draftSceneSourceSignature, draftSceneStorageKey]);
 
   // Close video modal on Escape
   useEffect(() => {
@@ -644,6 +910,91 @@ export default function EpisodesPage({
     }
   }
 
+  async function refreshActiveEpisodeDetail() {
+    if (!activeEpisodeId) return;
+    const data = await loadEpisodeDetail(activeEpisodeId);
+    applyEpisodeDetail(data);
+  }
+
+  async function duplicateStoryboardScene(scene: StoryboardScene) {
+    if (!activeEpisodeId || scene.shots.length === 0) return;
+    setStoryboardSceneActionId(scene.id);
+    try {
+      const newSceneId = `scene-copy-${Date.now()}-${scene.id}`;
+      const orderedShots = [...scene.shots].sort((a, b) => a.sequence - b.sequence);
+      for (const shot of orderedShots) {
+        const duplicateRes = await apiFetch(`/api/projects/${projectId}/shots`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "duplicate", sourceShotId: shot.id }),
+        });
+        if (!duplicateRes.ok) throw new Error(await duplicateRes.text());
+        const created = (await duplicateRes.json()) as EpisodeShot;
+        const patchRes = await apiFetch(`/api/projects/${projectId}/shots/${created.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sceneId: newSceneId }),
+        });
+        if (!patchRes.ok) throw new Error(await patchRes.text());
+      }
+      await refreshActiveEpisodeDetail();
+      toast.success("已复制分镜");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "复制分镜失败");
+    } finally {
+      setStoryboardSceneActionId(null);
+    }
+  }
+
+  async function deleteStoryboardScene(scene: StoryboardScene) {
+    setStoryboardSceneActionId(scene.id);
+    try {
+      const orderedShots = [...scene.shots].sort((a, b) => b.sequence - a.sequence);
+      for (const shot of orderedShots) {
+        const res = await apiFetch(`/api/projects/${projectId}/shots/${shot.id}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) throw new Error(await res.text());
+      }
+      await refreshActiveEpisodeDetail();
+      toast.success("已删除分镜");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "删除分镜失败");
+    } finally {
+      setStoryboardSceneActionId(null);
+    }
+  }
+
+  async function addStoryboardScene() {
+    if (!activeEpisodeId) return;
+    setStoryboardSceneActionId("new");
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/shots`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add",
+          episodeId: activeEpisodeId,
+          versionId: episodeDetail?.shots[0]?.versionId ?? null,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const created = (await res.json()) as EpisodeShot;
+      const patchRes = await apiFetch(`/api/projects/${projectId}/shots/${created.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sceneId: `scene-manual-${Date.now()}-${created.id}` }),
+      });
+      if (!patchRes.ok) throw new Error(await patchRes.text());
+      await refreshActiveEpisodeDetail();
+      toast.success("已添加分镜");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "添加分镜失败");
+    } finally {
+      setStoryboardSceneActionId(null);
+    }
+  }
+
   function chipClassName(episode: Episode, selected: boolean, selectable: boolean) {
     const base =
       "inline-flex h-9 max-w-[280px] shrink-0 items-center gap-1.5 rounded-full px-4 text-xs font-semibold transition-all";
@@ -717,34 +1068,31 @@ export default function EpisodesPage({
     });
   }
 
-  const activeEpisode = useMemo(
-    () => episodes.find((episode) => episode.id === activeEpisodeId) || episodes[0],
-    [episodes, activeEpisodeId]
-  );
-
   const storyboardScenes = useMemo(
     () => groupShotsByScene(episodeDetail?.shots || []),
     [episodeDetail?.shots]
   );
 
   const draftScenes = useMemo(() => {
-    const source =
-      episodeDetail?.script ||
-      episodeDetail?.idea ||
-      episodeDetail?.description ||
-      activeEpisode?.script ||
-      activeEpisode?.idea ||
-      activeEpisode?.description ||
-      "";
-    return parseDraftScenes(source);
-  }, [
-    activeEpisode?.description,
-    activeEpisode?.idea,
-    activeEpisode?.script,
-    episodeDetail?.description,
-    episodeDetail?.idea,
-    episodeDetail?.script,
-  ]);
+    return parseDraftScenes(draftSceneSource, activeEpisode?.sequence);
+  }, [activeEpisode?.sequence, draftSceneSource]);
+
+  const usableDraftSceneEdits = useMemo(
+    () =>
+      isDraftSceneListCompatible(draftSceneEdits, draftScenes, activeEpisode?.sequence)
+        ? draftSceneEdits
+        : null,
+    [activeEpisode?.sequence, draftSceneEdits, draftScenes]
+  );
+
+  useEffect(() => {
+    if (
+      draftSceneEdits &&
+      !isDraftSceneListCompatible(draftSceneEdits, draftScenes, activeEpisode?.sequence)
+    ) {
+      setDraftSceneEdits(null);
+    }
+  }, [activeEpisode?.sequence, draftSceneEdits, draftScenes]);
 
   const characterAssets = useMemo(() => {
     const projectAssets = uniqueCharacters([...(episodeDetail?.characters || []), ...projectCharacters]).map(characterToLibraryAsset);
@@ -762,8 +1110,8 @@ export default function EpisodesPage({
 
   const fallbackDraftScenes = useMemo<DraftScene[]>(
     () =>
-      draftScenes.length
-        ? draftScenes
+      (usableDraftSceneEdits ?? draftScenes).length
+        ? (usableDraftSceneEdits ?? draftScenes)
         : [
             {
               id: "draft-scene-empty",
@@ -773,7 +1121,7 @@ export default function EpisodesPage({
               props: [],
             },
           ],
-    [draftScenes]
+    [draftScenes, usableDraftSceneEdits]
   );
 
   const videoModelOptions = useMemo(
@@ -864,7 +1212,7 @@ export default function EpisodesPage({
 
   const generationMode = episodeDetail?.generationMode || "keyframe";
   const totalShots = episodeDetail?.shots.length || 0;
-  const visibleSceneCount = storyboardScenes.length || draftScenes.length;
+  const visibleSceneCount = storyboardScenes.length || fallbackDraftScenes.length;
   const shotsWithVideos =
     episodeDetail?.shots.filter((shot) => getShotVideoUrl(shot, generationMode)).length || 0;
 
@@ -1128,6 +1476,21 @@ export default function EpisodesPage({
     });
   }
 
+  function removeSceneAsset(scene: DraftScene, category: AssetCategory, assetId: string) {
+    const options = getSceneAssetOptions(scene, category, assetPools);
+    const defaultIds = inferDefaultAssetIds(scene, options, category);
+    setSceneAssetSelections((prev) => {
+      const current = prev[scene.id]?.[category] ?? defaultIds;
+      return {
+        ...prev,
+        [scene.id]: {
+          ...prev[scene.id],
+          [category]: current.filter((id) => id !== assetId),
+        },
+      };
+    });
+  }
+
   function selectedAssetsForScene(scene: DraftScene, category: AssetCategory) {
     const options = getSceneAssetOptions(scene, category, assetPools);
     const selectedIds = sceneAssetSelections[scene.id]?.[category];
@@ -1180,6 +1543,36 @@ export default function EpisodesPage({
     );
   }
 
+  function renderSelectedAssetChip(scene: DraftScene, category: AssetCategory, asset: LibraryAsset) {
+    const visual = Boolean(asset.imageUrl) || category === "characters";
+    return (
+      <div key={asset.id} className="group relative inline-flex">
+        <button
+          type="button"
+          onClick={() => setAssetPicker({ sceneId: scene.id, category })}
+          title={asset.description || asset.visualHint || asset.name}
+          className="text-left"
+        >
+          {visual
+            ? renderAssetThumb(asset.name, asset.subtitle, asset.imageUrl)
+            : renderTextChip(asset.name, asset.subtitle)}
+        </button>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            removeSceneAsset(scene, category, asset.id);
+          }}
+          aria-label={`取消选择 ${asset.name}`}
+          title="取消选择"
+          className="absolute -right-1.5 -top-1.5 z-10 flex h-4 w-4 scale-90 items-center justify-center rounded-full border border-[--border-subtle] bg-[--elevated] text-[--text-muted] opacity-0 shadow-sm transition-all hover:border-primary/40 hover:bg-primary hover:text-white group-hover:scale-100 group-hover:opacity-100"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
+    );
+  }
+
   function renderEditableReferenceGroup(
     scene: DraftScene,
     category: AssetCategory,
@@ -1212,29 +1605,7 @@ export default function EpisodesPage({
           </div>
         ) : (
           <div className="flex flex-wrap gap-2">
-            {selectedAssets.map((asset) =>
-              asset.imageUrl || category === "characters" ? (
-                <button
-                  key={asset.id}
-                  type="button"
-                  onClick={() => setAssetPicker({ sceneId: scene.id, category })}
-                  title={asset.description || asset.visualHint || asset.name}
-                  className="text-left"
-                >
-                  {renderAssetThumb(asset.name, asset.subtitle, asset.imageUrl)}
-                </button>
-              ) : (
-                <button
-                  key={asset.id}
-                  type="button"
-                  onClick={() => setAssetPicker({ sceneId: scene.id, category })}
-                  title={asset.description || asset.visualHint || asset.name}
-                  className="text-left"
-                >
-                  {renderTextChip(asset.name, asset.subtitle)}
-                </button>
-              )
-            )}
+            {selectedAssets.map((asset) => renderSelectedAssetChip(scene, category, asset))}
           </div>
         )}
         {pickerOpen && renderAssetPicker(scene, category, options)}
@@ -1258,6 +1629,41 @@ export default function EpisodesPage({
     );
   }
 
+  function updateDraftSceneList(updater: (scenes: DraftScene[]) => DraftScene[]) {
+    setDraftSceneEdits((prev) => {
+      const base = prev ?? fallbackDraftScenes;
+      return updater(base);
+    });
+  }
+
+  function duplicateDraftScene(sceneIndex: number) {
+    updateDraftSceneList((scenes) => {
+      const source = scenes[sceneIndex];
+      if (!source) return scenes;
+      const copy: DraftScene = {
+        ...source,
+        id: `draft-scene-copy-${Date.now()}-${sceneIndex}`,
+        environment: [...source.environment],
+        props: [...source.props],
+      };
+      return [...scenes.slice(0, sceneIndex + 1), copy, ...scenes.slice(sceneIndex + 1)];
+    });
+  }
+
+  function deleteDraftScene(sceneIndex: number) {
+    updateDraftSceneList((scenes) => scenes.filter((_, index) => index !== sceneIndex));
+  }
+
+  function addDraftScene() {
+    updateDraftSceneList((scenes) => [...scenes, createEmptyDraftScene(scenes.length + 1)]);
+  }
+
+  function updateDraftScenePrompt(sceneId: string, prompt: string) {
+    updateDraftSceneList((scenes) =>
+      scenes.map((scene) => (scene.id === sceneId ? { ...scene, prompt } : scene))
+    );
+  }
+
   function renderDraftSceneCard(scene: DraftScene, sceneIndex: number) {
     return (
       <article key={scene.id} className="overflow-hidden rounded-xl bg-[#e8e8e6] p-4">
@@ -1268,6 +1674,54 @@ export default function EpisodesPage({
             </h3>
             <p className="mt-1 text-xs text-[--text-muted]">脚本场景草稿 · 等待拆成正式镜头</p>
           </div>
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setDraftSceneMenuOpen((openId) => (openId === scene.id ? null : scene.id))}
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-white/80 text-[--text-secondary] shadow-sm transition-colors hover:bg-white hover:text-primary"
+              aria-label="分镜操作"
+              title="分镜操作"
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </button>
+            {draftSceneMenuOpen === scene.id && (
+              <div className="absolute right-0 top-full z-30 mt-1 min-w-[120px] overflow-hidden rounded-xl border border-[--border-subtle] bg-white py-1 shadow-lg">
+                <button
+                  type="button"
+                  onClick={() => {
+                    duplicateDraftScene(sceneIndex);
+                    setDraftSceneMenuOpen(null);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-sm text-[--text-secondary] hover:bg-[--surface] hover:text-[--text-primary]"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                  复制
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    deleteDraftScene(sceneIndex);
+                    setDraftSceneMenuOpen(null);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-red-50"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  删除
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    addDraftScene();
+                    setDraftSceneMenuOpen(null);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-sm text-[--text-secondary] hover:bg-[--surface] hover:text-[--text-primary]"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  添加
+                </button>
+              </div>
+            )}
+          </div>
         </div>
         <div
           className="grid min-h-[300px] grid-cols-1 gap-3 xl:grid-cols-[var(--storyboard-cols)]"
@@ -1276,21 +1730,19 @@ export default function EpisodesPage({
           }}
         >
           <section className="min-w-0 bg-[#d2d2d0] p-4">
-            <h4 className="mb-4 text-center text-2xl font-bold text-black">参考素材位置</h4>
             {renderDraftReferenceColumn(scene)}
           </section>
           {renderResizeHandle("left", "拖动调整参考素材和提示词宽度")}
           <section className="min-w-0 bg-[#d2d2d0] p-4">
-            <h4 className="mb-4 text-center text-2xl font-bold text-black">提示词位置</h4>
             <textarea
-              defaultValue={scene.prompt}
+              value={scene.prompt}
+              onChange={(event) => updateDraftScenePrompt(scene.id, event.target.value)}
               className="mx-auto min-h-[160px] w-full max-w-[88%] resize-y rounded-2xl border-2 border-black bg-white/70 p-4 text-xs leading-relaxed text-black outline-none"
             />
             {renderVideoSettingsBar()}
           </section>
           {renderResizeHandle("right", "拖动调整提示词和视频宽度")}
           <section className="min-w-0 bg-[#d2d2d0] p-4">
-            <h4 className="mb-4 text-center text-2xl font-bold text-black">视频生成位置</h4>
             <div className="flex min-h-[200px] items-center justify-center text-sm font-semibold text-black/50">
               等待生成视频
             </div>
@@ -1480,6 +1932,7 @@ export default function EpisodesPage({
                       getShotVideoUrl(shot, episodeDetail.generationMode)
                     );
                     const videoUrl = videoShot ? getShotVideoUrl(videoShot, episodeDetail.generationMode) : null;
+                    const sceneActionBusy = storyboardSceneActionId === scene.id || storyboardSceneActionId === "new";
                     return (
                       <article key={scene.id} className="overflow-hidden rounded-xl bg-[#e8e8e6] p-4">
                         <div className="mb-3 flex items-center justify-between gap-3">
@@ -1500,15 +1953,70 @@ export default function EpisodesPage({
                               </span>
                             </span>
                           </button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => toggleScene(scene.id)}
-                            className="shrink-0 rounded-full bg-white/80"
-                          >
-                            {expanded ? "收起" : "展开"}
-                            <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} />
-                          </Button>
+                          <div className="flex shrink-0 items-center gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => toggleScene(scene.id)}
+                              className="rounded-full bg-white/80"
+                            >
+                              {expanded ? "收起" : "展开"}
+                              <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} />
+                            </Button>
+                            <div className="relative">
+                              <button
+                                type="button"
+                                onClick={() => setStoryboardSceneMenuOpen((openId) => (openId === scene.id ? null : scene.id))}
+                                disabled={!!storyboardSceneActionId}
+                                className="flex h-8 w-8 items-center justify-center rounded-full bg-white/80 text-[--text-secondary] shadow-sm transition-colors hover:bg-white hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                                aria-label="分镜操作"
+                                title="分镜操作"
+                              >
+                                {sceneActionBusy ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <MoreHorizontal className="h-4 w-4" />
+                                )}
+                              </button>
+                              {storyboardSceneMenuOpen === scene.id && (
+                                <div className="absolute right-0 top-full z-30 mt-1 min-w-[120px] overflow-hidden rounded-xl border border-[--border-subtle] bg-white py-1 shadow-lg">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setStoryboardSceneMenuOpen(null);
+                                      duplicateStoryboardScene(scene);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-[--text-secondary] hover:bg-[--surface] hover:text-[--text-primary]"
+                                  >
+                                    <Copy className="h-3.5 w-3.5" />
+                                    复制
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setStoryboardSceneMenuOpen(null);
+                                      deleteStoryboardScene(scene);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-red-50"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                    删除
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setStoryboardSceneMenuOpen(null);
+                                      addStoryboardScene();
+                                    }}
+                                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-[--text-secondary] hover:bg-[--surface] hover:text-[--text-primary]"
+                                  >
+                                    <Plus className="h-3.5 w-3.5" />
+                                    添加
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
                         </div>
 
                         <div
@@ -1518,14 +2026,12 @@ export default function EpisodesPage({
                           }}
                         >
                           <section className="min-w-0 bg-[#d2d2d0] p-4">
-                            <h4 className="mb-4 text-center text-2xl font-bold text-black">参考素材位置</h4>
                             {renderReferenceColumn(scene)}
                           </section>
 
                           {renderResizeHandle("left", "拖动调整参考素材和提示词宽度")}
 
                           <section className="min-w-0 bg-[#d2d2d0] p-4">
-                            <h4 className="mb-4 text-center text-2xl font-bold text-black">提示词位置</h4>
                             {renderPromptColumn(scene)}
                             {renderVideoSettingsBar(scene.shots.reduce((sum, shot) => sum + (shot.duration || 0), 0))}
                           </section>
@@ -1533,7 +2039,6 @@ export default function EpisodesPage({
                           {renderResizeHandle("right", "拖动调整提示词和视频宽度")}
 
                           <section className="min-w-0 bg-[#d2d2d0] p-4">
-                            <h4 className="mb-4 text-center text-2xl font-bold text-black">视频生成位置</h4>
                             <div className="flex min-h-[238px] items-center justify-center rounded-xl border border-[--border-subtle] bg-white p-3">
                               {videoUrl ? (
                                 <video src={uploadUrl(videoUrl)} controls className="max-h-[260px] w-full rounded-lg bg-black object-contain" />

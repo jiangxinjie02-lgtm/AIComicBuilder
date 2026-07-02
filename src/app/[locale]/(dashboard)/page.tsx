@@ -1,7 +1,7 @@
 import { db } from "@/lib/db";
-import { projects } from "@/lib/db/schema";
-import { desc, eq } from "drizzle-orm";
-import { getTranslations } from "next-intl/server";
+import { importStates, projects } from "@/lib/db/schema";
+import { desc, eq, inArray } from "drizzle-orm";
+import { getLocale, getTranslations } from "next-intl/server";
 import { cookies } from "next/headers";
 import { ProjectCard } from "@/components/project-card";
 import { CreateProjectDialog } from "@/components/create-project-dialog";
@@ -9,6 +9,7 @@ import { Clapperboard } from "lucide-react";
 
 export default async function DashboardPage() {
   const t = await getTranslations("dashboard");
+  const locale = await getLocale();
   const cookieStore = await cookies();
   const userId = cookieStore.get("ai_comic_uid")?.value ?? "";
 
@@ -19,6 +20,26 @@ export default async function DashboardPage() {
         .where(eq(projects.userId, userId))
         .orderBy(desc(projects.createdAt))
     : [];
+  const projectIds = allProjects.map((project) => project.id);
+  const importDraftProjectIds = projectIds.length
+    ? new Set(
+        (
+          await db
+            .select({
+              projectId: importStates.projectId,
+              currentStep: importStates.currentStep,
+              stepStatus: importStates.stepStatus,
+            })
+            .from(importStates)
+            .where(inArray(importStates.projectId, projectIds))
+        )
+          .filter((state) => {
+            const stepStatus = state.stepStatus as Partial<Record<string, string>> | null;
+            return state.currentStep > 0 && stepStatus?.[5] !== "done";
+          })
+          .map((state) => state.projectId),
+      )
+    : new Set<string>();
 
   return (
     <div className="animate-page-in space-y-6">
@@ -67,6 +88,11 @@ export default async function DashboardPage() {
               title={project.title}
               status={project.status}
               createdAt={project.createdAt.toISOString()}
+              href={
+                project.status !== "completed" && importDraftProjectIds.has(project.id)
+                  ? `/${locale}/project/${project.id}/import`
+                  : undefined
+              }
             />
           ))}
         </div>

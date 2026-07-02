@@ -7,11 +7,20 @@ import { useRouter } from "next/navigation";
 import {
   Upload, FileText, Users, Layers, Sparkles,
   Loader2, Check, X, ArrowLeft, AlertCircle,
-  ImageIcon, Images, Plus, ChevronDown, History,
+  ImageIcon, Images, Plus, ChevronDown, History, Download,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelStore } from "@/stores/model-store";
 import { useModelGuard } from "@/hooks/use-model-guard";
@@ -173,6 +182,8 @@ export default function ImportPage({
   const draftHydratedRef = useRef(false);
   const skipNextDraftSaveRef = useRef(false);
   const saveDraftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestDraftPayloadRef = useRef<ImportDraftState | null>(null);
+  const hasPendingDraftSaveRef = useRef(false);
 
   // Pipeline state
   const [currentStep, setCurrentStep] = useState<Step | 0>(0);
@@ -210,15 +221,44 @@ export default function ImportPage({
   const [episodes, setEpisodes] = useState<SplitEpisode[]>([]);
   const [expandedEpisodeIndexes, setExpandedEpisodeIndexes] = useState<Set<number>>(() => new Set());
   const [confirmedEpisodeIndexes, setConfirmedEpisodeIndexes] = useState<Set<number>>(() => new Set());
+  const [episodeDeleteIndex, setEpisodeDeleteIndex] = useState<number | null>(null);
 
   // History mode
   const [historyMode, setHistoryMode] = useState(false);
   const [selectedStep, setSelectedStep] = useState<Step | null>(null);
   const [activeAssetTab, setActiveAssetTab] = useState<AssetTab>("characters");
   const [activeAssetKey, setActiveAssetKey] = useState("");
-  const [assetGeneratingTarget, setAssetGeneratingTarget] = useState<string | null>(null);
+  const [assetGeneratingTargets, setAssetGeneratingTargets] = useState<string[]>([]);
   const [assetUploadingTarget, setAssetUploadingTarget] = useState<string | null>(null);
   const [assetEditingTarget, setAssetEditingTarget] = useState<string | null>(null);
+
+  const isAssetGenerating = useCallback(
+    (targetKey: string) => assetGeneratingTargets.includes(targetKey),
+    [assetGeneratingTargets],
+  );
+  const hasAssetGenerationInTab = useCallback(
+    (tab: AssetTab) => assetGeneratingTargets.some((targetKey) => targetKey.startsWith(`${tab}:`)),
+    [assetGeneratingTargets],
+  );
+  const isAssetGenerationBlocked = useCallback(
+    (tab: AssetTab, assetIndex: number, variantIndex?: number) => {
+      const targetKey = `${tab}:${assetIndex}:${variantIndex ?? "main"}`;
+      return (
+        assetGeneratingTargets.includes(targetKey)
+        || assetGeneratingTargets.includes(`${tab}:category`)
+        || assetGeneratingTargets.includes(`${tab}:${assetIndex}:variants`)
+      );
+    },
+    [assetGeneratingTargets],
+  );
+
+  function beginAssetGenerating(targetKey: string) {
+    setAssetGeneratingTargets((prev) => prev.includes(targetKey) ? prev : [...prev, targetKey]);
+  }
+
+  function endAssetGenerating(targetKey: string) {
+    setAssetGeneratingTargets((prev) => prev.filter((item) => item !== targetKey));
+  }
 
   const buildDraftPayload = useCallback((): ImportDraftState => ({
     currentStep,
@@ -255,10 +295,30 @@ export default function ImportPage({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload ?? buildDraftPayload()),
       });
+      hasPendingDraftSaveRef.current = false;
     } catch (err) {
       console.error("Import draft save error:", err);
     }
   }, [buildDraftPayload, projectId]);
+
+  const flushDraft = useCallback(() => {
+    const payload = latestDraftPayloadRef.current;
+    if (!payload || !hasPendingDraftSaveRef.current) return;
+    const body = JSON.stringify(payload);
+    const headers: HeadersInit = { "Content-Type": "application/json" };
+    const userId = typeof window !== "undefined" ? localStorage.getItem("ai_comic_uid") : null;
+    if (userId) headers["x-user-id"] = userId;
+
+    fetch(`/api/projects/${projectId}/import/state`, {
+      method: "PATCH",
+      headers,
+      body,
+      keepalive: body.length < 60000,
+    }).catch((err) => {
+      console.error("Import draft flush error:", err);
+    });
+    hasPendingDraftSaveRef.current = false;
+  }, [projectId]);
 
   const resetDraftPayload = useCallback((): ImportDraftState => ({
     currentStep: 0,
@@ -274,6 +334,11 @@ export default function ImportPage({
     episodes: [],
     confirmedEpisodeIndexes: [],
   }), []);
+
+  if (draftHydratedRef.current) {
+    latestDraftPayloadRef.current = buildDraftPayload();
+    hasPendingDraftSaveRef.current = true;
+  }
 
   // Load existing draft/logs on mount
   useEffect(() => {
@@ -370,14 +435,34 @@ export default function ImportPage({
       skipNextDraftSaveRef.current = false;
       return;
     }
+    latestDraftPayloadRef.current = buildDraftPayload();
+    hasPendingDraftSaveRef.current = true;
     if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
     saveDraftTimerRef.current = setTimeout(() => {
-      saveDraft();
+      saveDraft(latestDraftPayloadRef.current ?? undefined);
     }, 1000);
     return () => {
       if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
     };
-  }, [saveDraft]);
+  }, [buildDraftPayload, saveDraft]);
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
+      flushDraft();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") handlePageHide();
+    };
+    window.addEventListener("pagehide", handlePageHide);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
+      flushDraft();
+      window.removeEventListener("pagehide", handlePageHide);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [flushDraft]);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -994,24 +1079,24 @@ export default function ImportPage({
       });
       return next;
     });
+    setEpisodeDeleteIndex(null);
   }
 
   function toggleEpisodeExpanded(idx: number) {
     setExpandedEpisodeIndexes((prev) => {
-      const next = new Set(prev);
-      if (next.has(idx)) {
-        next.delete(idx);
-      } else {
-        next.add(idx);
-      }
-      return next;
+      if (prev.has(idx)) return new Set();
+      return new Set([idx]);
     });
   }
 
   function confirmEpisode(idx: number) {
     setConfirmedEpisodeIndexes((prev) => {
       const next = new Set(prev);
-      next.add(idx);
+      if (next.has(idx)) {
+        next.delete(idx);
+      } else {
+        next.add(idx);
+      }
       return next;
     });
   }
@@ -1231,7 +1316,7 @@ export default function ImportPage({
     }
 
     const targetKey = `${tab}:${assetIndex}:${variantIndex ?? "main"}`;
-    setAssetGeneratingTarget(targetKey);
+    if (!options.keepBusy) beginAssetGenerating(targetKey);
 
     try {
       const res = await apiFetch(`/api/projects/${projectId}/import/generate-image`, {
@@ -1303,8 +1388,42 @@ export default function ImportPage({
       if (!options.quiet) toast.error(msg);
       return false;
     } finally {
-      if (!options.keepBusy) setAssetGeneratingTarget(null);
+      if (!options.keepBusy) endAssetGenerating(targetKey);
     }
+  }
+
+  async function downloadWorkbenchImage(imageUrl: string, filenameBase: string) {
+    const filename = `${slugifyFileName(filenameBase || "image")}.png`;
+    try {
+      const res = await fetch(imageUrl, { cache: "no-store" });
+      if (!res.ok) throw new Error(`download failed: ${res.status}`);
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      triggerDownload(objectUrl, filename);
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch {
+      triggerDownload(imageUrl, filename);
+    }
+  }
+
+  function triggerDownload(href: string, filename: string) {
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = filename;
+    link.rel = "noreferrer";
+    link.target = "_blank";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function slugifyFileName(value: string) {
+    return String(value || "image")
+      .trim()
+      .replace(/[\\/:*?"<>|]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || "image";
   }
 
   async function generateActiveWorkbenchAsset(variantIndex?: number) {
@@ -1322,7 +1441,8 @@ export default function ImportPage({
     const variants = asset.variants || [];
     if (!variants.length) return;
 
-    setAssetGeneratingTarget(`${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`);
+    const variantsTargetKey = `${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`;
+    beginAssetGenerating(variantsTargetKey);
     let successCount = 0;
     for (let variantIndex = 0; variantIndex < variants.length; variantIndex += 1) {
       const ok = await generateWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, variantIndex, {
@@ -1332,7 +1452,7 @@ export default function ImportPage({
       });
       if (ok) successCount += 1;
     }
-    setAssetGeneratingTarget(null);
+    endAssetGenerating(variantsTargetKey);
     toast.success(`已生成 ${successCount}/${variants.length} 个变体`);
   }
 
@@ -1482,7 +1602,8 @@ export default function ImportPage({
     const tab = activeAssetTab;
     const list = tab === "characters" ? characters : tab === "items" ? items : environments;
     if (!list.length) return;
-    setAssetGeneratingTarget(`${tab}:category`);
+    const categoryTargetKey = `${tab}:category`;
+    beginAssetGenerating(categoryTargetKey);
 
     let successCount = 0;
     for (let assetIndex = 0; assetIndex < list.length; assetIndex += 1) {
@@ -1494,7 +1615,7 @@ export default function ImportPage({
     }
 
     toast.success(t("assetGenerateBatchSuccess", { count: successCount }));
-    setAssetGeneratingTarget(null);
+    endAssetGenerating(categoryTargetKey);
   }
 
   function assetTabInfo(tab: AssetTab) {
@@ -1617,6 +1738,7 @@ export default function ImportPage({
     confirmed: confirmedEpisodeCount,
     total: episodes.length,
   });
+  const episodePendingDelete = episodeDeleteIndex === null ? null : episodes[episodeDeleteIndex];
   const allWorkbenchAssets = [...characters, ...items, ...environments, ...voices];
   const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed !== false).length;
   const allAssetsConfirmed = allWorkbenchAssets.length > 0 && confirmedAssetCount === allWorkbenchAssets.length;
@@ -1925,7 +2047,7 @@ export default function ImportPage({
                 </div>
               </div>
 
-              <div className="flex min-h-0 flex-col rounded-xl border border-[--border-subtle] bg-white">
+              <div className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-[--border-subtle] bg-white">
                 <div className="flex items-center justify-between border-b border-[--border-subtle] p-3">
                   <div>
                     <div className="text-sm font-semibold text-[--text-primary]">{t("aiReviewIssues")}</div>
@@ -1963,7 +2085,7 @@ export default function ImportPage({
                   </div>
                 </div>
 
-                <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+                <div className="max-h-[60vh] min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
                   {reviewRunning && (
                     <div className="flex items-center gap-2 rounded-lg bg-primary/5 p-3 text-sm text-primary">
                       <Loader2 className="h-4 w-4 animate-spin" />
@@ -2307,10 +2429,10 @@ export default function ImportPage({
                               <Button
                                 size="sm"
                                 onClick={() => generateActiveWorkbenchAsset()}
-                                disabled={Boolean(assetGeneratingTarget)}
+                                disabled={isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex)}
                                 className="rounded-lg"
                               >
-                                {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
+                                {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:main`) ? (
                                   <Loader2 className="size-3.5 animate-spin" />
                                 ) : (
                                   <ImageIcon className="size-3.5" />
@@ -2321,10 +2443,10 @@ export default function ImportPage({
                                 size="sm"
                                 variant="outline"
                                 onClick={generateCurrentAssetTab}
-                                disabled={Boolean(assetGeneratingTarget)}
+                                disabled={hasAssetGenerationInTab(activeAssetTab)}
                                 className="rounded-lg"
                               >
-                                {assetGeneratingTarget ? (
+                                {isAssetGenerating(`${activeAssetTab}:category`) ? (
                                   <Loader2 className="size-3.5 animate-spin" />
                                 ) : (
                                   <Images className="size-3.5" />
@@ -2335,10 +2457,25 @@ export default function ImportPage({
                           )}
                         </div>
 
-                        <div className="flex aspect-[16/10] min-h-[360px] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
+                        <div className="relative flex aspect-[16/10] min-h-[360px] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
                           {activeWorkbenchAsset.imageUrl ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img src={activeWorkbenchAsset.imageUrl} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
+                            <>
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="secondary"
+                                className="absolute right-3 top-3 z-10 h-8 w-8 rounded-lg bg-white/90 shadow-sm hover:bg-white"
+                                title="下载图片"
+                                onClick={() => downloadWorkbenchImage(
+                                  activeWorkbenchAsset.imageUrl || "",
+                                  getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab),
+                                )}
+                              >
+                                <Download className="size-4" />
+                              </Button>
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img src={activeWorkbenchAsset.imageUrl} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
+                            </>
                           ) : (
                             <div className="grid gap-1 text-center">
                               <div className="text-sm font-bold text-[--text-primary]">
@@ -2367,11 +2504,11 @@ export default function ImportPage({
                               disabled={
                                 !activeWorkbenchAsset.imageUrl
                                 || !activeWorkbenchAsset.variants?.length
-                                || Boolean(assetGeneratingTarget)
+                                || isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex)
                               }
                               className="rounded-lg"
                             >
-                              {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:variants` ? (
+                              {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`) ? (
                                 <Loader2 className="size-3.5 animate-spin" />
                               ) : (
                                 <Images className="size-3.5" />
@@ -2398,7 +2535,20 @@ export default function ImportPage({
                                 {variant.imageUrl && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">OK</span>}
                               </div>
                               {variant.imageUrl && (
-                                <div className="mt-2 overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
+                                <div className="relative mt-2 overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
+                                  <Button
+                                    type="button"
+                                    size="icon"
+                                    variant="secondary"
+                                    className="absolute right-2 top-2 z-10 h-7 w-7 rounded-md bg-white/90 shadow-sm hover:bg-white"
+                                    title="下载图片"
+                                    onClick={() => downloadWorkbenchImage(
+                                      variant.imageUrl || "",
+                                      `${activeWorkbenchAsset.name}-${variant.name}`,
+                                    )}
+                                  >
+                                    <Download className="size-3.5" />
+                                  </Button>
                                   {/* eslint-disable-next-line @next/next/no-img-element */}
                                   <img src={variant.imageUrl} alt={variant.name} className="h-56 w-full object-contain" />
                                 </div>
@@ -2433,9 +2583,9 @@ export default function ImportPage({
                                       size="xs"
                                       variant="outline"
                                       onClick={() => generateActiveWorkbenchAsset(index)}
-                                      disabled={Boolean(assetGeneratingTarget)}
+                                      disabled={isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex, index)}
                                     >
-                                      {assetGeneratingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                      {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}`) ? (
                                         <Loader2 className="size-3 animate-spin" />
                                       ) : (
                                         <ImageIcon className="size-3" />
@@ -2593,14 +2743,13 @@ export default function ImportPage({
                         variant={isConfirmed ? "outline" : "default"}
                         size="sm"
                         onClick={() => confirmEpisode(idx)}
-                        disabled={isConfirmed}
                         className="shrink-0 rounded-lg"
                       >
                         <Check className="size-3.5" />
-                        {isConfirmed ? t("episodeConfirmed") : t("confirmEpisode")}
+                        {isConfirmed ? t("cancelEpisodeConfirm") : t("confirmEpisode")}
                       </Button>
                       <button
-                        onClick={() => removeEpisode(idx)}
+                        onClick={() => setEpisodeDeleteIndex(idx)}
                         className="shrink-0 rounded-lg p-1.5 text-[--text-muted] transition-colors hover:bg-red-50 hover:text-red-500"
                         aria-label={t("removeEpisode")}
                       >
@@ -2608,14 +2757,15 @@ export default function ImportPage({
                       </button>
                     </div>
                     {isExpanded && (
-                      <div className="grid gap-4 border-t border-[--border-subtle] bg-[--surface] p-4">
+                      <div className="max-h-[340px] overflow-y-auto border-t border-[--border-subtle] bg-[--surface] p-4">
+                        <div className="grid gap-4 pr-1">
                         <div className="grid gap-2 md:grid-cols-2">
                           <label className="grid gap-1">
                             <span className="text-xs font-bold text-[--text-secondary]">{t("episodeDescription")}</span>
                             <Textarea
                               value={ep.description}
                               onChange={(e) => updateEpisode(idx, "description", e.target.value)}
-                              className="min-h-24 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                              className="h-24 resize-none overflow-y-auto rounded-lg bg-white text-xs leading-relaxed"
                             />
                           </label>
                           <label className="grid gap-1">
@@ -2623,7 +2773,7 @@ export default function ImportPage({
                             <Textarea
                               value={ep.keywords}
                               onChange={(e) => updateEpisode(idx, "keywords", e.target.value)}
-                              className="min-h-24 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                              className="h-24 resize-none overflow-y-auto rounded-lg bg-white text-xs leading-relaxed"
                             />
                           </label>
                         </div>
@@ -2632,7 +2782,7 @@ export default function ImportPage({
                           <Textarea
                             value={ep.idea}
                             onChange={(e) => updateEpisode(idx, "idea", e.target.value)}
-                            className="min-h-56 resize-y rounded-lg bg-white font-mono text-xs leading-relaxed"
+                            className="h-36 resize-none overflow-y-auto rounded-lg bg-white font-mono text-xs leading-relaxed"
                           />
                         </label>
                         <div className="grid gap-3 md:grid-cols-2">
@@ -2672,12 +2822,40 @@ export default function ImportPage({
                             )}
                           </div>
                         </div>
+                        </div>
                       </div>
                     )}
                   </div>
                 );
               })}
             </div>
+            <Dialog open={episodeDeleteIndex !== null} onOpenChange={(open) => !open && setEpisodeDeleteIndex(null)}>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>{t("removeEpisodeConfirmTitle")}</DialogTitle>
+                  <DialogDescription>
+                    {t("removeEpisodeConfirmDesc", {
+                      episode: episodePendingDelete
+                        ? `EP.${String((episodeDeleteIndex ?? 0) + 1).padStart(2, "0")} - ${episodePendingDelete.title}`
+                        : "",
+                    })}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose render={<Button variant="outline" />}>
+                    {t("cancelRemoveEpisode")}
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      if (episodeDeleteIndex !== null) removeEpisode(episodeDeleteIndex);
+                    }}
+                  >
+                    {t("confirmRemoveEpisode")}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
         )}
 

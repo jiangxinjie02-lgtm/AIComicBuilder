@@ -5,6 +5,7 @@ import { db } from "@/lib/db";
 import { projects } from "@/lib/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
+import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -49,6 +50,8 @@ interface EditImagePayload {
 }
 
 const generatedDir = path.join(process.cwd(), "public", "generated", "import-assets");
+let imageEditKeyPool: ApiKeyPool | null = null;
+let imageEditKeyPoolSignature = "";
 
 export async function POST(
   request: Request,
@@ -111,8 +114,8 @@ export async function POST(
 
 async function callImageEdit(payload: EditImagePayload) {
   const endpoint = getEditImageEndpoint();
-  const apiKey = getImageApiKey();
-  if (!endpoint || !apiKey) {
+  const keyPool = getImageKeyPool();
+  if (!endpoint || !keyPool) {
     return {
       provider: "mock",
       status: "skipped",
@@ -122,50 +125,61 @@ async function callImageEdit(payload: EditImagePayload) {
     };
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    Number(process.env.IMAGE_EDIT_TIMEOUT_MS || process.env.IMAGE2_TIMEOUT_MS || 300000),
-  );
-
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(stripMetadataForProvider(payload)),
+    return await keyPool.withKey(async (entry) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Number(process.env.IMAGE_EDIT_TIMEOUT_MS || process.env.IMAGE2_TIMEOUT_MS || 300000),
+      );
+      const startedAt = Date.now();
+
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${entry.apiKey}`,
+          },
+          body: JSON.stringify(stripMetadataForProvider(payload)),
+        });
+
+        const text = await response.text();
+        let json: unknown;
+        try {
+          json = text ? JSON.parse(text) : {};
+        } catch {
+          json = { raw: text };
+        }
+
+        if (!response.ok) {
+          const error = getProviderError(json) || `image edit returned HTTP ${response.status}`;
+          console.warn(`[ImageEdit] Provider error after ${Date.now() - startedAt}ms: ${error}`);
+          if (response.status === 429) throw new Error(error);
+          return {
+            provider: "jimapi:image-edit",
+            status: "error",
+            request: payload,
+            error,
+            raw: sanitizeProviderRaw(json),
+          };
+        }
+
+        const extracted = await extractImageResult(json, payload);
+        console.log(`[ImageEdit] Succeeded in ${Date.now() - startedAt}ms; cached=${Boolean(extracted.savedPath)}`);
+        return {
+          provider: "jimapi:image-edit",
+          status: "succeeded",
+          request: payload,
+          imageUrl: extracted.imageUrl,
+          savedPath: extracted.savedPath,
+          raw: sanitizeProviderRaw(json),
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
     });
-
-    const text = await response.text();
-    let json: unknown;
-    try {
-      json = text ? JSON.parse(text) : {};
-    } catch {
-      json = { raw: text };
-    }
-
-    if (!response.ok) {
-      return {
-        provider: "jimapi:image-edit",
-        status: "error",
-        request: payload,
-        error: getProviderError(json) || `image edit returned HTTP ${response.status}`,
-        raw: sanitizeProviderRaw(json),
-      };
-    }
-
-    const extracted = await extractImageResult(json, payload);
-    return {
-      provider: "jimapi:image-edit",
-      status: "succeeded",
-      request: payload,
-      imageUrl: extracted.imageUrl,
-      savedPath: extracted.savedPath,
-      raw: sanitizeProviderRaw(json),
-    };
   } catch (error) {
     return {
       provider: "jimapi:image-edit",
@@ -175,8 +189,6 @@ async function callImageEdit(payload: EditImagePayload) {
         ? `image edit exceeded ${process.env.IMAGE_EDIT_TIMEOUT_MS || process.env.IMAGE2_TIMEOUT_MS || 300000}ms and was aborted.`
         : error instanceof Error ? error.message : "image edit request failed",
     };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -187,8 +199,23 @@ function getEditImageEndpoint() {
   return `${base}/images/edits`;
 }
 
-function getImageApiKey() {
-  return process.env.JIMAPI_API_KEY || process.env.IMAGE_EDIT_API_KEY || process.env.IMAGE2_API_KEY || "";
+function getImageKeyPool() {
+  const hasPoolKeys = Boolean(process.env.JIMAPI_API_KEYS || process.env.IMAGE_EDIT_API_KEYS || process.env.IMAGE2_API_KEYS);
+  const entries = splitConfiguredKeys({
+    apiKey: hasPoolKeys ? "" : process.env.JIMAPI_API_KEY || process.env.IMAGE_EDIT_API_KEY || process.env.IMAGE2_API_KEY || "",
+    apiKeysEnv: ["JIMAPI_API_KEYS", "IMAGE_EDIT_API_KEYS", "IMAGE2_API_KEYS"],
+    labelPrefix: "jimapi:image-edit",
+  });
+  if (entries.length === 0) return null;
+
+  const signature = entries.map((entry) => entry.apiKey).join("|");
+  if (!imageEditKeyPool || imageEditKeyPoolSignature !== signature) {
+    imageEditKeyPool = new ApiKeyPool(entries);
+    imageEditKeyPoolSignature = signature;
+    console.log(`[ImageKeyPool] jimapi:image-edit loaded ${entries.length} API keys`);
+  }
+
+  return imageEditKeyPool;
 }
 
 function getEditImageModel() {
@@ -240,7 +267,11 @@ function mimeTypeFor(filePath: string) {
 
 async function extractImageResult(json: unknown, payload: EditImagePayload) {
   const directUrl = extractImageUrl(json);
-  if (directUrl) return { imageUrl: directUrl, savedPath: "" };
+  if (directUrl) {
+    const saved = await saveRemoteImage(directUrl, payload);
+    if (saved) return saved;
+    return { imageUrl: directUrl, savedPath: "" };
+  }
 
   const b64 = extractImageBase64(json);
   if (!b64) return { imageUrl: "", savedPath: "" };
@@ -258,6 +289,41 @@ async function extractImageResult(json: unknown, payload: EditImagePayload) {
     imageUrl: `/generated/import-assets/${filename}`,
     savedPath: outputPath,
   };
+}
+
+async function saveRemoteImage(imageUrl: string, payload: EditImagePayload) {
+  if (!/^https?:\/\//i.test(imageUrl)) return null;
+
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) return null;
+
+    const contentType = response.headers.get("content-type") || "";
+    const ext = imageExtensionFrom(contentType, imageUrl);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    await fs.mkdir(generatedDir, { recursive: true });
+    const safeAsset = slugify(
+      payload.metadata.assetName || payload.metadata.assetId || payload.metadata.targetName || "asset-edit",
+    );
+    const filename = `${Date.now()}_${safeAsset}_edit.${ext}`;
+    const outputPath = path.join(generatedDir, filename);
+    await fs.writeFile(outputPath, buffer);
+    return {
+      imageUrl: `/generated/import-assets/${filename}`,
+      savedPath: outputPath,
+    };
+  } catch (err) {
+    console.warn("[ImageEdit] Failed to cache remote image locally:", err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+function imageExtensionFrom(contentType: string, imageUrl: string) {
+  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
+  if (contentType.includes("webp")) return "webp";
+  if (contentType.includes("png")) return "png";
+  const ext = imageUrl.split("?")[0].split(".").pop()?.toLowerCase();
+  return ext && /^[a-z0-9]+$/.test(ext) ? ext : "png";
 }
 
 function extractImageUrl(value: unknown): string {
