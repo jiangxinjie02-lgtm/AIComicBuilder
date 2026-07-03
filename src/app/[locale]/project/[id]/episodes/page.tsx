@@ -1764,7 +1764,7 @@ export default function EpisodesPage({
 
   const workflowNavItems = [
     { label: "剧情审阅", icon: AlertCircle, href: `/${locale}/project/${projectId}/import` },
-    { label: "资产设定", icon: Users, href: `/${locale}/project/${projectId}/assets` },
+    { label: "资产设定", icon: Users, href: `/${locale}/project/${projectId}/import?step=assets` },
     { label: "自动分集", icon: Layers, href: `/${locale}/project/${projectId}/import` },
     { label: "创建分集", icon: Plus, href: `/${locale}/project/${projectId}/import` },
   ];

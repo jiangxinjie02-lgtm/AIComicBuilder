@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { db, ensureAssetLibraryTables, ensureStoryPipelineTables } from "@/lib/db";
 import {
   assets,
@@ -558,12 +558,12 @@ export async function listProjectAssets(projectId: string, type?: StoryAssetType
         .select()
         .from(assets)
         .where(and(eq(assets.projectId, projectId), eq(assets.type, type)))
-        .orderBy(asc(assets.type), asc(assets.importance), asc(assets.name))
+        .orderBy(asc(assets.type), desc(assets.importance), asc(assets.name))
     : await db
         .select()
         .from(assets)
         .where(eq(assets.projectId, projectId))
-        .orderBy(asc(assets.type), asc(assets.importance), asc(assets.name));
+        .orderBy(asc(assets.type), desc(assets.importance), asc(assets.name));
 
   return Promise.all(rows.map(enrichAsset));
 }

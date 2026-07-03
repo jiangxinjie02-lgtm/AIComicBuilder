@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef, use, useMemo } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { useTranslations, useLocale } from "next-intl";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   Upload, FileText, Users, Layers, Sparkles,
   Loader2, Check, X, ArrowLeft, AlertCircle,
@@ -174,6 +174,8 @@ export default function ImportPage({
   const { id: projectId } = use(params);
   const locale = useLocale();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const forceAssetWorkbench = searchParams.get("step") === "assets";
   const t = useTranslations("import");
   const textGuard = useModelGuard("text");
   const getModelConfig = useModelStore((s) => s.getModelConfig);
@@ -428,6 +430,14 @@ export default function ImportPage({
     }
     loadDraftAndLogs();
   }, [projectId]);
+
+  useEffect(() => {
+    if (!draftHydratedRef.current || !forceAssetWorkbench) return;
+    skipNextDraftSaveRef.current = true;
+    setHistoryMode(false);
+    setSelectedStep(null);
+    setCurrentStep(3);
+  }, [forceAssetWorkbench]);
 
   useEffect(() => {
     if (!draftHydratedRef.current) return;
@@ -1177,7 +1187,7 @@ export default function ImportPage({
   };
 
   const showStoryReview = currentStep === 2 && stepStatus[1] === "done" && stepStatus[2] !== "done" && !historyMode;
-  const showCharReview = stepStatus[3] === "done" && stepStatus[4] === "idle" && !historyMode;
+  const showCharReview = (forceAssetWorkbench || (stepStatus[3] === "done" && stepStatus[4] === "idle")) && !historyMode;
   const showEpReview = stepStatus[4] === "done" && stepStatus[5] === "idle" && !historyMode;
   const hideParseStep = stepStatus[2] === "done" || currentStep >= 3;
   const visibleSteps = hideParseStep ? STEPS.filter(({ num }) => num !== 1) : STEPS;
