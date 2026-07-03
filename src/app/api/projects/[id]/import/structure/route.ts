@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { generateText } from "ai";
 import { and, asc, desc, eq } from "drizzle-orm";
-import { createLanguageModel, extractJSON, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
+import { createLanguageModel, extractJSON, resolveLanguageModelConfigs, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
 import { db, ensureImportStatesTable, ensureStoryPipelineTables } from "@/lib/db";
 import {
@@ -66,6 +66,46 @@ function asArray<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : [];
 }
 
+function positiveIntEnv(name: string, fallback: number) {
+  const value = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function compactModelError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function describeTextModelConfig(config: ProviderConfig) {
+  let host = "";
+  try {
+    host = config.baseUrl ? new URL(config.baseUrl).host : "";
+  } catch {
+    host = "";
+  }
+  return [config.protocol, host, config.modelId].filter(Boolean).join(":");
+}
+
+async function runWithTextModelRetries<T>(
+  configs: ProviderConfig[],
+  pickConfig: () => ProviderConfig,
+  attempts: number,
+  runner: (config: ProviderConfig) => Promise<T>
+) {
+  const maxAttempts = Math.max(1, Math.min(configs.length, attempts));
+  const errors: string[] = [];
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const config = pickConfig();
+    try {
+      return await runner(config);
+    } catch (error) {
+      errors.push(`${describeTextModelConfig(config)}: ${compactModelError(error)}`);
+    }
+  }
+
+  throw new Error(`Failed after ${maxAttempts} text model config attempt(s). Last error: ${errors.at(-1) || "Unknown error"}`);
+}
+
 function asStringArray(value: unknown) {
   return asArray<unknown>(value)
     .map((item) => String(item || "").trim())
@@ -122,7 +162,142 @@ function parseAnalysis(text: string, chunkId: string) {
     .replace(/[“”]/g, "\"")
     .replace(/[‘’]/g, "'")
     .replace(/,\s*([}\]])/g, "$1");
-  return normalizeAnalysis(JSON.parse(json), chunkId);
+  try {
+    return normalizeAnalysis(JSON.parse(json), chunkId);
+  } catch (firstError) {
+    const repaired = repairJsonText(json);
+    try {
+      return normalizeAnalysis(JSON.parse(repaired), chunkId);
+    } catch {
+      const quoteRepaired = escapeLooseStringQuotes(repaired).replace(/,\s*([}\]])/g, "$1");
+      try {
+        return normalizeAnalysis(JSON.parse(quoteRepaired), chunkId);
+      } catch {
+        const message = firstError instanceof Error ? firstError.message : "Invalid chunk JSON";
+        throw new ChunkStructureParseError(message, json.slice(0, 1000));
+      }
+    }
+  }
+}
+
+class ChunkStructureParseError extends Error {
+  snippet: string;
+
+  constructor(message: string, snippet: string) {
+    super(message);
+    this.name = "ChunkStructureParseError";
+    this.snippet = snippet;
+  }
+}
+
+function repairJsonText(json: string) {
+  const normalized = json
+    .replace(/^\uFEFF/, "")
+    .replace(/```(?:json)?/gi, "")
+    .replace(/```/g, "")
+    .replace(/[“”]/g, "\"")
+    .replace(/[‘’]/g, "'")
+    .trim();
+  return repairJsonStringLines(normalized)
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/:\s*"([^"]*(?:\n|\r)[^"]*)"/g, (_match, value: string) => {
+      return `: "${value.replace(/\r?\n/g, "\\n").replace(/\t/g, "\\t")}"`;
+    });
+}
+
+function hasUnescapedQuote(value: string) {
+  let escaped = false;
+  for (const ch of value) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") return true;
+  }
+  return false;
+}
+
+function repairJsonStringLines(json: string) {
+  return json
+    .split(/\r?\n/)
+    .map((line) => {
+      const match = line.match(/^(\s*"[^"]+"\s*:\s*")([\s\S]*?)\s*$/);
+      if (!match) return line;
+
+      const [, prefix, value] = match;
+      if (!value || hasUnescapedQuote(value)) return line;
+
+      const commaMatch = value.match(/^(.*?)(,?)$/);
+      if (!commaMatch) return line;
+
+      return `${prefix}${commaMatch[1]}"${commaMatch[2]}`;
+    })
+    .join("\n");
+}
+
+function escapeLooseStringQuotes(json: string) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+
+    if (!inString) {
+      if (ch === "\"") inString = true;
+      result += ch;
+      continue;
+    }
+
+    if (escaped) {
+      escaped = false;
+      result += ch;
+      continue;
+    }
+
+    if (ch === "\\") {
+      escaped = true;
+      result += ch;
+      continue;
+    }
+
+    if (ch === "\"") {
+      let nextIndex = i + 1;
+      while (nextIndex < json.length && /\s/.test(json[nextIndex])) {
+        nextIndex++;
+      }
+      const next = json[nextIndex];
+      const isClosingQuote = next === ":" || next === "," || next === "}" || next === "]" || next === undefined;
+
+      if (isClosingQuote) {
+        inString = false;
+        result += ch;
+      } else {
+        result += "\\\"";
+      }
+      continue;
+    }
+
+    result += ch;
+  }
+
+  return result;
+}
+
+function classifyStructureError(error: unknown) {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  if (name === "AbortError" || /abort|timeout|timed out/i.test(message)) {
+    return { type: "timeout", message: `单块 AI 解析超时：${message}` };
+  }
+  if (error instanceof ChunkStructureParseError || /JSON|parse|Unexpected token|Expected/i.test(message)) {
+    return { type: "json_parse", message: `AI 返回 JSON 无法解析：${message}` };
+  }
+  return { type: "ai_request", message };
 }
 
 function compactText(value: unknown, maxLength = 360) {
@@ -441,8 +616,8 @@ export async function POST(
   ensureStoryPipelineTables();
 
   const body = (await request.json()) as StructureBody;
-  const textModelConfig = body.modelConfig?.text;
-  if (!textModelConfig) {
+  const textModelConfigs = resolveLanguageModelConfigs(body.modelConfig?.text);
+  if (textModelConfigs.length === 0) {
     return NextResponse.json({ error: "No text model" }, { status: 400 });
   }
 
@@ -461,11 +636,17 @@ export async function POST(
     return NextResponse.json({ error: "Script has no chunks" }, { status: 400 });
   }
 
-  const concurrency = Math.max(1, Math.min(4, body.concurrency ?? 2));
-  const model = createLanguageModel(textModelConfig);
-  const providerOptions = supportsOpenAIJsonMode(textModelConfig)
-    ? { openai: { response_format: { type: "json_object" as const } } }
-    : undefined;
+  const perKeyConcurrency = positiveIntEnv("IMPORT_TEXT_PER_KEY_CONCURRENCY", 2);
+  const maxConcurrency = positiveIntEnv("IMPORT_STRUCTURE_MAX_CONCURRENCY", 16);
+  const poolConcurrency = textModelConfigs.length * perKeyConcurrency;
+  const concurrency = Math.max(1, Math.min(maxConcurrency, Math.max(body.concurrency ?? 0, poolConcurrency)));
+  const textModelAttempts = positiveIntEnv("IMPORT_TEXT_MODEL_ATTEMPTS", textModelConfigs.length);
+  let modelCursor = 0;
+  const nextTextModelConfig = () => {
+    const config = textModelConfigs[modelCursor % textModelConfigs.length];
+    modelCursor += 1;
+    return config;
+  };
   const chunkTimeoutMs = Math.max(60_000, Number(process.env.IMPORT_STRUCTURE_CHUNK_TIMEOUT_MS || 240_000));
   const retryFallback = body.retryFallback ?? true;
 
@@ -473,7 +654,7 @@ export async function POST(
     projectId,
     2,
     "running",
-    `开始 chunk 结构化解析：${chunks.length} 块，并发 ${concurrency}，单块超时 ${Math.round(chunkTimeoutMs / 1000)} 秒`
+    `开始 chunk 结构化解析：${chunks.length} 块，并发 ${concurrency}，文本 key ${textModelConfigs.length} 个，单块超时 ${Math.round(chunkTimeoutMs / 1000)} 秒`
   );
   await db
     .insert(importStates)
@@ -497,14 +678,19 @@ export async function POST(
   let completedChunks = chunks.filter(
     (chunk) => chunk.status === "parsed" && getStoredAnalysis(chunk) && (!retryFallback || !isFallbackChunk(chunk))
   ).length;
-  const recordChunkProgress = async (chunk: typeof scriptChunks.$inferSelect, fallback = false) => {
+  const recordChunkProgress = async (
+    chunk: typeof scriptChunks.$inferSelect,
+    fallback = false,
+    warning?: { type: string; message: string },
+  ) => {
     completedChunks += 1;
     const sourceLabel = fallback ? "本地兜底解析" : "AI解析";
+    const warningSuffix = warning ? `，原因：${warning.type}` : "";
     await addImportLog(
       projectId,
       2,
       "running",
-      `chunk progress: ${completedChunks}/${chunks.length} (chunk ${chunk.chunkIndex + 1}，${sourceLabel})`,
+      `chunk progress: ${completedChunks}/${chunks.length} (chunk ${chunk.chunkIndex + 1}，${sourceLabel}${warningSuffix})`,
       {
         scriptId: script.id,
         chunkId: chunk.id,
@@ -514,6 +700,7 @@ export async function POST(
         fallback,
         source: fallback ? "local" : "ai",
         sourceLabel,
+        warning,
       }
     );
   };
@@ -546,8 +733,9 @@ export async function POST(
       const timeout = setTimeout(() => controller.abort(), chunkTimeoutMs);
       const result = await (async () => {
         try {
-          return await generateText({
-            model,
+          return await runWithTextModelRetries(textModelConfigs, nextTextModelConfig, textModelAttempts, async (modelConfig) => {
+            return await generateText({
+            model: createLanguageModel(modelConfig),
             system: CHUNK_STRUCTURE_SYSTEM,
             prompt: buildChunkStructurePrompt({
               chunkId: chunk.id,
@@ -559,11 +747,14 @@ export async function POST(
               sceneTitle: String(metadata.sceneTitle || ""),
               text: chunk.text,
             }),
-            providerOptions,
+            providerOptions: supportsOpenAIJsonMode(modelConfig)
+              ? { openai: { response_format: { type: "json_object" as const } } }
+              : undefined,
             temperature: 0.1,
             maxRetries: 1,
             maxOutputTokens: 6000,
             abortSignal: controller.signal,
+          });
           });
         } finally {
           clearTimeout(timeout);
@@ -615,11 +806,11 @@ export async function POST(
       await recordChunkProgress(chunk);
       return { ok: true as const, chunkId: chunk.id, analysis, usage: result.usage, fallback: false, source: "ai" as const };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const warning = classifyStructureError(err);
       const metadata = chunk.metadata && typeof chunk.metadata === "object"
         ? (chunk.metadata as Record<string, unknown>)
         : {};
-      const fallbackAnalysis = buildLocalFallbackAnalysis(chunk, message);
+      const fallbackAnalysis = buildLocalFallbackAnalysis(chunk, warning.message);
       await db
         .update(scriptChunks)
         .set({
@@ -627,15 +818,17 @@ export async function POST(
           metadata: {
             ...metadata,
             analysis: fallbackAnalysis,
-            structureWarning: message,
+            structureWarning: warning.message,
+            structureWarningType: warning.type,
+            structureWarningSnippet: err instanceof ChunkStructureParseError ? err.snippet : "",
             fallbackStructure: true,
             source: "local",
           },
           updatedAt: new Date(),
         })
         .where(eq(scriptChunks.id, chunk.id));
-      await recordChunkProgress(chunk, true);
-      return { ok: true as const, chunkId: chunk.id, analysis: fallbackAnalysis, warning: message, fallback: true, source: "local" as const };
+      await recordChunkProgress(chunk, true, warning);
+      return { ok: true as const, chunkId: chunk.id, analysis: fallbackAnalysis, warning: warning.message, fallback: true, source: "local" as const };
     }
   });
 

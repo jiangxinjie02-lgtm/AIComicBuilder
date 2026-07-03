@@ -6,6 +6,15 @@ import { projects } from "@/lib/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
+import {
+  buildAssetImagePrompt,
+  categoryToAssetType,
+  defaultAssetStyleSpec,
+  defaultAssetVisualSpec,
+  type AssetStyleSpec,
+  type AssetVisualSpec,
+  type AssetVisualSchema,
+} from "@/lib/asset-prompt-builder";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -15,6 +24,21 @@ interface EditImageAsset {
   assetId?: string;
   name?: string;
   category?: string;
+  role?: string;
+  visualHint?: string;
+  description?: string;
+  visualConstraints?: string;
+  sceneAssetId?: string;
+  visualSchema?: AssetVisualSchema;
+  styleSpec?: AssetStyleSpec;
+  prompt?: string;
+  negativePrompt?: string;
+  tags?: string[];
+  faceTemplate?: {
+    label?: string;
+    url?: string;
+    note?: string;
+  } | null;
 }
 
 interface EditImageBody {
@@ -27,6 +51,8 @@ interface EditImageBody {
   quality?: string;
   targetName?: string;
   targetType?: string;
+  visualSpec?: AssetVisualSpec;
+  styleSpec?: AssetStyleSpec;
   asset?: EditImageAsset;
 }
 
@@ -46,6 +72,11 @@ interface EditImagePayload {
     category: string;
     sourceImage: string;
     projectId: string;
+    promptBuilder?: string;
+    compilerInput?: unknown;
+    compilerIR?: unknown;
+    compiledFinalPrompt?: string;
+    validation?: unknown;
   };
 }
 
@@ -72,7 +103,6 @@ export async function POST(
   const body = (await request.json()) as EditImageBody;
   const sourceImage = String(body.imageUrl || "").trim();
   const editPrompt = String(body.editPrompt || "").trim();
-  const basePrompt = String(body.prompt || "").trim();
   if (!sourceImage) {
     return NextResponse.json({ error: "Missing source image" }, { status: 400 });
   }
@@ -83,25 +113,60 @@ export async function POST(
   const category = String(body.category || body.asset?.category || "");
   const providerImage = await toProviderImage(sourceImage);
   const isVariantTarget = String(body.targetType || "").startsWith("variant");
-  const prompt = isVariantTarget
-    ? [
-        "Create a visibly different variant from the source image.",
-        "Apply this variant instruction as the highest priority:",
-        editPrompt,
-        "Preserve only the same character identity, facial features, body proportions, and overall visual style.",
-        "Do not copy the source image exactly. If the instruction mentions outfit, hair, expression, weather, time of day, or state, make that change obvious.",
-        basePrompt ? `Base identity/context, lower priority:\n${basePrompt}` : "",
-      ].filter(Boolean).join("\n\n")
-    : [
-        basePrompt,
-        "Edit instruction:",
-        editPrompt,
-        "Keep the same identity, facial features, body proportions, composition continuity, and visual style unless the instruction explicitly changes them.",
-      ].filter(Boolean).join("\n\n");
+  const assetType = categoryToAssetType(category);
+  const builtPrompt = buildAssetImagePrompt({
+    asset: {
+      id: body.asset?.id || body.asset?.assetId || "",
+      type: assetType,
+      name: body.asset?.name || body.targetName || "asset",
+      role: body.asset?.role || "",
+      category,
+      description: body.asset?.description || "",
+      visualHint: body.asset?.visualHint || "",
+      visualConstraints: body.asset?.visualConstraints || "",
+      negativeConstraints: body.asset?.negativePrompt || body.negativePrompt || "",
+      tags: Array.isArray(body.asset?.tags) ? body.asset.tags : [],
+      sceneAssetId: body.asset?.sceneAssetId || "",
+      visualSchema: body.asset?.visualSchema || null,
+      faceTemplate: body.asset?.faceTemplate || null,
+    },
+    variant: {
+      id: "",
+      name: body.targetName || "variant",
+      variantType: isVariantTarget ? "variant" : "edit",
+      state: editPrompt,
+      editInstruction: editPrompt,
+      visualConstraints: editPrompt,
+      negativeConstraints: body.negativePrompt || "",
+    },
+    visualSpec: {
+      ...defaultAssetVisualSpec(assetType, String(body.size || sizeForCategory(category))),
+      ...(body.visualSpec || {}),
+    },
+    styleSpec: {
+      ...defaultAssetStyleSpec(),
+      ...(body.asset?.styleSpec || {}),
+      ...(body.styleSpec || {}),
+    },
+  });
+  if (!builtPrompt.validation_report.passed) {
+    return NextResponse.json({
+      error: "Asset prompt validation failed",
+      validation: builtPrompt.validation_report,
+      compilerIR: builtPrompt.compiler_ir,
+    }, { status: 422 });
+  }
+  const prompt = [
+    isVariantTarget
+      ? "Create a reusable asset variant from the source image, not a story scene."
+      : "Edit this reusable asset image, not a story scene.",
+    "Preserve the same asset identity, facial features, body proportions, layout discipline, and clean asset-sheet purpose unless the variant explicitly changes a visual trait.",
+    builtPrompt.compiled_final_prompt,
+  ].join("\n\n");
 
   const payload: EditImagePayload = {
     model: getEditImageModel(),
-    prompt: mergePromptWithNegative(prompt, body.negativePrompt || defaultNegativePrompt(category)),
+    prompt: mergePromptWithNegative(prompt, builtPrompt.compiled_negative_prompt || defaultNegativePrompt(category)),
     image: providerImage,
     n: 1,
     size: normalizeImageSize(String(body.size || sizeForCategory(category))),
@@ -115,6 +180,11 @@ export async function POST(
       category,
       sourceImage,
       projectId,
+      promptBuilder: "asset_prompt_compiler_v2",
+      compilerInput: builtPrompt.compiler_input,
+      compilerIR: builtPrompt.compiler_ir,
+      compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      validation: builtPrompt.validation_report,
     },
   };
 
@@ -459,36 +529,6 @@ function defaultNegativePrompt(category: string) {
   if (category === "props") return `${common}, people, hands, background environment`;
   if (category === "scenes") return `${common}, people, silhouettes, pedestrians, unrelated modern objects`;
   return `${common}, multiple people, duplicate character, distorted face, inconsistent outfit`;
-}
-
-function makePlaceholderImage(payload: EditImagePayload) {
-  const label = payload.metadata.targetName || payload.metadata.assetName || payload.metadata.category || "image edit";
-  const promptPreview = escapeSvg(compactText(payload.prompt, 150));
-  const svg = `
-  <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
-    <rect width="1280" height="720" fill="#111827"/>
-    <rect x="72" y="72" width="1136" height="576" rx="22" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.22)"/>
-    <text x="110" y="145" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="42" font-weight="700">Image Edit Placeholder</text>
-    <text x="110" y="205" fill="#93c5fd" font-family="Arial, sans-serif" font-size="30">${escapeSvg(label)}</text>
-    <foreignObject x="110" y="250" width="1040" height="310">
-      <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:Arial,sans-serif;color:#d1d5db;font-size:24px;line-height:1.55;">
-        ${promptPreview}
-      </div>
-    </foreignObject>
-  </svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
-}
-
-function compactText(text: string, maxLength: number) {
-  const cleaned = String(text || "").replace(/\s+/g, " ").trim();
-  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}...` : cleaned;
-}
-
-function escapeSvg(text: string) {
-  return String(text || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
 
 function slugify(value: string) {

@@ -1,3 +1,9 @@
+import {
+  buildAssetImagePrompt,
+  defaultAssetStyleSpec,
+  defaultAssetVisualSpec,
+} from "@/lib/asset-prompt-builder";
+
 type AssetCategory = "characters" | "props" | "scenes" | "voices";
 
 interface AnalyzeScriptAssetsInput {
@@ -8,6 +14,11 @@ interface AnalyzeScriptAssetsInput {
   targetSize?: string;
   style?: string;
 }
+
+type AssetPromptSettings = Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & {
+  eraConstraint: string;
+  genreConstraint: string;
+};
 
 export interface StoryMetaAnalysis {
   time?: string;
@@ -55,8 +66,10 @@ export interface AssetAgentAsset {
   appearances: number;
   episodes: string[];
   description: string;
+  visualConstraints: string;
   prompt: string;
   negativePrompt: string;
+  promptMetadata?: Record<string, unknown>;
   variants: AssetAgentVariant[];
   imageUrl: string;
   history: Array<Record<string, unknown>>;
@@ -71,6 +84,8 @@ export interface AssetAgentProject {
     aspectRatio: string;
     targetSize: string;
     style: string;
+    eraConstraint?: string;
+    genreConstraint?: string;
   };
   summary: {
     output: string;
@@ -336,7 +351,13 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
   const sceneSeeds = mergeNamedSeeds(aiSceneSeeds, ruleSceneSeeds);
 
   const storyMeta = normalizeStoryMeta(input.storyAnalysis?.storyMeta);
-  const settings = { aspectRatio, targetSize, style, storyMeta };
+  const settings: AssetPromptSettings = {
+    aspectRatio,
+    targetSize,
+    style,
+    eraConstraint: inferAssetEraConstraint(storyMeta, normalized),
+    genreConstraint: inferAssetGenreConstraint(storyMeta),
+  };
   const characters = characterSeeds.slice(0, 80).map((seed, index) =>
     makeCharacterAsset(seed, index, normalized, episodes, settings)
   );
@@ -593,6 +614,29 @@ function normalizeStoryMeta(meta?: StoryMetaAnalysis): StoryMetaAnalysis | undef
   return Object.values(normalized).some(Boolean) ? normalized : undefined;
 }
 
+function inferAssetEraConstraint(meta: StoryMetaAnalysis | undefined, text: string) {
+  const source = [
+    meta?.time,
+    meta?.background,
+    meta?.locationBackground,
+    meta?.visualStyleBase,
+    text.slice(0, 12000),
+  ].filter(Boolean).join(" ");
+  const year = source.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
+  if (year) return `${year[1]} China`;
+  if (/八十年代|80年代|1980年代|1980s/i.test(source)) return "1980s China";
+  if (/七十年代|70年代|1970年代|1970s/i.test(source)) return "1970s China";
+  if (/九十年代|90年代|1990年代|1990s/i.test(source)) return "1990s China";
+  if (/民国/.test(source)) return "Republican-era China";
+  if (/古代|唐代|宋代|明代|清代|汉代|古风|仙侠|武侠/.test(source)) return "historical China";
+  return "realistic modern/civilian China unless asset schema explicitly states otherwise";
+}
+
+function inferAssetGenreConstraint(meta: StoryMetaAnalysis | undefined) {
+  const genre = compactText(meta?.genre || meta?.visualStyleBase || "", 120);
+  return genre || "realistic Chinese short-drama asset reference";
+}
+
 function mergeCharacterSeeds(primary: CharacterSeed[], fallback: CharacterSeed[]) {
   const merged = new Map<string, CharacterSeed>();
 
@@ -617,18 +661,6 @@ function mergeCharacterSeeds(primary: CharacterSeed[], fallback: CharacterSeed[]
 
 function mergeNamedSeeds(primary: NamedSeed[], fallback: NamedSeed[]) {
   return dedupeNamedSeeds([...primary, ...fallback]).sort((a, b) => b.score - a.score);
-}
-
-function buildGlobalStoryPrompt(meta?: StoryMetaAnalysis) {
-  if (!meta) return "";
-  const lines = [
-    meta.time ? `故事时间：${meta.time}` : "",
-    meta.background ? `故事背景：${meta.background}` : "",
-    meta.genre ? `题材类型：${meta.genre}` : "",
-    meta.locationBackground ? `主要地域/空间背景：${meta.locationBackground}` : "",
-    meta.visualStyleBase ? `统一视觉基调：${meta.visualStyleBase}` : "",
-  ].filter(Boolean);
-  return lines.length ? ["【全局故事设定】", ...lines, ""].join("\n") : "";
 }
 
 function buildCharacterSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null): CharacterSeed[] {
@@ -700,7 +732,7 @@ function makeCharacterAsset(
   index: number,
   text: string,
   episodes: string[],
-  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & { storyMeta?: StoryMetaAnalysis }
+  settings: AssetPromptSettings
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const joined = snippets.concat(seed.contexts).join(" ");
@@ -711,30 +743,31 @@ function makeCharacterAsset(
   const description = compactText(seed.contexts.concat(snippets).join(" "), 220);
   const roleKey = roleKeyFromRole(seed.role);
   const faceTemplate = LEAD_FACE_TEMPLATES[roleKey] || null;
-  const faceConstraint = faceTemplate
-    ? [
-        "【脸型模板约束】",
-        `参考图：${faceTemplate.label}（${faceTemplate.url}）。${faceTemplate.note}。`,
-        "生成主图与全部变体时，脸型、五官、眉眼鼻唇比例、骨相和面部辨识度必须严格保持模板一致；多个变体只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。",
-        "",
-      ]
-    : [];
-  const globalStoryPrompt = buildGlobalStoryPrompt(settings.storyMeta);
-  const prompt = [
-    globalStoryPrompt,
-    "【整体美学】",
-    `${settings.style}摄影质感，自然皮肤毛孔与织物纹理，影棚柔光，35mm 胶片质地，统一剧集视觉风格。`,
-    "",
-    "【画面规格】",
-    `人物三视图角色设定图，“${seed.name}”。${settings.aspectRatio}，${settings.targetSize}，纯白背景，平视视角。单一角色，画面中不出现其他人物。左侧为面部近景，右侧为正面、侧面、背面三视图，全身比例准确。`,
-    "",
-    ...faceConstraint,
-    "【角色档案】",
-    `姓名：${seed.name}。身份：${seed.role}。${gender}，${age}。性格气质：${temperament}。剧本依据：${description || "根据剧本主要出场信息生成。"} `,
-    "",
-    "【一致性约束】",
-    "所有视图保持同一人物，发型、服装、肤色、身材比例完全一致；不出现字幕、文字、Logo、水印、UI；不裁切头顶或脚部。",
-  ].join("\n");
+  const visualConstraints = [
+    gender,
+    age,
+    temperament,
+    faceTemplate ? `${faceTemplate.label}；${faceTemplate.note}` : "",
+  ].filter(Boolean).join("；");
+  const builtPrompt = buildAssetImagePrompt({
+    asset: {
+      id: `char_${index + 1}_${slugify(seed.name)}`,
+      type: "character",
+      name: seed.name,
+      role: seed.role,
+      visualConstraints,
+      tags: [seed.role, gender, age].filter(Boolean),
+      faceTemplate,
+    },
+    visualSpec: defaultAssetVisualSpec("character", settings.targetSize),
+    styleSpec: {
+      ...defaultAssetStyleSpec(),
+      style: settings.style || "realistic live-action photography",
+      eraConstraint: settings.eraConstraint,
+      genre: settings.genreConstraint,
+    },
+  });
+  const prompt = builtPrompt.compiled_final_prompt;
 
   return {
     id: `char_${index + 1}_${slugify(seed.name)}`,
@@ -751,8 +784,16 @@ function makeCharacterAsset(
     appearances: seed.score,
     episodes: epRefs,
     description: description || `${seed.name} 是剧本中需要建立一致视觉形象的角色。`,
+    visualConstraints,
     prompt,
-    negativePrompt: defaultNegativePrompt("characters"),
+    negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("characters"),
+    promptMetadata: {
+      promptBuilder: "asset_prompt_compiler_v2",
+      compilerInput: builtPrompt.compiler_input,
+      compilerIR: builtPrompt.compiler_ir,
+      compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      validation: builtPrompt.validation_report,
+    },
     variants: suggestCharacterVariants(seed.name, seed.role, snippets, faceTemplate),
     imageUrl: "",
     history: [],
@@ -764,26 +805,30 @@ function makePropAsset(
   index: number,
   text: string,
   episodes: string[],
-  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & { storyMeta?: StoryMetaAnalysis }
+  settings: AssetPromptSettings
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
   const description = compactText(seed.contexts.concat(snippets).join(" "), 180);
-  const globalStoryPrompt = buildGlobalStoryPrompt(settings.storyMeta);
-  const prompt = [
-    globalStoryPrompt,
-    "【整体美学】",
-    `${settings.style}摄影质感，真实材质细节，柔和棚拍光，35mm 胶片质地。`,
-    "",
-    "【画面规格】",
-    `物品设定图，“${seed.name}”。${settings.aspectRatio}，${settings.targetSize}，完整物品展示，单个主体，居中构图，纯白背景，正面视角，必要时附侧面/背面小视图，清晰展示轮廓、材质、磨损与表面纹理。`,
-    "",
-    "【物品档案】",
-    `名称：${seed.name}。类型：${seed.type}。剧本依据：${description || "由剧本中的道具关键词与上下文抽取。"} `,
-    "",
-    "【限制】",
-    "不出现持握者、手、人物、人影、背景环境；不出现字幕、文字、Logo、水印、UI。",
-  ].join("\n");
+  const visualConstraints = [seed.type, description].filter(Boolean).join("；");
+  const builtPrompt = buildAssetImagePrompt({
+    asset: {
+      id: `prop_${index + 1}_${slugify(seed.name)}`,
+      type: "prop",
+      name: seed.name,
+      role: seed.type,
+      visualConstraints,
+      tags: [seed.type],
+    },
+    visualSpec: defaultAssetVisualSpec("prop", settings.targetSize),
+    styleSpec: {
+      ...defaultAssetStyleSpec(),
+      style: settings.style || "realistic product photography",
+      eraConstraint: settings.eraConstraint,
+      genre: settings.genreConstraint,
+    },
+  });
+  const prompt = builtPrompt.compiled_final_prompt;
 
   return {
     id: `prop_${index + 1}_${slugify(seed.name)}`,
@@ -798,8 +843,16 @@ function makePropAsset(
     appearances: seed.score,
     episodes: epRefs,
     description: description || `${seed.name} 是剧本中反复出现或具有叙事功能的物品。`,
+    visualConstraints,
     prompt,
-    negativePrompt: defaultNegativePrompt("props"),
+    negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("props"),
+    promptMetadata: {
+      promptBuilder: "asset_prompt_compiler_v2",
+      compilerInput: builtPrompt.compiler_input,
+      compilerIR: builtPrompt.compiler_ir,
+      compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      validation: builtPrompt.validation_report,
+    },
     variants: [],
     imageUrl: "",
     history: [],
@@ -811,27 +864,33 @@ function makeSceneAsset(
   index: number,
   text: string,
   episodes: string[],
-  settings: Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & { storyMeta?: StoryMetaAnalysis }
+  settings: AssetPromptSettings
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
   const description = compactText(seed.contexts.concat(snippets).join(" "), 220);
   const times = Array.isArray(seed.times) ? seed.times : [];
-  const globalStoryPrompt = buildGlobalStoryPrompt(settings.storyMeta);
-  const prompt = [
-    globalStoryPrompt,
-    "【整体美学】",
-    `${settings.style}摄影质感，电影级布光，空间纹理真实，冷暖对比克制，35mm 胶片颗粒，Cinematic。`,
-    "",
-    "【画面规格】",
-    `场景环境设定图，“${seed.name}”。${settings.aspectRatio}，${settings.targetSize}，宽银幕构图，大全景，平视视角，空间完整，建筑结构、陈设、光源关系清晰。`,
-    "",
-    "【环境档案】",
-    `名称：${seed.name}。类型：${seed.type}。剧本依据：${description || "根据剧本地点与场景段落生成。"} `,
-    "",
-    "【限制】",
-    "不出现字幕、文字、Logo、水印；不出现人物、人影、行人；不出现现代无关物件。",
-  ].join("\n");
+  const visualConstraints = [seed.type, description, times.map((time) => `${time}景`).join("；")]
+    .filter(Boolean)
+    .join("；");
+  const builtPrompt = buildAssetImagePrompt({
+    asset: {
+      id: `scene_${index + 1}_${slugify(seed.name)}`,
+      type: "scene",
+      name: seed.name,
+      role: seed.type,
+      visualConstraints,
+      tags: [seed.type, ...times.map((time) => `${time}景`)].filter(Boolean),
+    },
+    visualSpec: defaultAssetVisualSpec("scene", settings.targetSize),
+    styleSpec: {
+      ...defaultAssetStyleSpec(),
+      style: settings.style || "realistic live-action environment reference",
+      eraConstraint: settings.eraConstraint,
+      genre: settings.genreConstraint,
+    },
+  });
+  const prompt = builtPrompt.compiled_final_prompt;
 
   return {
     id: `scene_${index + 1}_${slugify(seed.name)}`,
@@ -846,8 +905,16 @@ function makeSceneAsset(
     appearances: seed.score,
     episodes: epRefs,
     description: description || `${seed.name} 是剧本中需要建立空间一致性的场景。`,
+    visualConstraints,
     prompt,
-    negativePrompt: defaultNegativePrompt("scenes"),
+    negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("scenes"),
+    promptMetadata: {
+      promptBuilder: "asset_prompt_compiler_v2",
+      compilerInput: builtPrompt.compiler_input,
+      compilerIR: builtPrompt.compiler_ir,
+      compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      validation: builtPrompt.validation_report,
+    },
     variants: suggestSceneVariants(seed.name, times, prompt),
     imageUrl: "",
     history: [],
@@ -882,8 +949,10 @@ function makeVoiceAsset(character: AssetAgentAsset, index: number, text: string,
     appearances: character.appearances,
     episodes: inferEpisodeRefs(text, character.name, episodes),
     description: `${character.name} 的配音/音色设定，用于后续对白制作保持一致。`,
+    visualConstraints: "",
     prompt,
     negativePrompt: "",
+    promptMetadata: {},
     variants: [
       { name: "日常对白", description: "自然、克制、贴近生活的基础版本。" },
       { name: "情绪爆发", description: "压力升高时的更强气息与重音。" },

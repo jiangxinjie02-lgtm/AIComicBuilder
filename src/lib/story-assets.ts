@@ -1,7 +1,10 @@
 import { and, asc, eq } from "drizzle-orm";
-import { db, ensureAssetLibraryTables } from "@/lib/db";
+import { db, ensureAssetLibraryTables, ensureStoryPipelineTables } from "@/lib/db";
 import {
   assets,
+  assetCandidates,
+  assetOccurrences,
+  assetVariants,
   characterAssets,
   characters,
   propAssets,
@@ -17,6 +20,7 @@ export interface ImportAssetDraft {
   frequency?: number;
   description?: string;
   visualHint?: string;
+  visualConstraints?: string;
   confirmed?: boolean;
   assetId?: string;
   category?: string;
@@ -32,6 +36,27 @@ export interface ImportAssetDraft {
   mainImageName?: string;
   tags?: string[];
   faceTemplate?: unknown;
+  promptMetadata?: unknown;
+  styleSpec?: unknown;
+  visualSchema?: unknown;
+}
+
+export interface ImportAssetVariantDraft {
+  id?: string;
+  name?: string;
+  variantType?: string;
+  type?: string;
+  state?: string;
+  description?: string;
+  prompt?: string;
+  visualConstraints?: string;
+  negativePrompt?: string;
+  imageUrl?: string;
+  history?: unknown[];
+  editInstruction?: string;
+  lockedTraits?: unknown;
+  changedTraits?: unknown;
+  visualSchema?: unknown;
 }
 
 export interface StoryAssetPatch {
@@ -70,6 +95,7 @@ export interface StoryAssetPatch {
     state?: string;
     usageRules?: string;
   };
+  variants?: ImportAssetVariantDraft[];
 }
 
 type AssetRow = typeof assets.$inferSelect;
@@ -111,11 +137,191 @@ function normalizeAliases(value: unknown): string[] {
   return [];
 }
 
+function normalizeVariantDrafts(type: StoryAssetType, draft: ImportAssetDraft) {
+  const rawVariants = Array.isArray(draft.variants)
+    ? draft.variants
+        .map((item) => item && typeof item === "object" ? item as ImportAssetVariantDraft : null)
+        .filter((item): item is ImportAssetVariantDraft => Boolean(item))
+    : [];
+  const defaultName = type === "character"
+    ? "default_look"
+    : type === "scene"
+      ? "default_scene_state"
+      : "default_prop_state";
+  const defaultState = cleanText(draft.visualConstraints || draft.visualHint || draft.description || draft.role || draft.category || "default");
+  const defaultVariant: ImportAssetVariantDraft = {
+    name: defaultName,
+    variantType: "default",
+    state: defaultState,
+    description: draft.description,
+    prompt: draft.prompt || "",
+    visualConstraints: draft.visualConstraints || draft.visualHint || draft.description,
+    negativePrompt: draft.negativePrompt,
+    imageUrl: draft.imageUrl,
+    history: draft.history,
+    lockedTraits: {
+      name: draft.name,
+      aliases: normalizeAliases(draft.aliases),
+      type,
+    },
+    changedTraits: {
+      state: defaultState,
+    },
+    visualSchema: draft.visualSchema,
+  };
+
+  const seen = new Set<string>();
+  return [defaultVariant, ...rawVariants]
+    .map((variant, index) => {
+      const name = normalizeName(variant.name || variant.id || (index === 0 ? defaultName : `variant_${index}`));
+      return {
+        ...variant,
+        name,
+        variantType: normalizeName(variant.variantType || variant.type || (index === 0 ? "default" : "state")),
+      };
+    })
+    .filter((variant) => {
+      const key = variant.name.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 export function importanceLabel(score: number) {
   if (score >= 80) return "core";
   if (score >= 50) return "important";
   if (score >= 20) return "temporary";
   return "background";
+}
+
+async function createResolvedCandidate(
+  projectId: string,
+  type: StoryAssetType,
+  draft: ImportAssetDraft,
+  assetId: string,
+) {
+  const now = new Date();
+  const name = normalizeName(draft.name);
+  const [candidate] = await db
+    .insert(assetCandidates)
+    .values({
+      id: genId(),
+      projectId,
+      assetType: type,
+      name,
+      normalizedName: name.toLowerCase(),
+      aliases: normalizeAliases(draft.aliases),
+      role: cleanText(draft.role || draft.roleKey || draft.scope || draft.category),
+      description: cleanText(draft.description),
+      evidenceText: cleanText(draft.description || draft.visualConstraints || draft.visualHint || name),
+      confidence: Math.max(50, Math.min(95, importanceScore(undefined, draft))),
+      source: "ai",
+      status: "merged",
+      mergedAssetId: assetId,
+      metadata: {
+        source: "import_asset_draft",
+        sourceAssetId: draft.assetId || "",
+        episodes: draft.episodes || [],
+        visualHint: draft.visualHint || "",
+      },
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning();
+  return candidate;
+}
+
+async function createAssetOccurrence(
+  projectId: string,
+  assetId: string,
+  draft: ImportAssetDraft,
+  candidateId?: string | null,
+) {
+  const evidenceText = cleanText(draft.description || draft.visualConstraints || draft.visualHint || draft.name);
+  const [occurrence] = await db
+    .insert(assetOccurrences)
+    .values({
+      id: genId(),
+      projectId,
+      assetId,
+      candidateId: candidateId ?? null,
+      occurrenceType: "mention",
+      evidenceText,
+      importance: importanceScore(undefined, draft),
+      metadata: {
+        source: "import_asset_draft",
+        episodes: draft.episodes || [],
+        visualHint: draft.visualHint || "",
+      },
+      createdAt: new Date(),
+    })
+    .returning();
+  return occurrence;
+}
+
+async function syncAssetVariants(
+  projectId: string,
+  type: StoryAssetType,
+  assetId: string,
+  draft: ImportAssetDraft,
+  source?: {
+    candidateId?: string | null;
+    occurrenceId?: string | null;
+  },
+) {
+  const now = new Date();
+  const rows = [];
+  for (const variant of normalizeVariantDrafts(type, draft)) {
+    const values = {
+      projectId,
+      assetId,
+      sourceCandidateId: source?.candidateId ?? null,
+      sourceOccurrenceId: source?.occurrenceId ?? null,
+      variantType: cleanText(variant.variantType || variant.type || "state"),
+      name: normalizeName(variant.name),
+      state: cleanText(variant.state || variant.description || variant.editInstruction || draft.visualConstraints || draft.visualHint),
+      lockedTraits: variant.lockedTraits ?? {
+        assetName: draft.name,
+        assetType: type,
+        baseDescription: draft.description || "",
+      },
+      changedTraits: variant.changedTraits ?? {
+        prompt: variant.prompt || "",
+        editInstruction: variant.editInstruction || "",
+      },
+      visualConstraints: cleanText(variant.visualConstraints || variant.description || draft.visualConstraints || draft.visualHint || draft.description),
+      negativeConstraints: cleanText(variant.negativePrompt || draft.negativePrompt),
+      referenceImage: variant.imageUrl || (variant.variantType === "default" ? draft.imageUrl : null) || null,
+      status: draft.confirmed ? "approved" as const : variant.imageUrl ? "generated" as const : "draft" as const,
+      metadata: {
+        source: "import_asset_draft",
+        sourceVariantId: variant.id || "",
+        history: variant.history || [],
+        visualSchema: variant.visualSchema || null,
+      },
+      updatedAt: now,
+    };
+
+    await db
+      .insert(assetVariants)
+      .values({
+        id: genId(),
+        ...values,
+        createdAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [assetVariants.assetId, assetVariants.name],
+        set: values,
+      });
+
+    const [row] = await db
+      .select()
+      .from(assetVariants)
+      .where(and(eq(assetVariants.assetId, assetId), eq(assetVariants.name, values.name)));
+    if (row) rows.push(row);
+  }
+  return rows;
 }
 
 export function importanceScore(value: unknown, draft?: ImportAssetDraft) {
@@ -176,6 +382,9 @@ function buildMetadata(type: StoryAssetType, draft: ImportAssetDraft, previous?:
     episodes: draft.episodes || previousMetadata.episodes || [],
     prompt: draft.prompt || previousMetadata.prompt || "",
     negativePrompt: draft.negativePrompt || previousMetadata.negativePrompt || "",
+    promptMetadata: draft.promptMetadata || previousMetadata.promptMetadata || null,
+    styleSpec: draft.styleSpec || previousMetadata.styleSpec || null,
+    visualSchema: draft.visualSchema || previousMetadata.visualSchema || null,
     variants: draft.variants || previousMetadata.variants || [],
     imageHistory: draft.history || previousMetadata.imageHistory || [],
     mainImageName: draft.mainImageName || previousMetadata.mainImageName || "",
@@ -259,6 +468,7 @@ export async function upsertStoryAsset(
   links?: { characterIdByName?: Map<string, string> },
 ) {
   ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
 
   const name = normalizeName(draft.name);
   if (!name) return null;
@@ -274,7 +484,7 @@ export async function upsertStoryAsset(
     aliases: jsonString(normalizeAliases(draft.aliases)),
     importance: score,
     description: cleanText(draft.description),
-    visualConstraints: cleanText(draft.prompt || draft.visualHint || draft.description),
+    visualConstraints: cleanText(draft.visualConstraints || draft.visualHint || draft.description),
     negativeConstraints: cleanText(draft.negativePrompt),
     firstAppearance: Array.isArray(draft.episodes) ? draft.episodes[0] ?? "" : "",
     confirmed: draft.confirmed ? 1 : 0,
@@ -305,6 +515,12 @@ export async function upsertStoryAsset(
   }
 
   await syncSubtypeRow(record.id, type, draft, links);
+  const candidate = await createResolvedCandidate(projectId, type, draft, record.id);
+  const occurrence = await createAssetOccurrence(projectId, record.id, draft, candidate.id);
+  await syncAssetVariants(projectId, type, record.id, draft, {
+    candidateId: candidate.id,
+    occurrenceId: occurrence.id,
+  });
   return record;
 }
 
@@ -335,6 +551,7 @@ export async function syncImportAssets(
 
 export async function listProjectAssets(projectId: string, type?: StoryAssetType) {
   ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
 
   const rows = type
     ? await db
@@ -352,11 +569,52 @@ export async function listProjectAssets(projectId: string, type?: StoryAssetType
 }
 
 async function enrichAsset(row: AssetRow) {
+  let sourceRows = await db
+    .select()
+    .from(assetOccurrences)
+    .where(eq(assetOccurrences.assetId, row.id))
+    .orderBy(asc(assetOccurrences.createdAt));
+  if (sourceRows.length === 0) {
+    await createAssetOccurrence(row.projectId, row.id, {
+      name: row.name,
+      description: row.description,
+      prompt: row.visualConstraints,
+      negativePrompt: row.negativeConstraints,
+      imageUrl: row.referenceImage ?? undefined,
+      confirmed: Boolean(row.confirmed),
+    });
+    sourceRows = await db
+      .select()
+      .from(assetOccurrences)
+      .where(eq(assetOccurrences.assetId, row.id))
+      .orderBy(asc(assetOccurrences.createdAt));
+  }
+
+  let variantRows = await db
+    .select()
+    .from(assetVariants)
+    .where(eq(assetVariants.assetId, row.id))
+    .orderBy(asc(assetVariants.createdAt));
+  if (variantRows.length === 0) {
+    variantRows = await syncAssetVariants(row.projectId, row.type, row.id, {
+      name: row.name,
+      aliases: row.aliases,
+      description: row.description,
+      prompt: row.visualConstraints,
+      negativePrompt: row.negativeConstraints,
+      imageUrl: row.referenceImage ?? undefined,
+      confirmed: Boolean(row.confirmed),
+    }, {
+      occurrenceId: sourceRows[0]?.id,
+    });
+  }
   const base = {
     ...row,
     aliases: normalizeAliases(row.aliases),
     importanceLabel: importanceLabel(row.importance ?? 0),
     metadata: parseJson<Record<string, unknown>>(row.metadata, {}),
+    variants: variantRows,
+    sources: sourceRows,
   };
 
   if (row.type === "character") {
@@ -382,6 +640,7 @@ async function enrichAsset(row: AssetRow) {
 
 export async function assertAssetInProject(projectId: string, assetId: string) {
   ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
 
   const [row] = await db
     .select()
@@ -390,8 +649,17 @@ export async function assertAssetInProject(projectId: string, assetId: string) {
   return row ?? null;
 }
 
+export async function getProjectAsset(projectId: string, assetId: string) {
+  ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
+
+  const row = await assertAssetInProject(projectId, assetId);
+  return row ? enrichAsset(row) : null;
+}
+
 export async function patchStoryAsset(projectId: string, assetId: string, patch: StoryAssetPatch) {
   ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
 
   const existing = await assertAssetInProject(projectId, assetId);
   if (!existing) return null;
@@ -437,11 +705,25 @@ export async function patchStoryAsset(projectId: string, assetId: string, patch:
       .onConflictDoUpdate({ target: propAssets.assetId, set: patch.prop });
   }
 
+  if (patch.variants !== undefined) {
+    await syncAssetVariants(projectId, updated.type, updated.id, {
+      name: updated.name,
+      aliases: updated.aliases,
+      description: updated.description,
+      prompt: updated.visualConstraints,
+      negativePrompt: updated.negativeConstraints,
+      imageUrl: updated.referenceImage ?? undefined,
+      confirmed: Boolean(updated.confirmed),
+      variants: patch.variants,
+    });
+  }
+
   return enrichAsset(updated);
 }
 
 export async function deleteStoryAsset(projectId: string, assetId: string) {
   ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
 
   const existing = await assertAssetInProject(projectId, assetId);
   if (!existing) return false;

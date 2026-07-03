@@ -51,6 +51,8 @@ export interface StructuredChunkDraft {
     sceneId?: string;
     episodeTitle?: string;
     sceneTitle?: string;
+    sceneIds?: string[];
+    sceneIndexes?: number[];
     dialogueCharacters: string[];
   };
 }
@@ -441,7 +443,52 @@ function createChunksForScenes(
   const overlap = options.overlap ?? DEFAULT_OVERLAP_SIZE;
   const chunks: StructuredChunkDraft[] = [];
 
-  for (const scene of scenes) {
+  function pushChunkForRange(params: {
+    episode: StructuredEpisodeDraft;
+    scenesInChunk: StructuredSceneDraft[];
+    coreStart: number;
+    coreEnd: number;
+  }) {
+    const firstScene = params.scenesInChunk[0];
+    if (!firstScene || params.coreEnd <= params.coreStart) return;
+
+    const startIndex = Math.max(params.episode.startIndex, params.coreStart - overlap);
+    const endIndex = Math.min(params.episode.endIndex, params.coreEnd + overlap);
+    const chunkIndex = chunks.length + 1;
+    const text = cleanedText.slice(startIndex, endIndex).trim();
+
+    chunks.push({
+      id: `chunk_${String(chunkIndex).padStart(4, "0")}`,
+      chunkIndex: chunkIndex - 1,
+      episodeIndex: params.episode.episodeIndex,
+      sceneIndex: firstScene.sceneIndex,
+      text,
+      startIndex,
+      endIndex,
+      overlapBefore: params.coreStart - startIndex,
+      overlapAfter: endIndex - params.coreEnd,
+      metadata: {
+        coreStartIndex: params.coreStart,
+        coreEndIndex: params.coreEnd,
+        episodeId: params.episode.id,
+        sceneId: firstScene.id,
+        episodeTitle: params.episode.title,
+        sceneTitle: params.scenesInChunk.map((scene) => scene.title).join(" / "),
+        sceneIds: params.scenesInChunk.map((scene) => scene.id),
+        sceneIndexes: params.scenesInChunk.map((scene) => scene.sceneIndex),
+        dialogueCharacters: extractDialogueCharacters(text),
+      },
+    });
+
+    for (const scene of params.scenesInChunk) {
+      scene.chunkIndexes.push(chunkIndex - 1);
+      scene.chunkCount = scene.chunkIndexes.length;
+    }
+    params.episode.chunkIndexes.push(chunkIndex - 1);
+    params.episode.chunkCount = params.episode.chunkIndexes.length;
+  }
+
+  function splitLongScene(episode: StructuredEpisodeDraft, scene: StructuredSceneDraft) {
     let coreStart = scene.startIndex;
     const sceneEnd = scene.endIndex;
 
@@ -450,41 +497,55 @@ function createChunksForScenes(
       const localText = cleanedText.slice(scene.startIndex, sceneEnd);
       const localCoreEnd = findBreakPosition(localText, localCoreStart, minSize, maxSize);
       const coreEnd = Math.min(sceneEnd, scene.startIndex + localCoreEnd);
-      const startIndex = Math.max(scene.startIndex, coreStart - overlap);
-      const endIndex = Math.min(sceneEnd, coreEnd + overlap);
-      const chunkIndex = chunks.length + 1;
-      const episode = episodes.find((item) => item.episodeIndex === scene.episodeIndex);
-      const text = cleanedText.slice(startIndex, endIndex).trim();
-
-      chunks.push({
-        id: `chunk_${String(chunkIndex).padStart(4, "0")}`,
-        chunkIndex: chunkIndex - 1,
-        episodeIndex: scene.episodeIndex,
-        sceneIndex: scene.sceneIndex,
-        text,
-        startIndex,
-        endIndex,
-        overlapBefore: coreStart - startIndex,
-        overlapAfter: endIndex - coreEnd,
-        metadata: {
-          coreStartIndex: coreStart,
-          coreEndIndex: coreEnd,
-          episodeId: episode?.id,
-          sceneId: scene.id,
-          episodeTitle: episode?.title,
-          sceneTitle: scene.title,
-          dialogueCharacters: extractDialogueCharacters(text),
-        },
+      pushChunkForRange({
+        episode,
+        scenesInChunk: [scene],
+        coreStart,
+        coreEnd,
       });
-
-      scene.chunkIndexes.push(chunkIndex - 1);
-      scene.chunkCount = scene.chunkIndexes.length;
-      episode?.chunkIndexes.push(chunkIndex - 1);
-      if (episode) episode.chunkCount = episode.chunkIndexes.length;
 
       if (coreEnd <= coreStart) break;
       coreStart = coreEnd;
     }
+  }
+
+  for (const episode of episodes) {
+    const episodeScenes = scenes.filter((scene) => scene.episodeIndex === episode.episodeIndex);
+    let group: StructuredSceneDraft[] = [];
+
+    const flushGroup = () => {
+      if (group.length === 0) return;
+      pushChunkForRange({
+        episode,
+        scenesInChunk: group,
+        coreStart: group[0].startIndex,
+        coreEnd: group[group.length - 1].endIndex,
+      });
+      group = [];
+    };
+
+    for (const scene of episodeScenes) {
+      const sceneLength = scene.endIndex - scene.startIndex;
+      if (sceneLength >= maxSize) {
+        flushGroup();
+        splitLongScene(episode, scene);
+        continue;
+      }
+
+      if (group.length === 0) {
+        group.push(scene);
+        continue;
+      }
+
+      const nextLength = scene.endIndex - group[0].startIndex;
+      const currentLength = group[group.length - 1].endIndex - group[0].startIndex;
+      if (nextLength > maxSize && currentLength >= minSize) {
+        flushGroup();
+      }
+      group.push(scene);
+    }
+
+    flushGroup();
   }
 
   return chunks;

@@ -40,10 +40,6 @@ import { buildShotSplitPrompt } from "@/lib/ai/prompts/shot-split";
 import { resolvePrompt, resolveSlotContents } from "@/lib/ai/prompts/resolver";
 import { getPromptDefinition } from "@/lib/ai/prompts/registry";
 import { getModelMaxDuration } from "@/lib/ai/model-limits";
-import {
-  buildFirstFramePrompt,
-  buildLastFramePrompt,
-} from "@/lib/ai/prompts/frame-generate";
 import { buildSceneFramePrompt } from "@/lib/ai/prompts/scene-frame-generate";
 import { resolveImageProvider, resolveVideoProvider, resolveAIProvider } from "@/lib/ai/provider-factory";
 import { buildVideoPrompt, buildReferenceVideoPrompt } from "@/lib/ai/prompts/video-generate";
@@ -59,11 +55,12 @@ import {
   patchAsset,
 } from "@/lib/shot-asset-utils";
 import { buildRefImagePromptsRequest } from "@/lib/ai/prompts/ref-image-prompts";
-import { buildKeyframePromptsRequest } from "@/lib/ai/prompts/keyframe-prompts";
 import { getProductionBiblePromptBlock } from "@/lib/production-bible";
 import {
+  buildStoryboardPromptForShotSpec,
   createStoryboardPromptsForShots,
   generateStoryboardFrameImage,
+  syncShotSpecsForShots,
   upsertShotSpecFromShot,
   upsertStoryboardFramePrompt,
 } from "@/lib/story-pipeline-utils";
@@ -152,6 +149,23 @@ function extractErrorMessage(err: unknown): string {
     if (parsed?.error?.message) return parsed.error.message;
   } catch {}
   return err.message;
+}
+
+function mergePromptWithNegative(prompt: string, negativePrompt: string) {
+  const negative = negativePrompt.trim();
+  return negative ? `${prompt}\n\n[NEGATIVE_PROMPT]\n${negative}` : prompt;
+}
+
+function buildGeneratedPromptMeta(
+  built: Awaited<ReturnType<typeof buildStoryboardPromptForShotSpec>>,
+) {
+  return {
+    negative_prompt: built.negativePrompt,
+    structured_prompt: built.structuredPrompt,
+    referenceImages: built.referenceImages,
+    referenceLabels: built.referenceLabels,
+    prompt_builder: "deterministic_v1",
+  };
 }
 
 interface ModelConfig {
@@ -1737,26 +1751,6 @@ async function handleBatchFrameGenerate(
     ? await getVersionedUploadDir(batchVersionId)
     : process.env.UPLOAD_DIR || "./uploads";
 
-  // Fetch only characters linked to this episode
-  let frameCharacters: typeof characters.$inferSelect[];
-  if (episodeId) {
-    const linkedIds = await db
-      .select({ characterId: episodeCharacters.characterId })
-      .from(episodeCharacters)
-      .where(eq(episodeCharacters.episodeId, episodeId));
-    frameCharacters = linkedIds.length > 0
-      ? await db.select().from(characters).where(inArray(characters.id, linkedIds.map((r) => r.characterId)))
-      : [];
-  } else {
-    frameCharacters = await db.select().from(characters).where(eq(characters.projectId, projectId));
-  }
-
-  const characterDescriptions = frameCharacters
-    .map((c) => `${c.name}: ${c.description}`)
-    .join("\n");
-
-  const charsWithImages = frameCharacters.filter((c) => c.referenceImage);
-
   const ai = resolveImageProvider(modelConfig, versionedUploadDir);
   const results: Array<{ shotId: string; sequence: number; status: string; firstFrame?: string; lastFrame?: string; error?: string }> = [];
 
@@ -1767,10 +1761,7 @@ async function handleBatchFrameGenerate(
   });
   const skipCount = allShots.length - needProcess.length;
 
-  console.log(`[BatchFrameGenerate] Total: ${allShots.length} shots, need: ${needProcess.length}, skip: ${skipCount}, characters: ${frameCharacters.length}`);
-
-  const frameFirstSlots = await resolveSlotContents("frame_generate_first", { userId, projectId });
-  const frameLastSlots = await resolveSlotContents("frame_generate_last", { userId, projectId });
+  console.log(`[BatchFrameGenerate] Total: ${allShots.length} shots, need: ${needProcess.length}, skip: ${skipCount}, promptBuilder=deterministic_v1`);
 
   // ── Concurrent per-shot generation ──
   // Each shot is fully independent under the new shot_assets architecture:
@@ -1798,74 +1789,67 @@ async function handleBatchFrameGenerate(
       try {
         await db.update(shots).set({ status: "generating" }).where(eq(shots.id, shot.id));
 
-        // Per-shot character filter: read the first_frame / last_frame asset
-        // characters metadata (set by handleGenerateKeyframePrompts). Only
-        // inject those characters' ref images into the image model, so shots
-        // only see their relevant characters.
+        const spec = await upsertShotSpecFromShot({
+          projectId,
+          episodeId: episodeId ?? shot.episodeId,
+          shotId: shot.id,
+        });
+        const firstBuilt = await buildStoryboardPromptForShotSpec(spec.id, { frameRole: "first_frame" });
+        const lastBuilt = await buildStoryboardPromptForShotSpec(spec.id, { frameRole: "last_frame" });
+
+        // Prompts and reference images are resolved by the deterministic
+        // shot_spec + asset + variant + production_bible builder.
         const ffAssetExisting = await getActiveAsset(shot.id, "first_frame", 0);
         const lfAssetExisting = await getActiveAsset(shot.id, "last_frame", 0);
-        const shotCharNameSet = new Set<string>([
-          ...(ffAssetExisting?.characters ?? []),
-          ...(lfAssetExisting?.characters ?? []),
-        ]);
-        const filteredChars = shotCharNameSet.size > 0
-          ? charsWithImages.filter((c) => shotCharNameSet.has(c.name))
-          : charsWithImages;
-        const shotCharRefImages = filteredChars.map((c) => c.referenceImage!);
-        const shotCharRefLabels = filteredChars.map((c) => c.name);
-        const shotCharsForPersist = filteredChars.length > 0 ? filteredChars.map((c) => c.name) : undefined;
-
-        // Each shot is independent — generate its own first frame from prompt.
-        const firstPrompt = buildFirstFramePrompt({
-          sceneDescription: shot.prompt || "",
-          startFrameDesc: shotLegacy?.startFrameDesc || shot.prompt || "",
-          characterDescriptions,
-          slotContents: frameFirstSlots,
-        });
-        const firstFramePath = await ai.generateImage(firstPrompt, {
+        const firstFramePath = await ai.generateImage(mergePromptWithNegative(firstBuilt.prompt, firstBuilt.negativePrompt), {
           ...imageOpts,
           quality: "hd",
-          referenceImages: shotCharRefImages,
-          referenceLabels: shotCharRefLabels,
+          referenceImages: firstBuilt.referenceImages,
+          referenceLabels: firstBuilt.referenceLabels,
         });
 
-        const lastPrompt = buildLastFramePrompt({
-          sceneDescription: shot.prompt || "",
-          endFrameDesc: shotLegacy?.endFrameDesc || shot.prompt || "",
-          characterDescriptions,
-          firstFramePath,
-          slotContents: frameLastSlots,
-        });
-        const lastFramePath = await ai.generateImage(lastPrompt, {
+        const lastFramePath = await ai.generateImage(mergePromptWithNegative(lastBuilt.prompt, lastBuilt.negativePrompt), {
           ...imageOpts,
           quality: "hd",
-          referenceImages: [firstFramePath, ...shotCharRefImages],
-          referenceLabels: ["首帧/First Frame", ...shotCharRefLabels],
+          referenceImages: [firstFramePath, ...lastBuilt.referenceImages],
+          referenceLabels: ["First Frame", ...lastBuilt.referenceLabels],
         });
 
         await db.update(shots).set({ status: "completed" }).where(eq(shots.id, shot.id));
 
-        if (ffAssetExisting) await patchAsset(ffAssetExisting.id, { fileUrl: firstFramePath, status: "completed" });
+        if (ffAssetExisting) await patchAsset(ffAssetExisting.id, {
+          prompt: firstBuilt.prompt,
+          fileUrl: firstFramePath,
+          status: "completed",
+          meta: buildGeneratedPromptMeta(firstBuilt),
+        });
         else
           await insertAssetVersion({
             shotId: shot.id,
             type: "first_frame",
             sequenceInType: 0,
-            prompt: shotLegacy?.startFrameDesc ?? "",
+            prompt: firstBuilt.prompt,
             fileUrl: firstFramePath,
             status: "completed",
-            characters: shotCharsForPersist,
+            characters: firstBuilt.characterNames,
+            meta: buildGeneratedPromptMeta(firstBuilt),
           });
-        if (lfAssetExisting) await patchAsset(lfAssetExisting.id, { fileUrl: lastFramePath, status: "completed" });
+        if (lfAssetExisting) await patchAsset(lfAssetExisting.id, {
+          prompt: lastBuilt.prompt,
+          fileUrl: lastFramePath,
+          status: "completed",
+          meta: buildGeneratedPromptMeta(lastBuilt),
+        });
         else
           await insertAssetVersion({
             shotId: shot.id,
             type: "last_frame",
             sequenceInType: 0,
-            prompt: shotLegacy?.endFrameDesc ?? "",
+            prompt: lastBuilt.prompt,
             fileUrl: lastFramePath,
             status: "completed",
-            characters: shotCharsForPersist,
+            characters: lastBuilt.characterNames,
+            meta: buildGeneratedPromptMeta(lastBuilt),
           });
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -1934,87 +1918,74 @@ async function handleSingleFrameGenerate(
     return NextResponse.json({ error: "Shot not found" }, { status: 404 });
   }
 
-  // Read prompts from shot_assets — they were generated by the dedicated
-  // "生成首尾帧提示词" step. Each shot is independent: no continuity chain.
+  // Existing asset rows are reused as output slots; prompt text is rebuilt
+  // deterministically from shot_spec + assets + variants + production_bible.
   const ffAsset = await getActiveAsset(shotId, "first_frame", 0);
   const lfAsset = await getActiveAsset(shotId, "last_frame", 0);
-  const startFramePromptText = ffAsset?.prompt || shot.prompt || "";
-  const endFramePromptText = lfAsset?.prompt || shot.prompt || "";
 
   const versionedUploadDir = await getVersionedUploadDir(shot.versionId);
-  const shotEpisodeId = episodeId || shot.episodeId;
-  const projectCharacters = await getEpisodeCharacters(projectId, shotEpisodeId);
-
-  const characterDescriptions = projectCharacters
-    .map((c) => `${c.name}: ${c.description}`)
-    .join("\n");
-
-  // Per-shot character filter: only inject refs for characters declared
-  // on the first_frame / last_frame asset metadata for this shot.
-  const shotCharNameSet = new Set<string>([
-    ...(ffAsset?.characters ?? []),
-    ...(lfAsset?.characters ?? []),
-  ]);
-  const filteredChars = shotCharNameSet.size > 0
-    ? projectCharacters.filter((c) => c.referenceImage && shotCharNameSet.has(c.name))
-    : projectCharacters.filter((c) => c.referenceImage);
-  const shotCharRefImages = filteredChars.map((c) => c.referenceImage as string);
-
   const ai = resolveImageProvider(modelConfig, versionedUploadDir);
   const imageOpts = ratioToImageOpts(payload?.ratio as string | undefined);
-
-  const frameFirstSlots = await resolveSlotContents("frame_generate_first", { userId, projectId });
-  const frameLastSlots = await resolveSlotContents("frame_generate_last", { userId, projectId });
+  const spec = await upsertShotSpecFromShot({
+    projectId,
+    episodeId: episodeId ?? shot.episodeId,
+    shotId,
+  });
+  const firstBuilt = await buildStoryboardPromptForShotSpec(spec.id, { frameRole: "first_frame" });
+  const lastBuilt = await buildStoryboardPromptForShotSpec(spec.id, { frameRole: "last_frame" });
 
   try {
     await db.update(shots).set({ status: "generating" }).where(eq(shots.id, shotId));
 
-    const firstPrompt = buildFirstFramePrompt({
-      sceneDescription: shot.prompt || "",
-      startFrameDesc: startFramePromptText,
-      characterDescriptions,
-      slotContents: frameFirstSlots,
-    });
-    const firstFramePath = await ai.generateImage(firstPrompt, {
+    const firstFramePath = await ai.generateImage(mergePromptWithNegative(firstBuilt.prompt, firstBuilt.negativePrompt), {
       ...imageOpts,
       quality: "hd",
-      referenceImages: shotCharRefImages,
+      referenceImages: firstBuilt.referenceImages,
+      referenceLabels: firstBuilt.referenceLabels,
     });
 
-    const lastPrompt = buildLastFramePrompt({
-      sceneDescription: shot.prompt || "",
-      endFrameDesc: endFramePromptText,
-      characterDescriptions,
-      firstFramePath,
-      slotContents: frameLastSlots,
-    });
-    const lastFramePath = await ai.generateImage(lastPrompt, {
+    const lastFramePath = await ai.generateImage(mergePromptWithNegative(lastBuilt.prompt, lastBuilt.negativePrompt), {
       ...imageOpts,
       quality: "hd",
-      referenceImages: [firstFramePath, ...shotCharRefImages],
+      referenceImages: [firstFramePath, ...lastBuilt.referenceImages],
+      referenceLabels: ["First Frame", ...lastBuilt.referenceLabels],
     });
 
     await db.update(shots).set({ status: "completed" }).where(eq(shots.id, shotId));
 
-    if (ffAsset) await patchAsset(ffAsset.id, { fileUrl: firstFramePath, status: "completed" });
+    if (ffAsset) await patchAsset(ffAsset.id, {
+      prompt: firstBuilt.prompt,
+      fileUrl: firstFramePath,
+      status: "completed",
+      meta: buildGeneratedPromptMeta(firstBuilt),
+    });
     else
       await insertAssetVersion({
         shotId,
         type: "first_frame",
         sequenceInType: 0,
-        prompt: startFramePromptText,
+        prompt: firstBuilt.prompt,
         fileUrl: firstFramePath,
         status: "completed",
+        characters: firstBuilt.characterNames,
+        meta: buildGeneratedPromptMeta(firstBuilt),
       });
-    if (lfAsset) await patchAsset(lfAsset.id, { fileUrl: lastFramePath, status: "completed" });
+    if (lfAsset) await patchAsset(lfAsset.id, {
+      prompt: lastBuilt.prompt,
+      fileUrl: lastFramePath,
+      status: "completed",
+      meta: buildGeneratedPromptMeta(lastBuilt),
+    });
     else
       await insertAssetVersion({
         shotId,
         type: "last_frame",
         sequenceInType: 0,
-        prompt: endFramePromptText,
+        prompt: lastBuilt.prompt,
         fileUrl: lastFramePath,
         status: "completed",
+        characters: lastBuilt.characterNames,
+        meta: buildGeneratedPromptMeta(lastBuilt),
       });
 
     return NextResponse.json({ shotId, firstFrame: firstFramePath, lastFrame: lastFramePath, status: "ok" });
@@ -3882,8 +3853,7 @@ async function handleSingleShotRefImageGenerateAll(
   return NextResponse.json({ generated, total: pending.length });
 }
 
-// --- generate_keyframe_prompts: synchronous batch — AI generates first/last
-// frame prompts for all shots in one call, writes them into shot_assets ---
+// --- generate_keyframe_prompts: deterministic shot_spec prompt builder ---
 
 async function handleGenerateKeyframePrompts(
   projectId: string,
@@ -3892,237 +3862,66 @@ async function handleGenerateKeyframePrompts(
   modelConfig?: ModelConfig,
   episodeId?: string
 ) {
-  const productionBibleContext = await getProductionBiblePromptBlock(projectId, episodeId);
+  void userId;
+  void modelConfig;
+  const deterministicVersionId = payload?.versionId as string | undefined;
+  const specs = await syncShotSpecsForShots({
+    projectId,
+    episodeId: episodeId ?? null,
+    versionId: deterministicVersionId ?? null,
+  });
 
-  // === 智能体路由 ===
-  const kpBoundAgent = await findBoundAgent(projectId, "keyframe_prompts");
-  if (kpBoundAgent) {
-    // Build prompt from shots data (same info as built-in pipeline)
-    const batchVersionId = payload?.versionId as string | undefined;
-    const kpWhereConds = [eq(shots.projectId, projectId)];
-    if (batchVersionId) kpWhereConds.push(eq(shots.versionId, batchVersionId));
-    if (episodeId) kpWhereConds.push(eq(shots.episodeId, episodeId));
-    const kpAgentShots = await db.select().from(shots).where(and(...kpWhereConds)).orderBy(asc(shots.sequence));
-    if (kpAgentShots.length === 0) {
-      return NextResponse.json({ error: "没有分镜数据，请先生成分镜" }, { status: 400 });
-    }
-    const kpAgentChars = await getEpisodeCharacters(projectId, episodeId);
-    const kpPrompt = JSON.stringify({
-      shots: kpAgentShots.map((s) => ({
-        sequence: s.sequence,
-        sceneDescription: s.prompt,
-        motionScript: s.motionScript,
-        cameraDirection: s.cameraDirection,
-        duration: s.duration,
-      })),
-      characters: kpAgentChars.map((c) => ({ name: c.name, description: c.description, visualHint: c.visualHint })),
-      productionBible: productionBibleContext,
-    }, null, 2);
-
-    const agentResult = await callAndValidateAgent(kpBoundAgent, "keyframe_prompts", kpPrompt);
-    if (agentResult instanceof NextResponse) return agentResult;
-
-    // Parse agent output — must be JSON array
-    try {
-      const kpParsed = JSON.parse(extractJSON(agentResult.text)) as Array<Record<string, unknown>>;
-      if (!Array.isArray(kpParsed)) {
-        return NextResponse.json({ error: "智能体必须返回 JSON 数组格式的首尾帧提示词" }, { status: 422 });
-      }
-
-      let savedCount = 0;
-      for (const entry of kpParsed) {
-        const seq = (entry.sequence as number) ?? (entry.shotSequence as number) ?? 0;
-        const shot = kpAgentShots.find((s) => s.sequence === seq);
-        if (!shot) continue;
-
-        const startFrame = (entry.startFrame || (entry.prompts as string[])?.[0] || "") as string;
-        const endFrame = (entry.endFrame || (entry.prompts as string[])?.[1] || "") as string;
-        const chars = Array.isArray(entry.characters) ? entry.characters as string[] : [];
-
-        if (startFrame) {
-          await insertAssetVersion({ shotId: shot.id, type: "first_frame", sequenceInType: 0, prompt: startFrame, status: "pending", characters: chars });
-          savedCount++;
-        }
-        if (endFrame) {
-          await insertAssetVersion({ shotId: shot.id, type: "last_frame", sequenceInType: 0, prompt: endFrame, status: "pending", characters: chars });
-          savedCount++;
-        }
-      }
-      console.log(`[KeyframePrompts Agent] Saved ${savedCount} assets from ${kpParsed.length} shots`);
-      return NextResponse.json({ updatedCount: kpParsed.length, totalShots: kpAgentShots.length });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return NextResponse.json({ error: `智能体首尾帧提示词解析失败: ${msg}` }, { status: 422 });
-    }
-  }
-  // === 智能体路由结束 ===
-
-  if (!modelConfig?.text) {
-    return NextResponse.json({ error: "No text model configured" }, { status: 400 });
-  }
-
-  const batchVersionId = payload?.versionId as string | undefined;
-  const buildWhere = (includeVersion: boolean) => {
-    const conds = [eq(shots.projectId, projectId)];
-    if (includeVersion && batchVersionId) conds.push(eq(shots.versionId, batchVersionId));
-    if (episodeId) conds.push(eq(shots.episodeId, episodeId));
-    return and(...conds);
-  };
-
-  let allShots = await db
-    .select()
-    .from(shots)
-    .where(buildWhere(true))
-    .orderBy(asc(shots.sequence));
-
-  if (allShots.length === 0 && batchVersionId) {
-    console.warn(`[GenerateKeyframePrompts] strict filter empty (versionId=${batchVersionId}), falling back to no-version filter`);
-    allShots = await db
-      .select()
-      .from(shots)
-      .where(buildWhere(false))
-      .orderBy(asc(shots.sequence));
-  }
-
-  if (allShots.length === 0) {
+  if (specs.length === 0) {
     return NextResponse.json({ error: "No shots found" }, { status: 400 });
   }
 
-  const projectCharacters = await getEpisodeCharacters(projectId, episodeId);
+  let savedCount = 0;
+  for (const spec of specs) {
+    if (!spec.shotId) continue;
+    const firstFrame = await buildStoryboardPromptForShotSpec(spec.id, { frameRole: "first_frame" });
+    const lastFrame = await buildStoryboardPromptForShotSpec(spec.id, { frameRole: "last_frame" });
 
-  // Pull visual style meta from script (same regex as ref prompts handler)
-  const scriptSource = episodeId
-    ? await db.select({ script: episodes.script }).from(episodes).where(eq(episodes.id, episodeId))
-    : await db.select({ script: projects.script }).from(projects).where(eq(projects.id, projectId));
-  const script = scriptSource[0]?.script || "";
+    await insertAssetVersion({
+      shotId: spec.shotId,
+      type: "first_frame",
+      sequenceInType: 0,
+      prompt: firstFrame.prompt,
+      status: "pending",
+      characters: firstFrame.characterNames,
+      meta: {
+        negative_prompt: firstFrame.negativePrompt,
+        structured_prompt: firstFrame.structuredPrompt,
+        referenceImages: firstFrame.referenceImages,
+        referenceLabels: firstFrame.referenceLabels,
+        prompt_builder: "deterministic_v1",
+      },
+    });
+    savedCount++;
 
-  const pickField = (label: string): string => {
-    const re = new RegExp(`${label}[：:]\\s*(.+?)(?:\\n|$)`);
-    const m = script.match(re);
-    return m?.[1]?.trim() || "";
-  };
-  const visualStyle = [
-    pickField("视觉风格") || pickField("Visual Style"),
-    pickField("色彩基调") && `色彩基调：${pickField("色彩基调")}`,
-    pickField("时代美学") && `时代美学：${pickField("时代美学")}`,
-    pickField("氛围情绪") && `氛围情绪：${pickField("氛围情绪")}`,
-    pickField("画幅比例") && `画幅比例：${pickField("画幅比例")}`,
-  ].filter(Boolean).join("；");
-  const visualStyleWithBible = [visualStyle, productionBibleContext].filter(Boolean).join("\n\n");
-
-  // Load character relationships — drives on-screen interaction framing.
-  // Enemies must face each other as live combatants, not background icons.
-  const kfRelations = await db
-    .select()
-    .from(characterRelations)
-    .where(eq(characterRelations.projectId, projectId));
-  let kfRelationsText = "";
-  if (kfRelations.length > 0) {
-    kfRelationsText = "\n\n## 角色关系（必须用于决定站位、眼神、肢体对抗、画面张力）\n";
-    for (const rel of kfRelations) {
-      const charA = projectCharacters.find((c) => c.id === rel.characterAId);
-      const charB = projectCharacters.find((c) => c.id === rel.characterBId);
-      if (charA && charB) {
-        kfRelationsText += `- ${charA.name} ↔ ${charB.name}：${rel.relationType}${rel.description ? `（${rel.description}）` : ""}\n`;
-      }
-    }
-    kfRelationsText += `
-**关系驱动构图规则（最高优先级）**：
-- **敌对 / 对立 / 仇人**：两人必须都是**活人角色同屏对峙**，直接对视、肢体对抗、武器对准彼此。严禁把任一方画成背景的雕像/神像/虚影/浮雕/壁画。
-- **友好 / 盟友**：并肩站位、相互掩护、眼神交流。
-- **爱慕 / 亲密**：靠近、牵手、拥抱、温柔对视。
-- **父女 / 师徒**：长辈在前或侧，晚辈跟随。
-- 凡是出现在 characters 列表里的角色，在首尾帧画面里都必须是真实的活人，不允许以雕像/虚影形式出场。
-`;
+    await insertAssetVersion({
+      shotId: spec.shotId,
+      type: "last_frame",
+      sequenceInType: 0,
+      prompt: lastFrame.prompt,
+      status: "pending",
+      characters: lastFrame.characterNames,
+      meta: {
+        negative_prompt: lastFrame.negativePrompt,
+        structured_prompt: lastFrame.structuredPrompt,
+        referenceImages: lastFrame.referenceImages,
+        referenceLabels: lastFrame.referenceLabels,
+        prompt_builder: "deterministic_v1",
+      },
+    });
+    savedCount++;
   }
 
-  const textProvider = resolveAIProvider(modelConfig);
-  const keyframeSystemPrompt = await resolvePrompt("shot_split_keyframe_assets", {
-    userId,
-    projectId,
+  console.log(`[GenerateKeyframePrompts] deterministic builder saved ${savedCount} assets from ${specs.length} shot specs`);
+  return NextResponse.json({
+    updatedCount: specs.length,
+    totalShots: specs.length,
+    savedAssets: savedCount,
+    promptBuilder: "deterministic_v1",
   });
 
-  // Concurrent per-shot generation: each shot is one LLM call, all run in parallel.
-  const total = allShots.length;
-  let doneCount = 0;
-  console.log(`[GenerateKeyframePrompts] Starting concurrent generation: 0/${total}`);
-  const results = await Promise.allSettled(
-    allShots.map(async (shot) => {
-      try {
-        const basePromptRequest = buildKeyframePromptsRequest(
-          [{
-            sequence: shot.sequence,
-            prompt: shot.prompt || "",
-            motionScript: shot.motionScript,
-            cameraDirection: shot.cameraDirection,
-          }],
-          projectCharacters.map((c) => ({
-            name: c.name,
-            description: c.description,
-            visualHint: c.visualHint,
-          })),
-          visualStyleWithBible
-        );
-        const promptRequest = kfRelationsText
-          ? basePromptRequest + kfRelationsText
-          : basePromptRequest;
-
-        const result = await textProvider.generateText(promptRequest, {
-          systemPrompt: keyframeSystemPrompt,
-          temperature: 0.5,
-        });
-
-        const jsonMatch = result.match(/\[[\s\S]*\]/);
-        if (!jsonMatch) {
-          throw new Error(`Shot ${shot.sequence}: invalid JSON response`);
-        }
-        const parsed = JSON.parse(jsonMatch[0]) as Array<{
-          shotSequence: number;
-          characters?: string[];
-          prompts: string[];
-        }>;
-        const entry = parsed.find((e) => e.shotSequence === shot.sequence) || parsed[0];
-        if (!entry || !Array.isArray(entry.prompts) || entry.prompts.length < 2) {
-          throw new Error(`Shot ${shot.sequence}: expected 2 prompts (first/last frame)`);
-        }
-
-        // Use LLM-provided per-shot character list (only visible chars in this shot).
-        // Fall back to empty array if LLM omitted the field — never default to all chars.
-        const charsForShot = Array.isArray(entry.characters) ? entry.characters : [];
-        await insertAssetVersion({
-          shotId: shot.id,
-          type: "first_frame",
-          sequenceInType: 0,
-          prompt: entry.prompts[0],
-          status: "pending",
-          characters: charsForShot,
-        });
-        await insertAssetVersion({
-          shotId: shot.id,
-          type: "last_frame",
-          sequenceInType: 0,
-          prompt: entry.prompts[1],
-          status: "pending",
-          characters: charsForShot,
-        });
-        doneCount++;
-        console.log(`[GenerateKeyframePrompts] ✓ shot ${shot.sequence} (${doneCount}/${total})`);
-        return shot.sequence;
-      } catch (err) {
-        doneCount++;
-        console.warn(`[GenerateKeyframePrompts] ✗ shot ${shot.sequence} (${doneCount}/${total}): ${String(err)}`);
-        throw err;
-      }
-    })
-  );
-
-  const updatedCount = results.filter((r) => r.status === "fulfilled").length;
-  const failed = results
-    .map((r, i) => (r.status === "rejected" ? { seq: allShots[i].sequence, err: String(r.reason) } : null))
-    .filter(Boolean);
-  if (failed.length > 0) {
-    console.warn(`[GenerateKeyframePrompts] ${failed.length} shots failed:`, failed);
-  }
-  console.log(`[GenerateKeyframePrompts] Updated ${updatedCount}/${allShots.length} shots (concurrent)`);
-  return NextResponse.json({ updatedCount, totalShots: allShots.length });
 }

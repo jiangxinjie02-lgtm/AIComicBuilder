@@ -22,6 +22,7 @@ interface CharacterData {
   scope: "main" | "guest";
   description: string;
   visualHint?: string;
+  visualConstraints?: string;
   frequency?: number;
   confirmed?: boolean;
   assetId?: string;
@@ -36,6 +37,7 @@ interface CharacterData {
   mainImageName?: string;
   tags?: string[];
   faceTemplate?: unknown;
+  promptMetadata?: unknown;
 }
 
 interface AssetData {
@@ -43,6 +45,7 @@ interface AssetData {
   frequency: number;
   description: string;
   visualHint?: string;
+  visualConstraints?: string;
   confirmed?: boolean;
   assetId?: string;
   category?: string;
@@ -57,6 +60,7 @@ interface AssetData {
   mainImageName?: string;
   tags?: string[];
   faceTemplate?: unknown;
+  promptMetadata?: unknown;
 }
 
 export async function POST(

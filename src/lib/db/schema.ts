@@ -476,6 +476,44 @@ export const assetOccurrences = sqliteTable("asset_occurrences", {
     .$defaultFn(() => new Date()),
 });
 
+export const assetVariants = sqliteTable("asset_variants", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  assetId: text("asset_id")
+    .notNull()
+    .references(() => assets.id, { onDelete: "cascade" }),
+  sourceCandidateId: text("source_candidate_id").references(
+    () => assetCandidates.id,
+    { onDelete: "set null" },
+  ),
+  sourceOccurrenceId: text("source_occurrence_id").references(
+    () => assetOccurrences.id,
+    { onDelete: "set null" },
+  ),
+  variantType: text("variant_type").notNull().default("default"),
+  name: text("name").notNull(),
+  state: text("state").notNull().default(""),
+  lockedTraits: text("locked_traits", { mode: "json" }),
+  changedTraits: text("changed_traits", { mode: "json" }),
+  visualConstraints: text("visual_constraints").notNull().default(""),
+  negativeConstraints: text("negative_constraints").notNull().default(""),
+  referenceImage: text("reference_image"),
+  status: text("status", {
+    enum: ["draft", "generated", "reviewing", "approved", "rejected", "locked"],
+  })
+    .notNull()
+    .default("draft"),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const characterAssets = sqliteTable("character_assets", {
   assetId: text("asset_id")
     .primaryKey()

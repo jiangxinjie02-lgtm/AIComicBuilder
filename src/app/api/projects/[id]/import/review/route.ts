@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { generateText } from "ai";
-import { createLanguageModel, extractJSON, resolveLanguageModelConfig, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
+import { createLanguageModel, extractJSON, resolveLanguageModelConfig, resolveLanguageModelConfigs, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
 import { db } from "@/lib/db";
 import { projects } from "@/lib/db/schema";
@@ -627,8 +627,9 @@ function normalizeStoryAssetAnalysis(value: unknown): StoryAssetAnalysis | null 
 }
 
 async function analyzeStoryAssets(
-  model: ReturnType<typeof createLanguageModel>,
-  jsonMode: { openai: { response_format: { type: "json_object" } } } | undefined,
+  configs: ProviderConfig[],
+  pickModelConfig: () => ProviderConfig,
+  textModelAttempts: number,
   text: string
 ) {
   const chunks = chunkText(text, 12000);
@@ -637,8 +638,8 @@ async function analyzeStoryAssets(
   const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
   for (const [index, chunk] of targets.entries()) {
-    const result = await generateText({
-      model,
+    const result = await runWithTextModelRetries(configs, pickModelConfig, textModelAttempts, async (modelConfig) => generateText({
+      model: createLanguageModel(modelConfig),
       system: STORY_ASSET_ANALYSIS_SYSTEM,
       prompt: [
         targets.length > 1
@@ -646,11 +647,13 @@ async function analyzeStoryAssets(
           : "",
         buildStoryAssetAnalysisPrompt(chunk),
       ].filter(Boolean).join("\n\n"),
-      providerOptions: jsonMode,
+      providerOptions: supportsOpenAIJsonMode(modelConfig)
+        ? { openai: { response_format: { type: "json_object" as const } } }
+        : undefined,
       temperature: 0.1,
       maxRetries: 1,
       maxOutputTokens: 12000,
-    });
+    }));
 
     usage.inputTokens += result.usage.inputTokens ?? 0;
     usage.outputTokens += result.usage.outputTokens ?? 0;
@@ -668,6 +671,42 @@ async function analyzeStoryAssets(
       totalTokens: usage.totalTokens || undefined,
     },
   };
+}
+
+function positiveIntEnv(name: string, fallback: number) {
+  const value = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function describeTextModelConfig(config: ProviderConfig) {
+  let host = "";
+  try {
+    host = config.baseUrl ? new URL(config.baseUrl).host : "";
+  } catch {
+    host = "";
+  }
+  return [config.protocol, host, config.modelId].filter(Boolean).join(":");
+}
+
+async function runWithTextModelRetries<T>(
+  configs: ProviderConfig[],
+  pickConfig: () => ProviderConfig,
+  attempts: number,
+  runner: (config: ProviderConfig) => Promise<T>
+) {
+  const maxAttempts = Math.max(1, Math.min(configs.length, attempts));
+  const errors: string[] = [];
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const config = pickConfig();
+    try {
+      return await runner(config);
+    } catch (error) {
+      errors.push(`${describeTextModelConfig(config)}: ${getFriendlyModelError(error, config)}`);
+    }
+  }
+
+  throw new Error(`Failed after ${maxAttempts} text model config attempt(s). Last error: ${errors.at(-1) || "Unknown error"}`);
 }
 
 function mergeStoryAssetAnalyses(analyses: StoryAssetAnalysis[]) {
@@ -858,26 +897,37 @@ export async function POST(
     reviewConcurrency?: number;
   };
 
-  const textModelConfig = resolveLanguageModelConfig(body.modelConfig?.text);
+  const textModelConfigs = resolveLanguageModelConfigs(body.modelConfig?.text);
+  const textModelConfig = textModelConfigs[0] ?? resolveLanguageModelConfig(body.modelConfig?.text);
   if (!textModelConfig) {
     return NextResponse.json({ error: "No text model" }, { status: 400 });
   }
+  const activeTextModelConfigs = textModelConfigs.length > 0 ? textModelConfigs : [textModelConfig];
 
   const chunks = chunkText(body.text, 6000);
+  const perKeyConcurrency = positiveIntEnv("IMPORT_TEXT_PER_KEY_CONCURRENCY", 2);
+  const maxReviewConcurrency = positiveIntEnv("IMPORT_REVIEW_MAX_CONCURRENCY", Math.max(MAX_REVIEW_CONCURRENCY, 16));
+  const poolConcurrency = Math.max(1, activeTextModelConfigs.length * perKeyConcurrency);
+  const textModelAttempts = positiveIntEnv("IMPORT_TEXT_MODEL_ATTEMPTS", activeTextModelConfigs.length);
   const reviewConcurrency = Math.max(
     1,
     Math.min(
-      MAX_REVIEW_CONCURRENCY,
-      Number.isFinite(body.reviewConcurrency) ? Number(body.reviewConcurrency) : DEFAULT_REVIEW_CONCURRENCY
+      maxReviewConcurrency,
+      Math.max(
+        Number.isFinite(body.reviewConcurrency) ? Number(body.reviewConcurrency) : DEFAULT_REVIEW_CONCURRENCY,
+        poolConcurrency,
+      )
     )
   );
-  const model = createLanguageModel(textModelConfig);
-  const jsonMode = supportsOpenAIJsonMode(textModelConfig)
-    ? { openai: { response_format: { type: "json_object" as const } } }
-    : undefined;
+  let modelCursor = 0;
+  const pickModelConfig = () => {
+    const config = activeTextModelConfigs[modelCursor % activeTextModelConfigs.length];
+    modelCursor += 1;
+    return config;
+  };
   const termIssues = findSensitiveTermIssues(body.text);
 
-  await addImportLog(projectId, 2, "running", `开始 AI 剧情审阅，共 ${chunks.length} 块，敏感词预扫描命中 ${termIssues.length} 项，并发 ${reviewConcurrency}`);
+  await addImportLog(projectId, 2, "running", `开始 AI 剧情审阅，共 ${chunks.length} 块，敏感词预扫描命中 ${termIssues.length} 项，并发 ${reviewConcurrency}，文本 key ${activeTextModelConfigs.length} 个`);
 
   try {
     const aiIssues: ReviewIssue[] = [];
@@ -889,7 +939,7 @@ export async function POST(
 
     try {
       await addImportLog(projectId, 2, "running", "AI 正在解析故事时间、背景和资产草稿...");
-      const result = await analyzeStoryAssets(model, jsonMode, body.text);
+      const result = await analyzeStoryAssets(activeTextModelConfigs, pickModelConfig, textModelAttempts, body.text);
       storyAnalysis = result.analysis;
       totalInputTokens += result.usage.inputTokens ?? 0;
       totalOutputTokens += result.usage.outputTokens ?? 0;
@@ -927,14 +977,16 @@ export async function POST(
       async (chunk, idx) => {
         await addImportLog(projectId, 2, "running", `AI 正在审阅第 ${idx + 1}/${chunks.length} 块...`);
 
-        const result = await generateText({
-          model,
+        const result = await runWithTextModelRetries(activeTextModelConfigs, pickModelConfig, textModelAttempts, async (modelConfig) => generateText({
+          model: createLanguageModel(modelConfig),
           system: REVIEW_SYSTEM,
           prompt: buildReviewPrompt(chunk, idx, chunks.length),
-          providerOptions: jsonMode,
+          providerOptions: supportsOpenAIJsonMode(modelConfig)
+            ? { openai: { response_format: { type: "json_object" as const } } }
+            : undefined,
           temperature: 0.1,
           maxRetries: 1,
-        });
+        }));
 
         try {
           const parsedIssues = parseIssues(result.text, chunk);

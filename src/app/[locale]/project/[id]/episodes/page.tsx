@@ -1763,10 +1763,10 @@ export default function EpisodesPage({
   }
 
   const workflowNavItems = [
-    { label: "剧情审阅", icon: AlertCircle },
-    { label: "资产设定", icon: Users },
-    { label: "自动分集", icon: Layers },
-    { label: "创建分集", icon: Plus },
+    { label: "剧情审阅", icon: AlertCircle, href: `/${locale}/project/${projectId}/import` },
+    { label: "资产设定", icon: Users, href: `/${locale}/project/${projectId}/assets` },
+    { label: "自动分集", icon: Layers, href: `/${locale}/project/${projectId}/import` },
+    { label: "创建分集", icon: Plus, href: `/${locale}/project/${projectId}/import` },
   ];
 
   return (
@@ -1783,10 +1783,10 @@ export default function EpisodesPage({
           </Link>
 
           <div className="flex min-w-[760px] flex-1 gap-2">
-            {workflowNavItems.map(({ label, icon: Icon }) => (
+            {workflowNavItems.map(({ label, icon: Icon, href }) => (
               <Link
                 key={label}
-                href={`/${locale}/project/${projectId}/import`}
+                href={href}
                 className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-[--border-subtle] bg-[--surface]/70 px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:border-primary/45 hover:bg-primary/10 hover:text-primary"
               >
                 <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/12">

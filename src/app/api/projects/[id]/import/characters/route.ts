@@ -18,6 +18,7 @@ interface ImportedAsset {
   frequency: number;
   description: string;
   visualHint?: string;
+  visualConstraints?: string;
   confirmed?: boolean;
   assetId?: string;
   category?: string;
@@ -31,6 +32,7 @@ interface ImportedAsset {
   history?: AssetAgentAsset["history"];
   mainImageName?: string;
   tags?: string[];
+  promptMetadata?: AssetAgentAsset["promptMetadata"];
 }
 
 interface ImportedCharacter extends ImportedAsset {
@@ -52,6 +54,7 @@ function mapCharacter(asset: AssetAgentAsset): ImportedCharacter {
     frequency: asset.appearances || asset.score || 1,
     description: asset.description,
     visualHint: toVisualHint(asset),
+    visualConstraints: asset.visualConstraints,
     scope: isMainRole(asset) ? "main" : "guest",
     confirmed: asset.confirmed,
     assetId: asset.id,
@@ -67,6 +70,7 @@ function mapCharacter(asset: AssetAgentAsset): ImportedCharacter {
     mainImageName: asset.mainImageName,
     tags: asset.tags,
     faceTemplate: asset.faceTemplate,
+    promptMetadata: asset.promptMetadata,
   };
 }
 
@@ -76,6 +80,7 @@ function mapAsset(asset: AssetAgentAsset): ImportedAsset {
     frequency: asset.appearances || asset.score || 1,
     description: asset.description,
     visualHint: toVisualHint(asset),
+    visualConstraints: asset.visualConstraints,
     confirmed: asset.confirmed,
     assetId: asset.id,
     category: asset.category,
@@ -89,6 +94,7 @@ function mapAsset(asset: AssetAgentAsset): ImportedAsset {
     history: asset.history,
     mainImageName: asset.mainImageName,
     tags: asset.tags,
+    promptMetadata: asset.promptMetadata,
   };
 }
 

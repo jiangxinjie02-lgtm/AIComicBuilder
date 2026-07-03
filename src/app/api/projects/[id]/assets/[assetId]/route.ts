@@ -1,13 +1,10 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
-import { assets } from "@/lib/db/schema";
 import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 import {
-  assertAssetInProject,
   deleteStoryAsset,
+  getProjectAsset,
   patchStoryAsset,
 } from "@/lib/story-assets";
-import { and, eq } from "drizzle-orm";
 
 export async function GET(
   request: Request,
@@ -18,15 +15,10 @@ export async function GET(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const asset = await assertAssetInProject(projectId, assetId);
+  const asset = await getProjectAsset(projectId, assetId);
   if (!asset) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const [row] = await db
-    .select()
-    .from(assets)
-    .where(and(eq(assets.projectId, projectId), eq(assets.id, assetId)));
-
-  return NextResponse.json(row);
+  return NextResponse.json(asset);
 }
 
 export async function PATCH(

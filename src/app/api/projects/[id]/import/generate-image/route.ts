@@ -5,6 +5,16 @@ import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 import { patchStoryAsset } from "@/lib/story-assets";
+import {
+  buildAssetImagePrompt,
+  categoryToAssetType,
+  defaultAssetStyleSpec,
+  defaultAssetVisualSpec,
+  type AssetPromptVariant,
+  type AssetStyleSpec,
+  type AssetVisualSpec,
+  type AssetVisualSchema,
+} from "@/lib/asset-prompt-builder";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -18,10 +28,20 @@ interface GenerateImageAsset {
   assetId?: string;
   name?: string;
   category?: string;
+  role?: string;
+  visualHint?: string;
+  description?: string;
+  visualConstraints?: string;
+  sceneAssetId?: string;
+  visualSchema?: AssetVisualSchema;
+  styleSpec?: AssetStyleSpec;
   prompt?: string;
   negativePrompt?: string;
+  tags?: string[];
   faceTemplate?: {
+    label?: string;
     url?: string;
+    note?: string;
   } | null;
 }
 
@@ -41,6 +61,12 @@ interface ProviderPayload {
     category: string;
     referenceImages: string[];
     projectId: string;
+    promptBuilder?: string;
+    compilerInput?: unknown;
+    compilerIR?: unknown;
+    compiledFinalPrompt?: string;
+    validation?: unknown;
+    negativePrompt?: string;
   };
 }
 
@@ -53,6 +79,9 @@ interface GenerateImageBody {
   targetName?: string;
   targetType?: string;
   referenceImages?: string[];
+  visualSpec?: AssetVisualSpec;
+  styleSpec?: AssetStyleSpec;
+  variant?: AssetPromptVariant;
   asset?: GenerateImageAsset;
 }
 
@@ -77,12 +106,47 @@ export async function POST(
   }
 
   const body = (await request.json()) as GenerateImageBody;
-  const prompt = String(body.prompt || body.asset?.prompt || "").trim();
-  if (!prompt) {
+  const category = String(body.category || body.asset?.category || "");
+  const assetType = categoryToAssetType(category);
+  const builtPrompt = buildAssetImagePrompt({
+    asset: {
+      id: body.asset?.id || body.asset?.assetId || "",
+      type: assetType,
+      name: body.asset?.name || body.targetName || "asset",
+      role: body.asset?.role || "",
+      category,
+      description: body.asset?.description || "",
+      visualHint: body.asset?.visualHint || "",
+      visualConstraints: body.asset?.visualConstraints || "",
+      negativeConstraints: body.asset?.negativePrompt || body.negativePrompt || "",
+      tags: Array.isArray(body.asset?.tags) ? body.asset.tags : [],
+      sceneAssetId: body.asset?.sceneAssetId || "",
+      visualSchema: body.asset?.visualSchema || null,
+      faceTemplate: body.asset?.faceTemplate || null,
+    },
+    variant: body.variant || null,
+    visualSpec: {
+      ...defaultAssetVisualSpec(assetType, String(body.size || sizeForCategory(category))),
+      ...(body.visualSpec || {}),
+    },
+    styleSpec: {
+      ...defaultAssetStyleSpec(),
+      ...(body.asset?.styleSpec || {}),
+      ...(body.styleSpec || {}),
+    },
+  });
+
+  if (!builtPrompt.compiled_final_prompt.trim()) {
     return NextResponse.json({ error: "Missing image prompt" }, { status: 400 });
   }
+  if (!builtPrompt.validation_report.passed) {
+    return NextResponse.json({
+      error: "Asset prompt validation failed",
+      validation: builtPrompt.validation_report,
+      compilerIR: builtPrompt.compiler_ir,
+    }, { status: 422 });
+  }
 
-  const category = String(body.category || body.asset?.category || "");
   const referenceImages = [
     ...(Array.isArray(body.referenceImages) ? body.referenceImages : []),
     ...(body.asset?.faceTemplate?.url ? [body.asset.faceTemplate.url] : []),
@@ -91,8 +155,8 @@ export async function POST(
   const payload: ProviderPayload = {
     model: getImageModel(),
     prompt: mergePromptWithNegative(
-      prompt,
-      body.negativePrompt || body.asset?.negativePrompt || defaultNegativePrompt(category),
+      builtPrompt.compiled_final_prompt,
+      builtPrompt.compiled_negative_prompt || defaultNegativePrompt(category),
     ),
     n: 1,
     size: normalizeImageSize(String(body.size || sizeForCategory(category))),
@@ -107,6 +171,12 @@ export async function POST(
       category,
       referenceImages,
       projectId,
+      promptBuilder: "asset_prompt_compiler_v2",
+      compilerInput: builtPrompt.compiler_input,
+      compilerIR: builtPrompt.compiler_ir,
+      compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      validation: builtPrompt.validation_report,
+      negativePrompt: builtPrompt.compiled_negative_prompt,
     },
   };
 
@@ -129,6 +199,12 @@ export async function POST(
           status: result.status,
           targetName: payload.metadata.targetName,
           category: payload.metadata.category,
+          promptBuilder: "asset_prompt_compiler_v2",
+          compilerInput: builtPrompt.compiler_input,
+          compilerIR: builtPrompt.compiler_ir,
+          compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+          validation: builtPrompt.validation_report,
+          negativePrompt: builtPrompt.compiled_negative_prompt,
           updatedAt: new Date().toISOString(),
         },
       },
@@ -413,43 +489,6 @@ function defaultNegativePrompt(category: string) {
   if (category === "props") return `${common}, people, hands, background environment, reflected lettering`;
   if (category === "scenes") return `${common}, people, silhouettes, pedestrians, unrelated modern objects`;
   return `${common}, multiple people, duplicate character, distorted facial features, inconsistent costume`;
-}
-
-function makePlaceholderImage(payload: ProviderPayload) {
-  const label = payload.metadata.targetName || payload.metadata.assetName || payload.metadata.category || "image2";
-  const promptPreview = escapeSvg(compactText(payload.prompt, 150));
-  const svg = `
-  <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
-    <defs>
-      <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-        <stop offset="0%" stop-color="#111827"/>
-        <stop offset="52%" stop-color="#1f2937"/>
-        <stop offset="100%" stop-color="#0f766e"/>
-      </linearGradient>
-    </defs>
-    <rect width="1280" height="720" fill="url(#bg)"/>
-    <rect x="72" y="72" width="1136" height="576" rx="22" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.22)"/>
-        <text x="110" y="145" fill="#e5e7eb" font-family="Arial, sans-serif" font-size="42" font-weight="700">image2 not configured</text>
-    <text x="110" y="205" fill="#93c5fd" font-family="Arial, sans-serif" font-size="30">${escapeSvg(label)}</text>
-    <foreignObject x="110" y="250" width="1040" height="310">
-      <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:Arial,sans-serif;color:#d1d5db;font-size:24px;line-height:1.55;">
-        ${promptPreview}
-      </div>
-    </foreignObject>
-  </svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
-}
-
-function compactText(text: string, maxLength: number) {
-  const cleaned = String(text || "").replace(/\s+/g, " ").trim();
-  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}...` : cleaned;
-}
-
-function escapeSvg(text: string) {
-  return String(text || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
 
 function slugify(value: string) {

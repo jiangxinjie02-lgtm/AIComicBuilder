@@ -252,6 +252,39 @@ export function ensureAssetLibraryTables() {
   `).run();
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_prop_assets_scene" ON "prop_assets" ("scene_id")`).run();
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_prop_assets_owner" ON "prop_assets" ("owner_character_id")`).run();
+
+  ensureAssetVariantTable(sqlite);
+}
+
+function ensureAssetVariantTable(sqlite: SqliteConnection) {
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "asset_variants" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "asset_id" text NOT NULL,
+      "source_candidate_id" text,
+      "source_occurrence_id" text,
+      "variant_type" text DEFAULT 'default' NOT NULL,
+      "name" text NOT NULL,
+      "state" text DEFAULT '' NOT NULL,
+      "locked_traits" text,
+      "changed_traits" text,
+      "visual_constraints" text DEFAULT '' NOT NULL,
+      "negative_constraints" text DEFAULT '' NOT NULL,
+      "reference_image" text,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "metadata" text,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("asset_id") REFERENCES "assets"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("source_candidate_id") REFERENCES "asset_candidates"("id") ON UPDATE no action ON DELETE set null,
+      FOREIGN KEY ("source_occurrence_id") REFERENCES "asset_occurrences"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_variants_asset" ON "asset_variants" ("asset_id", "status")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_variants_project" ON "asset_variants" ("project_id", "asset_id")`).run();
+  sqlite.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS "idx_asset_variants_asset_name" ON "asset_variants" ("asset_id", "name")`).run();
 }
 
 export function ensureProductionBibleTable() {
@@ -427,6 +460,8 @@ export function ensureStoryPipelineTables() {
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_occurrences_project_chunk" ON "asset_occurrences" ("project_id", "chunk_id")`).run();
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_occurrences_episode_scene" ON "asset_occurrences" ("episode_id", "scene_id")`).run();
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_occurrences_candidate" ON "asset_occurrences" ("candidate_id")`).run();
+
+  ensureAssetVariantTable(sqlite);
 
   sqlite.prepare(`
     CREATE TABLE IF NOT EXISTS "shot_specs" (

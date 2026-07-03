@@ -2,6 +2,7 @@ import { and, asc, desc, eq, inArray, or, isNull } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   assets,
+  assetVariants,
   characterAssets,
   characters,
   complianceReports,
@@ -19,6 +20,13 @@ import {
 import type { AIProvider, ImageOptions } from "@/lib/ai/types";
 import { id as genId } from "@/lib/id";
 import { getActiveProductionBible } from "@/lib/production-bible";
+import {
+  buildDeterministicImagePrompt,
+  type BuiltImagePrompt,
+  type PromptAssetInput,
+  type PromptAssetVariantInput,
+  type PromptFrameRole,
+} from "@/lib/image-prompt-builder";
 
 type AssetType = "character" | "scene" | "prop";
 type StoryAssetDetail =
@@ -40,11 +48,6 @@ function parseJsonArray(value: unknown): string[] {
   } catch {
     return [];
   }
-}
-
-function compactText(value: unknown, maxLength = 220) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  return text.length > maxLength ? `${text.slice(0, maxLength).trim()}...` : text;
 }
 
 function uniq(values: Array<string | null | undefined>) {
@@ -145,8 +148,10 @@ export type ParsedShotForSpec = Partial<{
 export type StoryboardPromptBuild = {
   prompt: string;
   negativePrompt: string;
+  structuredPrompt: BuiltImagePrompt["structured_prompt"];
   referenceImages: string[];
   referenceLabels: string[];
+  characterNames: string[];
 };
 
 async function selectInserted<T extends { id: string }>(
@@ -579,81 +584,134 @@ export async function syncShotSpecsForShots(input: {
 
 export async function buildStoryboardPromptForShotSpec(
   shotSpecId: string,
+  options?: { frameRole?: PromptFrameRole },
 ): Promise<StoryboardPromptBuild> {
   const [spec] = await db.select().from(shotSpecs).where(eq(shotSpecs.id, shotSpecId)).limit(1);
   if (!spec) throw new Error(`Shot spec not found: ${shotSpecId}`);
-  const [shot] = spec.shotId
-    ? await db.select().from(shots).where(eq(shots.id, spec.shotId)).limit(1)
-    : [];
   const bible = await getActiveProductionBible(spec.projectId, spec.episodeId);
   const characterNames = parseJsonArray(spec.characters);
   const propAssetIds = parseJsonArray(spec.propAssetIds);
-  const assetIds = uniq([spec.sceneAssetId, ...propAssetIds]);
-  const selectedAssets = assetIds.length > 0
-    ? await db.select().from(assets).where(inArray(assets.id, assetIds))
-    : [];
-  const characterRows = characterNames.length > 0
+  const allStoryAssets = await listStoryAssets(spec.projectId);
+  const characterAssetsRows = allStoryAssets.filter((asset) =>
+    asset.type === "character" &&
+    characterNames.some((name) => asset.name === name || assetTerms(asset).includes(name)),
+  );
+  const sceneAsset = allStoryAssets.find((asset) => asset.id === spec.sceneAssetId);
+  const propAssetsForPrompt = allStoryAssets.filter((asset) => propAssetIds.includes(asset.id));
+  const selectedAssets = uniqueAssets([
+    ...characterAssetsRows,
+    ...(sceneAsset ? [sceneAsset] : []),
+    ...propAssetsForPrompt,
+  ]);
+  const selectedAssetIds = selectedAssets.map((asset) => asset.id);
+  const selectedVariants = selectedAssetIds.length > 0
     ? await db
         .select()
-        .from(characters)
-        .where(and(eq(characters.projectId, spec.projectId), inArray(characters.name, characterNames)))
+        .from(assetVariants)
+        .where(inArray(assetVariants.assetId, selectedAssetIds))
+        .orderBy(asc(assetVariants.assetId), asc(assetVariants.createdAt))
     : [];
-  const characterAssetsRows = characterNames.length > 0
-    ? (await listStoryAssets(spec.projectId, "character")).filter((asset) =>
-        characterNames.some((name) => asset.name === name || assetTerms(asset).includes(name)),
-      )
-    : [];
+  const variantsByAssetId = new Map<string, PromptAssetVariantInput | null>();
+  for (const asset of selectedAssets) {
+    const variants = selectedVariants.filter((variant) => variant.assetId === asset.id);
+    variantsByAssetId.set(asset.id, normalizePromptVariant(choosePromptVariant(variants)));
+  }
+
+  const built = buildDeterministicImagePrompt({
+    shotSpec: {
+      id: spec.id,
+      sequence: spec.sequence,
+      duration: spec.duration,
+      characters: characterNames,
+      sceneAssetId: spec.sceneAssetId,
+      propAssetIds,
+      shotType: spec.shotType,
+      cameraAngle: spec.cameraAngle,
+      cameraMovement: spec.cameraMovement,
+      action: spec.action,
+      emotion: spec.emotion,
+    },
+    productionBible: bible,
+    assets: selectedAssets.map(normalizePromptAsset),
+    variantsByAssetId,
+    frameRole: options?.frameRole ?? "storyboard",
+  });
 
   const references = uniq([
-    ...characterRows.map((character) => character.referenceImage),
-    ...characterAssetsRows.map((asset) => asset.referenceImage),
-    ...selectedAssets.map((asset) => asset.referenceImage),
+    ...selectedAssets.map((asset) => variantsByAssetId.get(asset.id)?.referenceImage || asset.referenceImage),
   ]);
   const referenceLabels = references.map((ref) => {
-    const character = characterRows.find((row) => row.referenceImage === ref);
-    if (character) return character.name;
-    const asset = [...characterAssetsRows, ...selectedAssets].find((row) => row.referenceImage === ref);
+    const asset = selectedAssets.find((row) =>
+      row.referenceImage === ref || variantsByAssetId.get(row.id)?.referenceImage === ref
+    );
     return asset?.name ?? "reference";
   });
 
-  const sceneAsset = selectedAssets.find((asset) => asset.id === spec.sceneAssetId);
-  const propAssetsForPrompt = selectedAssets.filter((asset) => propAssetIds.includes(asset.id));
-  const prompt = [
-    "Create one storyboard reference still for the next video-generation step.",
-    "Use the reference images only to preserve identity, costume, scene layout, and prop design.",
-    "No subtitles, captions, UI, watermarks, logos, extra limbs, duplicate faces, or unrelated background characters.",
-    bible?.worldSetting && `World: ${compactText(bible.worldSetting, 700)}`,
-    bible?.visualStyle && `Visual style: ${compactText(bible.visualStyle, 500)}`,
-    bible?.eraConstraints && `Era constraints: ${compactText(bible.eraConstraints, 400)}`,
-    bible?.locationRules && `Location rules: ${compactText(bible.locationRules, 400)}`,
-    bible?.characterRules && `Character rules: ${compactText(bible.characterRules, 500)}`,
-    spec.positivePrompt && `Shot prompt: ${spec.positivePrompt}`,
-    `Shot type: ${spec.shotType || "storyboard"}`,
-    spec.cameraAngle && `Camera angle/composition: ${spec.cameraAngle}`,
-    spec.cameraMovement && `Camera movement intent: ${spec.cameraMovement}`,
-    spec.action && `Action beat: ${spec.action}`,
-    spec.emotion && `Emotion/focus: ${spec.emotion}`,
-    spec.dialogue && `Dialogue context, do not render text: ${spec.dialogue}`,
-    spec.continuityIn && `Continuity in: ${spec.continuityIn}`,
-    spec.continuityOut && `Continuity out: ${spec.continuityOut}`,
-    characterNames.length > 0 && `Visible characters: ${characterNames.join(", ")}`,
-    sceneAsset && `Scene asset: ${sceneAsset.name}. ${sceneAsset.description || sceneAsset.visualConstraints || ""}`,
-    propAssetsForPrompt.length > 0 && `Prop assets: ${propAssetsForPrompt.map((asset) => `${asset.name}: ${asset.description || asset.visualConstraints || ""}`).join("; ")}`,
-    shot?.duration && `Target video duration after storyboard: ${shot.duration}s`,
-  ].filter(Boolean).join("\n");
-
-  const negativePrompt = [
-    spec.negativePrompt,
-    bible?.negativePromptTemplate,
-    ...selectedAssets.map((asset) => asset.negativeConstraints),
-    "text, caption, watermark, logo, distorted hands, extra fingers, duplicate person, inconsistent face, wrong costume, anachronistic objects",
-  ].filter(Boolean).join("\n");
-
   return {
-    prompt,
-    negativePrompt,
+    prompt: built.prompt,
+    negativePrompt: built.negative_prompt,
+    structuredPrompt: built.structured_prompt,
     referenceImages: references,
     referenceLabels,
+    characterNames,
+  };
+}
+
+function uniqueAssets(rows: Array<typeof assets.$inferSelect>) {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (seen.has(row.id)) return false;
+    seen.add(row.id);
+    return true;
+  });
+}
+
+function normalizePromptAsset(row: typeof assets.$inferSelect): PromptAssetInput {
+  return {
+    id: row.id,
+    type: row.type as PromptAssetInput["type"],
+    name: row.name,
+    description: row.description,
+    visualConstraints: row.visualConstraints,
+    negativeConstraints: row.negativeConstraints,
+    referenceImage: row.referenceImage,
+  };
+}
+
+function choosePromptVariant(rows: Array<typeof assetVariants.$inferSelect>) {
+  if (rows.length === 0) return null;
+  const statusRank = new Map([
+    ["locked", 0],
+    ["approved", 1],
+    ["generated", 2],
+    ["reviewing", 3],
+    ["draft", 4],
+    ["rejected", 5],
+  ]);
+  return [...rows].sort((a, b) => {
+    const byStatus = (statusRank.get(a.status) ?? 10) - (statusRank.get(b.status) ?? 10);
+    if (byStatus !== 0) return byStatus;
+    const byDefault =
+      (a.variantType === "default" || a.name === "default" ? 0 : 1) -
+      (b.variantType === "default" || b.name === "default" ? 0 : 1);
+    if (byDefault !== 0) return byDefault;
+    return a.createdAt.getTime() - b.createdAt.getTime();
+  })[0];
+}
+
+function normalizePromptVariant(row: typeof assetVariants.$inferSelect | null | undefined): PromptAssetVariantInput | null {
+  if (!row) return null;
+  return {
+    id: row.id,
+    assetId: row.assetId,
+    name: row.name,
+    variantType: row.variantType,
+    state: row.state,
+    lockedTraits: row.lockedTraits,
+    changedTraits: row.changedTraits,
+    visualConstraints: row.visualConstraints,
+    negativeConstraints: row.negativeConstraints,
+    referenceImage: row.referenceImage,
   };
 }
 
@@ -690,6 +748,8 @@ export async function upsertStoryboardFramePrompt(input: {
           ...(typeof existing.metadata === "object" && existing.metadata ? existing.metadata : {}),
           referenceImages: built.referenceImages,
           referenceLabels: built.referenceLabels,
+          structured_prompt: built.structuredPrompt,
+          prompt_builder: "deterministic_v1",
         },
         updatedAt: now,
       })
@@ -713,6 +773,8 @@ export async function upsertStoryboardFramePrompt(input: {
     metadata: {
       referenceImages: built.referenceImages,
       referenceLabels: built.referenceLabels,
+      structured_prompt: built.structuredPrompt,
+      prompt_builder: "deterministic_v1",
     },
     createdAt: now,
     updatedAt: now,
@@ -760,8 +822,16 @@ export async function generateStoryboardFrameImage(input: {
     : {
         prompt: frame.prompt,
         negativePrompt: frame.negativePrompt,
+        structuredPrompt: ((frame.metadata as { structured_prompt?: BuiltImagePrompt["structured_prompt"] } | null)?.structured_prompt ?? {
+          subjects: [],
+          scene: { asset_id: null, variant_id: null, name: "", visual: "", era: "", constraints: [] },
+          camera: { shot_type: "storyboard", movement: "static", composition: "", frame_role: "storyboard" },
+          action: "",
+          style: "",
+        }),
         referenceImages: parseJsonArray((frame.metadata as { referenceImages?: unknown } | null)?.referenceImages),
         referenceLabels: parseJsonArray((frame.metadata as { referenceLabels?: unknown } | null)?.referenceLabels),
+        characterNames: [],
       };
   const prompt = [built.prompt, built.negativePrompt && `Negative prompt: ${built.negativePrompt}`]
     .filter(Boolean)
@@ -792,6 +862,8 @@ export async function generateStoryboardFrameImage(input: {
           ...(typeof frame.metadata === "object" && frame.metadata ? frame.metadata : {}),
           referenceImages: built.referenceImages,
           referenceLabels: built.referenceLabels,
+          structured_prompt: built.structuredPrompt,
+          prompt_builder: "deterministic_v1",
           generatedAt: new Date().toISOString(),
         },
         updatedAt: new Date(),
