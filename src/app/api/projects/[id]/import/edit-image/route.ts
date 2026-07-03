@@ -25,6 +25,7 @@ interface EditImageAsset {
   name?: string;
   category?: string;
   role?: string;
+  roleKey?: string;
   visualHint?: string;
   description?: string;
   visualConstraints?: string;
@@ -84,6 +85,31 @@ const generatedDir = path.join(process.cwd(), "public", "generated", "import-ass
 let imageEditKeyPool: ApiKeyPool | null = null;
 let imageEditKeyPoolSignature = "";
 
+type CharacterFaceTemplate = NonNullable<EditImageAsset["faceTemplate"]>;
+
+const CHARACTER_FACE_TEMPLATES: Record<string, CharacterFaceTemplate> = {
+  maleLead: {
+    label: "男主角真人模板",
+    url: "/templates/male-lead-template.jpg",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态。",
+  },
+  femaleLead: {
+    label: "女主角真人模板",
+    url: "/templates/female-lead-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态。",
+  },
+  maleSupport: {
+    label: "男配角真人模板",
+    url: "/templates/male-support-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态。",
+  },
+  femaleSupport: {
+    label: "女配角真人模板",
+    url: "/templates/female-support-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态。",
+  },
+};
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
@@ -114,6 +140,7 @@ export async function POST(
   const providerImage = await toProviderImage(sourceImage);
   const isVariantTarget = String(body.targetType || "").startsWith("variant");
   const assetType = categoryToAssetType(category);
+  const effectiveFaceTemplate = resolveFaceTemplate(body.asset, category);
   const builtPrompt = buildAssetImagePrompt({
     asset: {
       id: body.asset?.id || body.asset?.assetId || "",
@@ -128,7 +155,7 @@ export async function POST(
       tags: Array.isArray(body.asset?.tags) ? body.asset.tags : [],
       sceneAssetId: body.asset?.sceneAssetId || "",
       visualSchema: body.asset?.visualSchema || null,
-      faceTemplate: body.asset?.faceTemplate || null,
+      faceTemplate: effectiveFaceTemplate,
     },
     variant: {
       id: "",
@@ -161,8 +188,9 @@ export async function POST(
       ? "Create a reusable asset variant from the source image, not a story scene."
       : "Edit this reusable asset image, not a story scene.",
     "Preserve the same asset identity, facial features, body proportions, layout discipline, and clean asset-sheet purpose unless the variant explicitly changes a visual trait.",
+    enforceCharacterIdentityPrompt(category, effectiveFaceTemplate),
     builtPrompt.compiled_final_prompt,
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 
   const payload: EditImagePayload = {
     model: getEditImageModel(),
@@ -349,6 +377,8 @@ async function toProviderImage(imageUrl: string) {
   let localPath = "";
   if (normalized.startsWith("/generated/")) {
     localPath = path.join(process.cwd(), "public", normalized);
+  } else if (normalized.startsWith("/templates/")) {
+    localPath = path.join(process.cwd(), "public", normalized);
   } else if (normalized.startsWith("/api/uploads/")) {
     localPath = path.join(process.cwd(), "uploads", normalized.replace(/^\/api\/uploads\//, ""));
   } else if (normalized.includes("/uploads/")) {
@@ -510,6 +540,40 @@ function mergePromptWithNegative(prompt: string, negativePrompt: string) {
   const negative = String(negativePrompt || "").trim();
   if (!negative) return prompt;
   return `${prompt}\n\nNegative prompt: ${negative}`;
+}
+
+function resolveFaceTemplate(asset: EditImageAsset | undefined, category: string): CharacterFaceTemplate | null {
+  if (category !== "characters") return null;
+  if (asset?.faceTemplate?.url) return asset.faceTemplate;
+  const key = String(asset?.roleKey || "");
+  if (CHARACTER_FACE_TEMPLATES[key]) return CHARACTER_FACE_TEMPLATES[key];
+
+  const roleText = `${asset?.role || ""} ${(asset?.tags || []).join(" ")}`;
+  if (/男主/.test(roleText)) return CHARACTER_FACE_TEMPLATES.maleLead;
+  if (/女主/.test(roleText)) return CHARACTER_FACE_TEMPLATES.femaleLead;
+  if (/男配/.test(roleText)) return CHARACTER_FACE_TEMPLATES.maleSupport;
+  if (/女配/.test(roleText)) return CHARACTER_FACE_TEMPLATES.femaleSupport;
+  if (/主角/.test(roleText) && /男性/.test(roleText)) return CHARACTER_FACE_TEMPLATES.maleLead;
+  if (/主角/.test(roleText) && /女性/.test(roleText)) return CHARACTER_FACE_TEMPLATES.femaleLead;
+  if (/(配角|反派)/.test(roleText) && /男性/.test(roleText)) return CHARACTER_FACE_TEMPLATES.maleSupport;
+  if (/(配角|反派)/.test(roleText) && /女性/.test(roleText)) return CHARACTER_FACE_TEMPLATES.femaleSupport;
+  return null;
+}
+
+function enforceCharacterIdentityPrompt(category: string, faceTemplate: CharacterFaceTemplate | null) {
+  if (category !== "characters") return "";
+  const templateText = faceTemplate
+    ? [
+        `Face reference template: ${faceTemplate.label || "character template"} (${faceTemplate.url || ""}).`,
+        faceTemplate.note || "",
+      ].filter(Boolean).join(" ")
+    : "Keep the same character identity across the main image and every variant.";
+  return [
+    "STRICT CHARACTER IDENTITY LOCK:",
+    templateText,
+    "The face shape, facial features, eyebrow-eye-nose-lip proportions, facial bone structure, gender, age impression, and recognizability must stay exactly consistent with the template/reference. Variants and edits may only change hairstyle, clothing, makeup intensity, expression, pose, and story state.",
+    "Use realistic live-action photography style with natural skin texture. Do not use comic, anime, illustration, stylized cartoon, face-swap artifacts, or altered identity.",
+  ].join("\n");
 }
 
 function normalizeImageSize(size: string) {

@@ -72,6 +72,7 @@ export interface AssetAgentAsset {
   promptMetadata?: Record<string, unknown>;
   variants: AssetAgentVariant[];
   imageUrl: string;
+  audioUrl?: string;
   history: Array<Record<string, unknown>>;
 }
 
@@ -138,16 +139,26 @@ interface NamedSeed {
   times?: string[];
 }
 
-const LEAD_FACE_TEMPLATES: Record<string, FaceTemplate> = {
+const FACE_TEMPLATES: Record<string, FaceTemplate> = {
   maleLead: {
-    label: "男主脸型模板：陆铮",
-    url: "/templates/male-lead-luzheng.jpg",
-    note: "固定窄长脸型、清晰下颌线、浓眉、挺直鼻梁和克制唇形",
+    label: "男主角真人模板",
+    url: "/templates/male-lead-template.jpg",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
   },
   femaleLead: {
-    label: "女主脸型模板：沈念",
-    url: "/templates/female-lead-shennian.png",
-    note: "固定鹅蛋脸、小巧下颌、大眼、柔和有形、挺鼻和自然唇形",
+    label: "女主角真人模板",
+    url: "/templates/female-lead-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
+  },
+  maleSupport: {
+    label: "男配角真人模板",
+    url: "/templates/male-support-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
+  },
+  femaleSupport: {
+    label: "女配角真人模板",
+    url: "/templates/female-support-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
   },
 };
 
@@ -736,18 +747,17 @@ function makeCharacterAsset(
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const joined = snippets.concat(seed.contexts).join(" ");
-  const gender = inferGender(seed.name, joined);
+  const gender = inferGender(seed.name, joined, seed.role);
+  const roleKey = roleKeyFromRole(seed.role, gender);
   const age = inferAge(joined);
   const temperament = inferTemperament(joined);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
-  const description = compactText(seed.contexts.concat(snippets).join(" "), 220);
-  const roleKey = roleKeyFromRole(seed.role);
-  const faceTemplate = LEAD_FACE_TEMPLATES[roleKey] || null;
+  const profile = buildCharacterProfile(seed, snippets, joined);
+  const faceTemplate = FACE_TEMPLATES[roleKey] || null;
   const visualConstraints = [
-    gender,
-    age,
-    temperament,
     faceTemplate ? `${faceTemplate.label}；${faceTemplate.note}` : "",
+    gender ? `性别识别保持${gender}，不改变年龄层次和人物辨识度。` : "",
+    "真人实拍摄影质感，自然皮肤纹理，不要漫画风、二次元、插画风、夸张美型或换脸感。",
   ].filter(Boolean).join("；");
   const builtPrompt = buildAssetImagePrompt({
     asset: {
@@ -755,6 +765,7 @@ function makeCharacterAsset(
       type: "character",
       name: seed.name,
       role: seed.role,
+      description: profile,
       visualConstraints,
       tags: [seed.role, gender, age].filter(Boolean),
       faceTemplate,
@@ -767,7 +778,7 @@ function makeCharacterAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = builtPrompt.compiled_final_prompt;
+  const prompt = buildCharacterImagePrompt(seed.name, seed.role, profile, visualConstraints, faceTemplate);
 
   return {
     id: `char_${index + 1}_${slugify(seed.name)}`,
@@ -783,7 +794,7 @@ function makeCharacterAsset(
     score: seed.score,
     appearances: seed.score,
     episodes: epRefs,
-    description: description || `${seed.name} 是剧本中需要建立一致视觉形象的角色。`,
+    description: profile,
     visualConstraints,
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("characters"),
@@ -828,7 +839,7 @@ function makePropAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = builtPrompt.compiled_final_prompt;
+  const prompt = buildPropImagePrompt(seed.name, seed.type, description);
 
   return {
     id: `prop_${index + 1}_${slugify(seed.name)}`,
@@ -890,7 +901,7 @@ function makeSceneAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = builtPrompt.compiled_final_prompt;
+  const prompt = buildSceneImagePrompt(seed.name, seed.type, description, times);
 
   return {
     id: `scene_${index + 1}_${slugify(seed.name)}`,
@@ -1066,12 +1077,15 @@ function normalizeRole(role: string) {
   return "主角";
 }
 
-function roleKeyFromRole(role: string) {
+function roleKeyFromRole(role: string, gender = "") {
   if (/男主/.test(role)) return "maleLead";
   if (/女主/.test(role)) return "femaleLead";
   if (/男配/.test(role)) return "maleSupport";
   if (/女配/.test(role)) return "femaleSupport";
-  if (/主角/.test(role)) return "mainLead";
+  if (/主角/.test(role) && gender === "男性") return "maleLead";
+  if (/主角/.test(role) && gender === "女性") return "femaleLead";
+  if (/配角|反派/.test(role) && gender === "男性") return "maleSupport";
+  if (/配角|反派/.test(role) && gender === "女性") return "femaleSupport";
   return "";
 }
 
@@ -1250,7 +1264,9 @@ function looksLikeNonScene(name: string) {
   return /(时候|身边|眼前|心里|手里|声音|电话|镜头|画面|男人|女人|孩子)$/.test(name);
 }
 
-function inferGender(name: string, context: string) {
+function inferGender(name: string, context: string, role = "") {
+  if (/男主|男配/.test(role)) return "男性";
+  if (/女主|女配/.test(role)) return "女性";
   if (/(女性|女人|女主|女配|妻子|母亲|小姐|姐姐|妹妹|姑娘|少女|她)/.test(`${name} ${context}`)) return "女性";
   if (/(男性|男人|男主|男配|丈夫|父亲|先生|哥哥|弟弟|军官|警官|他)/.test(`${name} ${context}`)) return "男性";
   return "性别未定";
@@ -1274,49 +1290,160 @@ function inferTemperament(context: string) {
   return traits.slice(0, 2).join("，") || "自然真实，情绪层次克制";
 }
 
+function buildCharacterProfile(seed: CharacterSeed, snippets: string[], joined: string) {
+  const source = seed.contexts.concat(snippets).join(" ");
+  const compact = compactCompleteSentences(source, 260);
+  let profile = "";
+  if (compact) {
+    profile = ensureSentenceEnd(`${seed.name}是剧本中的${seed.role}。${compact}`);
+  } else {
+    const temperament = inferTemperament(joined);
+    profile = ensureSentenceEnd(`${seed.name}是剧本中的${seed.role}，角色气质为${temperament}，在剧情中承担与其身份相匹配的叙事功能。`);
+  }
+  return normalizeCharacterProfileLength(profile, seed.name, seed.role);
+}
+
+function normalizeCharacterProfileLength(text: string, name: string, role: string) {
+  const sentences = String(text || "")
+    .replace(/人物：[^。！？!?]*/g, "")
+    .replace(/\s+/g, " ")
+    .split(/(?<=[。！？!?])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  let profile = sentences.join("");
+  if (!profile.startsWith(name)) profile = `${name}是剧本中的${role}。${profile}`;
+  if (profile.length > 200) {
+    let shortened = "";
+    for (const sentence of sentences) {
+      if ((shortened + sentence).length > 190) break;
+      shortened += sentence;
+    }
+    profile = shortened || profile.slice(0, 190);
+    profile = ensureSentenceEnd(profile);
+  }
+  const fillers = [
+    `${name}在故事中围绕${role || "角色"}身份承担清晰的叙事功能，处事方式、情绪底色和与主要阵营的关系需要保持连贯。`,
+    `${name}的人物动机应来自剧本中的经历和处境，外在状态可随情节变化，但性格核心、年龄层次、身份气质和辨识记忆点要稳定。`,
+    `${name}的表演应强调可信的生活细节、情绪层次和人物关系张力。`,
+  ];
+  for (const filler of fillers) {
+    if (profile.length >= 120) break;
+    profile += filler;
+  }
+  if (profile.length > 200) profile = ensureSentenceEnd(profile.slice(0, 196));
+  return ensureSentenceEnd(profile);
+}
+
+function buildCharacterImagePrompt(
+  name: string,
+  role: string,
+  profile: string,
+  visualConstraints: string,
+  faceTemplate: FaceTemplate | null,
+) {
+  const templateLine = faceTemplate ? `${faceTemplate.label}（${faceTemplate.url}）` : "同一角色身份锁定";
+  return [
+    "【角色真人模板锁定】",
+    templateLine,
+    "主图和全部变体必须保持同一张脸：脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱、表情动作和剧情状态。",
+    "真人实拍摄影质感，禁止漫画风、二次元、插画风、AI 换脸感或改变角色性别年龄。",
+    "",
+    "【角色档案】",
+    ensureSentenceEnd(profile || `${name}是剧本中的${role}。`),
+    "",
+    "【视觉约束】",
+    visualConstraints,
+    "",
+    "【主图生成要求】",
+    "真人实拍角色设定三视图，纯白背景，左侧面部近景，右侧正面、侧面、背面全身三视图；保持模板脸型五官和面部辨识度一致。",
+  ].join("\n");
+}
+
+function buildPropImagePrompt(name: string, type: string, description: string) {
+  return [
+    "【道具主图】",
+    `${name}，${type || "剧情道具"}。`,
+    "",
+    "【生成要求】",
+    "真人短剧质感的道具资产参考图，纯白或浅灰背景，单体清晰展示，结构、材质、颜色和尺寸比例稳定，适合后续多镜头复用。",
+    `概述：${name}是剧本中的${type || "剧情道具"}，需要保持清晰稳定的外观、材质和比例，便于后续镜头反复复用。`,
+  ].filter(Boolean).join("\n");
+}
+
+function buildSceneImagePrompt(name: string, type: string, description: string, times: string[]) {
+  const timeText = times.length ? `可扩展为${times.map((time) => `${time}景`).join("、")}。` : "";
+  return [
+    "【场景主图】",
+    `${name}，${type || "剧情场景"}。`,
+    "",
+    "【生成要求】",
+    `真人短剧质感的空镜场景资产参考图，无人物，保持空间结构、主要陈设、镜头高度和方位清晰稳定，适合后续分镜复用。${timeText}`,
+    `概述：${name}是剧本中的${type || "剧情场景"}，需要建立稳定的空间结构、环境氛围和主要陈设，便于后续镜头反复复用。`,
+  ].filter(Boolean).join("\n");
+}
+
 function suggestCharacterVariants(name: string, role: string, snippets: string[], faceTemplate: FaceTemplate | null) {
   const joined = snippets.join(" ");
   const faceLock = faceTemplate
-    ? `严格参考${faceTemplate.label}，锁定脸型、五官、眉眼鼻唇比例和骨相；`
-    : "锁定脸型、五官、眉眼鼻唇比例和骨相；";
-  const variants: AssetAgentVariant[] = [
+    ? `严格参考${faceTemplate.label}，锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；`
+    : "锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；";
+  const identityRule = `${faceLock}真人实拍摄影质感，禁止漫画风、二次元和插画感；只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`;
+  if (!/男主|女主|主角/.test(role)) {
+    return [{
+      name: `${name}备用变体`,
+      description: `备用状态：保留${name}的角色身份和面部辨识度，仅调整发型、服装、妆造强弱或轻微剧情状态。`,
+      prompt: `人物资产变体，${name}，${role}，备用造型，${identityRule}纯白背景。`,
+      imageUrl: "",
+      history: [],
+    }];
+  }
+
+  const variantSets: Array<{ test: RegExp; items: Array<[string, string, string]> }> = [
     {
-      name: `${name}基础三视图`,
-      description: "主形象版本，面部近景加正面、侧面、背面三视图。",
-      prompt: `人物三视图设定图，${name}，${role}，基础主形象，纯白背景，面部近景加全身正侧背三视图，${faceLock}保持人物一致。`,
+      test: /末世|丧尸|重生|系统|物资|车队|堡垒|救援|逃亡|尸潮|废土|战斗/,
+      items: [
+        ["末世行动状态", "末世行动状态：适合外出搜寻物资、驾驶车辆、穿越危险区域或推进救援任务，服装利落耐磨，发型可略凌乱。", "末世行动状态，外出搜寻物资或推进救援任务，利落耐磨服装，轻微尘土和紧张感"],
+        ["战斗戒备状态", "战斗戒备状态：适合遭遇丧尸、敌对幸存者或突发危机，表情警觉，动作蓄势，只增强剧情压力感。", "战斗戒备状态，警觉表情，动作蓄势，危机氛围"],
+        ["资源筹备状态", "资源筹备状态：适合整理物资、检查装备、规划路线或做关键决策，服装整洁克制，状态更冷静。", "资源筹备状态，整理装备或规划路线，冷静克制表情"],
+        ["受伤疲惫状态", "受伤疲惫状态：适合奔波、受伤、体力透支或撤离后的剧情，只调整妆发凌乱度、气色和服装污损。", "受伤疲惫状态，妆发略乱，气色疲惫，轻微污损"],
+        ["高压对峙状态", "高压对峙状态：适合背叛、审问、冲突或关键摊牌，表情更压抑锐利，妆造强度略提升。", "高压对峙状态，压抑锐利表情，冲突或摊牌氛围"],
+      ],
     },
     {
-      name: `${name}日常造型`,
-      description: "生活化服装，适合常规对白和室内戏。",
-      prompt: `人物三视图设定图，${name}，日常服装版本，${faceLock}只改变发型和着装，纯白背景。`,
+      test: /婚礼|婚姻|订婚|豪门|总裁|公司|职场|会议|发布会|商业|办公室/,
+      items: [
+        ["日常职场状态", "日常职场状态：适合办公室、会议前后或常规沟通，服装干练，表情自然克制。", "日常职场状态，干练通勤服装，自然克制表情"],
+        ["正式会面状态", "正式会面状态：适合谈判、发布会、宴会或重要亮相，服装正式，妆造完整但不改变五官。", "正式会面状态，正式服装，完整妆造，重要亮相"],
+        ["情绪拉扯状态", "情绪拉扯状态：适合争执、误会、告白或关系转折，表情有情绪张力，妆造略加强。", "情绪拉扯状态，情绪张力，关系转折氛围"],
+        ["私下独处状态", "私下独处状态：适合居家、车内、休息室或夜间独处，服装更生活化，情绪更松弛。", "私下独处状态，生活化服装，松弛或沉思表情"],
+        ["高光亮相状态", "高光亮相状态：适合婚礼、红毯、宴会或剧情高光，服装更精致，妆造强度提升。", "高光亮相状态，精致服装，剧情高光氛围"],
+      ],
     },
     {
-      name: `${name}外出造型`,
-      description: "适合室外行动戏份，服装更便于移动。",
-      prompt: `人物三视图设定图，${name}，外出行动服装版本，${faceLock}只改变发型和着装，纯白背景。`,
-    },
-    {
-      name: `${name}情绪状态`,
-      description: "用于关键情绪戏，只调整表情、妆发和疲惫程度。",
-      prompt: `人物三视图设定图，${name}，情绪状态版本，表情更有剧情压力，${faceLock}只改变妆发和状态，纯白背景。`,
+      test: /校园|学校|学生|校服|课堂|社团|考试|青春/,
+      items: [
+        ["校园日常状态", "校园日常状态：适合课堂、走廊、宿舍或校园对白，服装清爽自然，表情生活化。", "校园日常状态，清爽自然服装，生活化表情"],
+        ["校服版本", "校服版本：适合上课、集会或校园关键场景，仅替换为剧本指定校服和对应发型。", "校服版本，剧本指定校服，校园场景"],
+        ["奔跑追逐状态", "奔跑追逐状态：适合操场、雨中、追赶或突发事件，发型可有轻微动态变化。", "奔跑追逐状态，轻微动态感，校园突发事件"],
+        ["低落独处状态", "低落独处状态：适合天台、教室角落或夜间独处，表情压抑，妆造保持自然。", "低落独处状态，压抑情绪，独处氛围"],
+        ["青春高光状态", "青春高光状态：适合获奖、告白、舞台或毕业等高光场景，状态更明亮。", "青春高光状态，明亮情绪，校园高光场景"],
+      ],
     },
   ];
-  if (/(制服|军装|警服|白大褂|校服)/.test(joined)) {
-    variants.push({
-      name: `${name}制服版本`,
-      description: "保留主体外貌，仅替换为剧本指定制服造型。",
-      prompt: `人物三视图设定图，${name}，剧本指定制服版本，${faceLock}只改变制服和发型，纯白背景。`,
-    });
-  }
-  if (/(受伤|病|疲惫|崩溃)/.test(joined)) {
-    variants.push({
-      name: `${name}受伤疲惫版本`,
-      description: "保持角色一致，仅调整妆发、表情和身体状态。",
-      prompt: `人物三视图设定图，${name}，受伤疲惫状态，妆发略凌乱，${faceLock}保持主体一致，纯白背景。`,
-    });
-  }
-  if (/男主|女主|主角/.test(role)) return variants.slice(0, Math.max(4, variants.length));
-  return variants.slice(0, Math.min(3, variants.length));
+  const selected = variantSets.find((set) => set.test.test(joined))?.items || [
+    ["日常对白状态", "日常对白状态：适合常规对白和生活场景，服装自然，表情克制，保持同一人物脸型五官。", "日常对白状态，生活化服装，自然表情"],
+    ["外出行动状态", "外出行动状态：适合移动、调查、赴约或推进剧情，服装更利落，发型可略有变化。", "外出行动状态，利落服装，轻微动态感"],
+    ["高压情绪状态", "高压情绪状态：适合冲突、对峙、误会或关键抉择，妆造略加强，表情更有压力。", "高压情绪状态，表情紧绷，妆造略加强"],
+    ["疲惫受挫状态", "疲惫受挫状态：适合长时间奔波、受伤、崩溃或失落后的剧情，只改变气色和妆发状态。", "疲惫受挫状态，妆发略乱，气色疲惫"],
+    ["高光亮相状态", "高光亮相状态：适合会面、仪式、反转或高光出场，服装更正式，妆造更完整。", "高光亮相状态，正式服装，完整妆造"],
+  ];
+  return selected.slice(0, 5).map(([suffix, description, promptDetail]) => ({
+    name: `${name}${suffix}`,
+    description,
+    prompt: `人物资产变体，${name}，${promptDetail}，${identityRule}纯白背景。`,
+    imageUrl: "",
+    history: [],
+  }));
 }
 
 function suggestSceneVariants(name: string, times: string[], basePrompt: string) {
@@ -1364,6 +1491,42 @@ function findSnippets(text: string, keyword: string) {
 function compactText(text: string, maxLength: number) {
   const cleaned = String(text || "").replace(/\s+/g, " ").trim();
   return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}...` : cleaned;
+}
+
+function compactCompleteSentences(text: string, maxLength: number) {
+  const cleaned = String(text || "")
+    .replace(/\s+/g, " ")
+    .replace(/\.\.\.|…/g, "")
+    .trim();
+  if (!cleaned) return "";
+  if (cleaned.length <= maxLength) return ensureSentenceEnd(cleaned);
+
+  const pieces = cleaned
+    .split(/(?<=[。！？!?；;])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  let result = "";
+  for (const piece of pieces) {
+    if ((result + piece).length > maxLength) break;
+    result += piece;
+  }
+  if (result) return ensureSentenceEnd(result);
+
+  const truncated = cleaned.slice(0, maxLength);
+  const lastStop = Math.max(
+    truncated.lastIndexOf("。"),
+    truncated.lastIndexOf("！"),
+    truncated.lastIndexOf("？"),
+    truncated.lastIndexOf(";"),
+    truncated.lastIndexOf("；"),
+  );
+  return ensureSentenceEnd(lastStop > 20 ? truncated.slice(0, lastStop + 1) : truncated);
+}
+
+function ensureSentenceEnd(text: string) {
+  const cleaned = String(text || "").replace(/\s+/g, " ").replace(/\.\.\.|…/g, "").trim();
+  if (!cleaned) return "";
+  return /[。！？!?]$/.test(cleaned) ? cleaned : `${cleaned}。`;
 }
 
 function defaultNegativePrompt(category: AssetCategory) {

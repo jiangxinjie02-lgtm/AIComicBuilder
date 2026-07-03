@@ -8,6 +8,7 @@ import {
   Upload, FileText, Users, Layers, Sparkles,
   Loader2, Check, X, ArrowLeft, AlertCircle,
   ImageIcon, Images, Plus, ChevronDown, History, Download,
+  Pencil, Maximize2, Trash2, Play,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -34,6 +35,7 @@ interface ExtractedCharacter {
   frequency: number;
   description: string;
   visualHint?: string;
+  visualConstraints?: string;
   scope: "main" | "guest";
   confirmed?: boolean;
   assetId?: string;
@@ -44,8 +46,10 @@ interface ExtractedCharacter {
   negativePrompt?: string;
   variants?: AssetVariant[];
   imageUrl?: string;
+  audioUrl?: string;
   history?: Array<Record<string, unknown>>;
   mainImageName?: string;
+  editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
 }
@@ -75,8 +79,10 @@ interface ExtractedAsset {
   negativePrompt?: string;
   variants?: AssetVariant[];
   imageUrl?: string;
+  audioUrl?: string;
   history?: Array<Record<string, unknown>>;
   mainImageName?: string;
+  editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
 }
@@ -84,6 +90,311 @@ interface ExtractedAsset {
 type AssetTab = "characters" | "items" | "environments" | "voices";
 type WorkbenchAsset = ExtractedAsset & { scope?: "main" | "guest" };
 type StepStatus = Record<Step, "idle" | "running" | "done" | "error">;
+
+const CHARACTER_FACE_TEMPLATES: Record<string, NonNullable<ExtractedCharacter["faceTemplate"]>> = {
+  maleLead: {
+    label: "男主角真人模板",
+    url: "/templates/male-lead-template.jpg",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
+  },
+  femaleLead: {
+    label: "女主角真人模板",
+    url: "/templates/female-lead-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
+  },
+  maleSupport: {
+    label: "男配角真人模板",
+    url: "/templates/male-support-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
+  },
+  femaleSupport: {
+    label: "女配角真人模板",
+    url: "/templates/female-support-template.png",
+    note: "主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。",
+  },
+};
+
+function normalizeImportedCharacters(characters: ExtractedCharacter[]) {
+  return characters.map((character) => normalizeImportedCharacter(character));
+}
+
+function normalizeImportedCharacter(character: ExtractedCharacter): ExtractedCharacter {
+  const roleKey = inferCharacterRoleKey(character);
+  const faceTemplate = CHARACTER_FACE_TEMPLATES[roleKey] || character.faceTemplate || null;
+  const profile = sanitizeCharacterProfile(character);
+  const variants = buildExpectedCharacterVariants(character, faceTemplate, profile);
+  const visualConstraints = ensureCharacterVisualConstraints(character, faceTemplate, roleKey);
+  const prompt = ensureCharacterPrompt(character, faceTemplate, visualConstraints, profile);
+
+  return {
+    ...character,
+    description: profile,
+    roleKey,
+    faceTemplate,
+    visualConstraints,
+    prompt,
+    variants,
+  };
+}
+
+function inferCharacterRoleKey(character: ExtractedCharacter) {
+  const key = String(character.roleKey || "");
+  if (CHARACTER_FACE_TEMPLATES[key]) return key;
+  const text = `${character.name || ""} ${character.role || ""} ${(character.tags || []).join(" ")} ${character.description || ""}`;
+  if (/男主/.test(text)) return "maleLead";
+  if (/女主/.test(text)) return "femaleLead";
+  if (/男配/.test(text)) return "maleSupport";
+  if (/女配/.test(text)) return "femaleSupport";
+  if (/主角/.test(text) && /男性|男人|男/.test(text)) return "maleLead";
+  if (/主角/.test(text) && /女性|女人|女/.test(text)) return "femaleLead";
+  if (/(配角|反派)/.test(text) && /男性|男人|男/.test(text)) return "maleSupport";
+  if (/(配角|反派)/.test(text) && /女性|女人|女/.test(text)) return "femaleSupport";
+  return key;
+}
+
+function ensureCharacterVisualConstraints(
+  character: ExtractedCharacter,
+  faceTemplate: ExtractedCharacter["faceTemplate"],
+  roleKey: string,
+) {
+  const gender = inferCharacterGenderConstraint(character, roleKey);
+  const lock = faceTemplate
+    ? `${faceTemplate.label}：${faceTemplate.note}`
+    : "角色主图与全部变体必须保持同一人物脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致。";
+  return [
+    lock,
+    gender,
+    "真人实拍摄影质感，自然皮肤纹理，不要漫画风、二次元、插画风、夸张美型或换脸感。",
+  ].filter(Boolean).join("；");
+}
+
+function ensureCharacterPrompt(
+  character: ExtractedCharacter,
+  faceTemplate: ExtractedCharacter["faceTemplate"],
+  visualConstraints: string,
+  profile: string,
+) {
+  const templateLine = faceTemplate
+    ? `${faceTemplate.label}（${faceTemplate.url}）`
+    : "同一角色身份锁定";
+  return [
+    "【角色真人模板锁定】",
+    templateLine,
+    "主图和全部变体必须保持同一张脸：脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱、表情动作和剧情状态。",
+    "真人实拍摄影质感，禁止漫画风、二次元、插画风、AI 换脸感或改变角色性别年龄。",
+    "",
+    "【角色档案】",
+    profile,
+    "",
+    "【视觉约束】",
+    visualConstraints,
+    "",
+    "【主图生成要求】",
+    "真人实拍角色设定三视图，纯白背景，左侧面部近景，右侧正面、侧面、背面全身三视图；保持模板脸型五官和面部辨识度一致。",
+  ].join("\n");
+}
+
+function buildExpectedCharacterVariants(
+  character: ExtractedCharacter,
+  faceTemplate: ExtractedCharacter["faceTemplate"],
+  profile: string,
+) {
+  const roleKey = inferCharacterRoleKey(character);
+  const oldVariants = character.variants || [];
+  const identityText = faceTemplate
+    ? `严格参考${faceTemplate.label}，锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；真人实拍质感，禁止漫画风。`
+    : "锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；真人实拍质感，禁止漫画风。";
+  const name = character.name || "角色";
+  const role = character.role || "角色";
+  const storyText = `${profile} ${character.visualHint || ""} ${(character.tags || []).join(" ")}`;
+  const baseVariants: AssetVariant[] = roleKey === "maleLead" || roleKey === "femaleLead"
+    ? buildLeadScenarioVariants(name, storyText, identityText)
+    : [{
+        name: `${name}备用变体`,
+        description: `备用状态：保留${name}作为${role}的角色身份和面部辨识度，仅调整发型、服装、妆造强弱或轻微剧情状态。`,
+        prompt: `人物资产变体，${name}，${role}，备用造型，${identityText}`,
+      }];
+
+  const normalizedBaseVariants = baseVariants.map((variant, index) => ({
+    ...variant,
+    id: oldVariants[index]?.id || `${character.assetId || character.name || "character"}-variant-${index + 1}`,
+    name: shouldReplaceGeneratedVariantName(oldVariants[index]?.name) ? variant.name : oldVariants[index]?.name || variant.name,
+    description: shouldReplaceGeneratedVariantDescription(oldVariants[index]?.description)
+      ? variant.description
+      : oldVariants[index]?.description || variant.description,
+    prompt: shouldReplaceGeneratedVariantPrompt(oldVariants[index]?.prompt)
+      ? variant.prompt
+      : oldVariants[index]?.prompt || variant.prompt,
+    imageUrl: oldVariants[index]?.imageUrl || "",
+    history: oldVariants[index]?.history || [],
+    editInstruction: oldVariants[index]?.editInstruction || "",
+  }));
+  const customExtraVariants = oldVariants.slice(baseVariants.length).map((variant, index) => ({
+    ...variant,
+    id: variant.id || `${character.assetId || character.name || "character"}-custom-variant-${index + 1}`,
+    name: variant.name || `${name}自定义变体${index + 1}`,
+    description: variant.description || "自定义剧情状态：保持同一人物脸型、五官和辨识度，仅根据当前剧情调整发型、服装、妆造和表情。",
+    prompt: variant.prompt || `人物资产变体，${name}，自定义剧情状态，${identityText}`,
+    imageUrl: variant.imageUrl || "",
+    history: variant.history || [],
+    editInstruction: variant.editInstruction || "",
+  }));
+  return [...normalizedBaseVariants, ...customExtraVariants];
+}
+
+function sanitizeCharacterProfile(character: ExtractedCharacter) {
+  const promptProfile = extractPromptSection(character.prompt || "", "【角色档案】");
+  const source = promptProfile || character.description || `${character.name || "角色"}是剧本中的${character.role || "角色"}`;
+  const cleaned = String(source)
+    .replace(/人物：[^。！？!?]*/g, "")
+    .replace(/【角色真人模板锁定】[\s\S]*$/g, "")
+    .replace(/【视觉约束】[\s\S]*$/g, "")
+    .replace(/【主图生成要求】[\s\S]*$/g, "")
+    .replace(/【原始生图提示词】[\s\S]*$/g, "")
+    .replace(/Asset reference sheet[\s\S]*$/gi, "")
+    .replace(/需要根据整体剧本建立稳定、可复用的个人形象；?/g, "")
+    .replace(/资产设定/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalizeCharacterProfileLength(
+    cleaned || `${character.name || "角色"}是剧本中的${character.role || "角色"}`,
+    character.name || "角色",
+    character.role || "角色",
+  );
+}
+
+function extractPromptSection(prompt: string, title: string) {
+  const start = prompt.indexOf(title);
+  if (start < 0) return "";
+  const rest = prompt.slice(start + title.length).trim();
+  const next = rest.search(/\n【/);
+  return (next >= 0 ? rest.slice(0, next) : rest).trim();
+}
+
+function inferCharacterGenderConstraint(character: ExtractedCharacter, roleKey: string) {
+  if (roleKey === "maleLead" || roleKey === "maleSupport") return "性别识别保持男性，不改变年龄层次和人物辨识度。";
+  if (roleKey === "femaleLead" || roleKey === "femaleSupport") return "性别识别保持女性，不改变年龄层次和人物辨识度。";
+  const text = `${character.role || ""} ${character.description || ""}`;
+  if (/男性|男人|男/.test(text)) return "性别识别保持男性，不改变年龄层次和人物辨识度。";
+  if (/女性|女人|女/.test(text)) return "性别识别保持女性，不改变年龄层次和人物辨识度。";
+  return "";
+}
+
+function normalizeCharacterProfileLength(text: string, name: string, role: string) {
+  const sentences = String(text || "")
+    .replace(/\s+/g, " ")
+    .split(/(?<=[。！？!?])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  let profile = sentences.join("");
+  if (!profile) profile = `${name}是剧本中的${role}。`;
+  if (!profile.startsWith(name)) {
+    profile = `${name}是剧本中的${role}。${profile}`;
+  }
+  if (profile.length > 200) {
+    let shortened = "";
+    for (const sentence of sentences) {
+      if ((shortened + sentence).length > 190) break;
+      shortened += sentence;
+    }
+    profile = shortened || profile.slice(0, 190);
+    profile = ensureChineseSentence(profile);
+  }
+  const roleText = role || "角色";
+  const fillers = [
+    `${name}在故事中围绕${roleText}身份承担清晰的叙事功能，处事方式、情绪底色和与主要阵营的关系需要保持连贯。`,
+    `${name}的人物动机应来自剧本中的经历和处境，外在状态可随情节变化，但性格核心、年龄层次、身份气质和辨识记忆点要稳定。`,
+    `${name}的表演应强调可信的生活细节、情绪层次和人物关系张力。`,
+  ];
+  for (const filler of fillers) {
+    if (profile.length >= 120) break;
+    profile += filler;
+  }
+  if (profile.length > 200) {
+    profile = ensureChineseSentence(profile.slice(0, 196));
+  }
+  return ensureChineseSentence(profile);
+}
+
+function buildLeadScenarioVariants(name: string, storyText: string, identityText: string): AssetVariant[] {
+  const normalized = String(storyText || "");
+  const variantSets: Array<{ test: RegExp; items: Array<[string, string, string]> }> = [
+    {
+      test: /末世|丧尸|重生|系统|物资|车队|堡垒|救援|逃亡|尸潮|废土|战斗/,
+      items: [
+        ["末世行动状态", "末世行动状态：适合外出搜寻物资、驾驶车辆、穿越危险区域或推进救援任务，服装利落耐磨，发型可略凌乱。", "末世行动状态，外出搜寻物资或推进救援任务，利落耐磨服装，轻微尘土和紧张感"],
+        ["战斗戒备状态", "战斗戒备状态：适合遭遇丧尸、敌对幸存者或突发危机，表情警觉，动作蓄势，只增强剧情压力感。", "战斗戒备状态，警觉表情，动作蓄势，危机氛围"],
+        ["资源筹备状态", "资源筹备状态：适合整理物资、检查装备、规划路线或做关键决策，服装整洁克制，状态更冷静。", "资源筹备状态，整理装备或规划路线，冷静克制表情"],
+        ["受伤疲惫状态", "受伤疲惫状态：适合奔波、受伤、体力透支或撤离后的剧情，只调整妆发凌乱度、气色和服装污损。", "受伤疲惫状态，妆发略乱，气色疲惫，轻微污损"],
+        ["高压对峙状态", "高压对峙状态：适合背叛、审问、冲突或关键摊牌，表情更压抑锐利，妆造强度略提升。", "高压对峙状态，压抑锐利表情，冲突或摊牌氛围"],
+      ],
+    },
+    {
+      test: /婚礼|婚姻|订婚|豪门|总裁|公司|职场|会议|发布会|商业|办公室/,
+      items: [
+        ["日常职场状态", "日常职场状态：适合办公室、会议前后或常规沟通，服装干练，表情自然克制。", "日常职场状态，干练通勤服装，自然克制表情"],
+        ["正式会面状态", "正式会面状态：适合谈判、发布会、宴会或重要亮相，服装正式，妆造完整但不改变五官。", "正式会面状态，正式服装，完整妆造，重要亮相"],
+        ["情绪拉扯状态", "情绪拉扯状态：适合争执、误会、告白或关系转折，表情有情绪张力，妆造略加强。", "情绪拉扯状态，情绪张力，关系转折氛围"],
+        ["私下独处状态", "私下独处状态：适合居家、车内、休息室或夜间独处，服装更生活化，情绪更松弛。", "私下独处状态，生活化服装，松弛或沉思表情"],
+        ["高光亮相状态", "高光亮相状态：适合婚礼、红毯、宴会或剧情高光，服装更精致，妆造强度提升。", "高光亮相状态，精致服装，剧情高光氛围"],
+      ],
+    },
+    {
+      test: /校园|学校|学生|校服|课堂|社团|考试|青春/,
+      items: [
+        ["校园日常状态", "校园日常状态：适合课堂、走廊、宿舍或校园对白，服装清爽自然，表情生活化。", "校园日常状态，清爽自然服装，生活化表情"],
+        ["校服版本", "校服版本：适合上课、集会或校园关键场景，仅替换为剧本指定校服和对应发型。", "校服版本，剧本指定校服，校园场景"],
+        ["奔跑追逐状态", "奔跑追逐状态：适合操场、雨中、追赶或突发事件，发型可有轻微动态变化。", "奔跑追逐状态，轻微动态感，校园突发事件"],
+        ["低落独处状态", "低落独处状态：适合天台、教室角落或夜间独处，表情压抑，妆造保持自然。", "低落独处状态，压抑情绪，独处氛围"],
+        ["青春高光状态", "青春高光状态：适合获奖、告白、舞台或毕业等高光场景，状态更明亮。", "青春高光状态，明亮情绪，校园高光场景"],
+      ],
+    },
+    {
+      test: /古代|宫廷|王爷|皇|将军|江湖|仙侠|修仙|宗门|朝堂/,
+      items: [
+        ["常服对白状态", "常服对白状态：适合日常交谈、府邸或客栈场景，服装相对简洁，表情克制。", "古风常服对白状态，简洁服装，克制表情"],
+        ["行动赶路状态", "行动赶路状态：适合江湖行走、追查、赶路或潜入，服装更利落，发型可略有变化。", "行动赶路状态，利落古风服装，轻微动态感"],
+        ["朝堂礼服状态", "朝堂礼服状态：适合宫廷、朝堂、仪式或重要会面，服装更正式，妆造完整。", "朝堂礼服状态，正式古风服饰，仪式氛围"],
+        ["受伤虚弱状态", "受伤虚弱状态：适合中毒、受伤、战后或病弱剧情，只调整气色、妆发凌乱度和服装破损。", "受伤虚弱状态，气色疲惫，轻微破损"],
+        ["对峙爆发状态", "对峙爆发状态：适合决裂、审问、战前或情绪爆发，表情更锋利，服装保持同一体系。", "对峙爆发状态，锋利表情，冲突氛围"],
+      ],
+    },
+  ];
+  const selected = variantSets.find((set) => set.test.test(normalized))?.items || [
+    ["日常对白状态", "日常对白状态：适合常规对白和生活场景，服装自然，表情克制，保持同一人物脸型五官。", "日常对白状态，生活化服装，自然表情"],
+    ["外出行动状态", "外出行动状态：适合移动、调查、赴约或推进剧情，服装更利落，发型可略有变化。", "外出行动状态，利落服装，轻微动态感"],
+    ["高压情绪状态", "高压情绪状态：适合冲突、对峙、误会或关键抉择，妆造略加强，表情更有压力。", "高压情绪状态，表情紧绷，妆造略加强"],
+    ["疲惫受挫状态", "疲惫受挫状态：适合长时间奔波、受伤、崩溃或失落后的剧情，只改变气色和妆发状态。", "疲惫受挫状态，妆发略乱，气色疲惫"],
+    ["高光亮相状态", "高光亮相状态：适合会面、仪式、反转或高光出场，服装更正式，妆造更完整。", "高光亮相状态，正式服装，完整妆造"],
+  ];
+
+  return selected.slice(0, 5).map(([suffix, description, promptDetail]) => ({
+    name: `${name}${suffix}`,
+    description: ensureChineseSentence(description),
+    prompt: `人物资产变体，${name}，${promptDetail}，${identityText}`,
+  }));
+}
+
+function shouldReplaceGeneratedVariantName(value?: string) {
+  if (!value?.trim()) return true;
+  return /(日常对白状态|外出行动状态|高压情绪状态|受伤疲惫状态|正式亮相状态|疲惫受挫状态|备用变体|制服版本)$/.test(value);
+}
+
+function shouldReplaceGeneratedVariantDescription(value?: string) {
+  if (!value?.trim()) return true;
+  return /^(日常对白状态|外出行动状态|高压情绪状态|受伤疲惫状态|正式亮相状态|备用状态|制服版本)：/.test(value);
+}
+
+function shouldReplaceGeneratedVariantPrompt(value?: string) {
+  if (!value?.trim()) return true;
+  return /^人物资产变体/.test(value);
+}
+
+function ensureChineseSentence(text: string) {
+  const cleaned = String(text || "").replace(/\s+/g, " ").replace(/\.\.\.|…/g, "").trim();
+  if (!cleaned) return "";
+  return /[。！？!?]$/.test(cleaned) ? cleaned : `${cleaned}。`;
+}
 
 function getAssetKey(asset: WorkbenchAsset, index: number, tab: AssetTab) {
   return asset.assetId || `${tab}:${asset.name}:${index}`;
@@ -233,6 +544,15 @@ export default function ImportPage({
   const [assetGeneratingTargets, setAssetGeneratingTargets] = useState<string[]>([]);
   const [assetUploadingTarget, setAssetUploadingTarget] = useState<string | null>(null);
   const [assetEditingTarget, setAssetEditingTarget] = useState<string | null>(null);
+  const [draftHydrated, setDraftHydrated] = useState(false);
+  const [imagePreview, setImagePreview] = useState<{ title: string; imageUrl: string } | null>(null);
+  const [historyDialog, setHistoryDialog] = useState<{
+    title: string;
+    tab: AssetTab;
+    assetIndex: number;
+    variantIndex?: number;
+    entries: Array<Record<string, unknown>>;
+  } | null>(null);
 
   const isAssetGenerating = useCallback(
     (targetKey: string) => assetGeneratingTargets.includes(targetKey),
@@ -375,7 +695,7 @@ export default function ImportPage({
             voices?: ExtractedAsset[];
             relationships?: Array<{ characterA: string; characterB: string; relationType: string; description?: string }>;
           } | undefined;
-          if (assetMeta?.characters) setCharacters(assetMeta.characters);
+          if (assetMeta?.characters) setCharacters(normalizeImportedCharacters(assetMeta.characters));
           if (assetMeta?.items) setItems(assetMeta.items);
           if (assetMeta?.environments) setEnvironments(assetMeta.environments);
           if (assetMeta?.voices) setVoices(assetMeta.voices);
@@ -408,7 +728,7 @@ export default function ImportPage({
           if (typeof draft.fullText === "string") setFullText(draft.fullText);
           if (Array.isArray(draft.reviewIssues)) setReviewIssues(draft.reviewIssues);
           if (draft.storyAnalysis !== undefined) setStoryAnalysis(draft.storyAnalysis ?? null);
-          if (Array.isArray(draft.characters)) setCharacters(draft.characters);
+          if (Array.isArray(draft.characters)) setCharacters(normalizeImportedCharacters(draft.characters));
           if (Array.isArray(draft.items)) setItems(draft.items);
           if (Array.isArray(draft.environments)) setEnvironments(draft.environments);
           if (Array.isArray(draft.voices)) setVoices(draft.voices);
@@ -426,18 +746,18 @@ export default function ImportPage({
         // No draft/logs, fresh import
       } finally {
         draftHydratedRef.current = true;
+        setDraftHydrated(true);
       }
     }
     loadDraftAndLogs();
   }, [projectId]);
 
   useEffect(() => {
-    if (!draftHydratedRef.current || !forceAssetWorkbench) return;
-    skipNextDraftSaveRef.current = true;
+    if (!draftHydrated || !forceAssetWorkbench) return;
     setHistoryMode(false);
     setSelectedStep(null);
     setCurrentStep(3);
-  }, [forceAssetWorkbench]);
+  }, [draftHydrated, forceAssetWorkbench]);
 
   useEffect(() => {
     if (!draftHydratedRef.current) return;
@@ -908,7 +1228,7 @@ export default function ImportPage({
         throw new Error(errData.error || `HTTP ${res.status}`);
       }
       const data = await res.json();
-      setCharacters(data.characters);
+      setCharacters(normalizeImportedCharacters(data.characters));
       setItems(data.items || []);
       setEnvironments(data.environments || []);
       setVoices(data.voices || []);
@@ -921,7 +1241,7 @@ export default function ImportPage({
         ...buildDraftPayload(),
         currentStep: 3,
         stepStatus: { ...stepStatus, 3: "done" },
-        characters: data.characters,
+        characters: normalizeImportedCharacters(data.characters),
         items: data.items || [],
         environments: data.environments || [],
         voices: data.voices || [],
@@ -1187,7 +1507,7 @@ export default function ImportPage({
   };
 
   const showStoryReview = currentStep === 2 && stepStatus[1] === "done" && stepStatus[2] !== "done" && !historyMode;
-  const showCharReview = (forceAssetWorkbench || (stepStatus[3] === "done" && stepStatus[4] === "idle")) && !historyMode;
+  const showCharReview = forceAssetWorkbench || ((stepStatus[3] === "done" && stepStatus[4] === "idle") && !historyMode);
   const showEpReview = stepStatus[4] === "done" && stepStatus[5] === "idle" && !historyMode;
   const hideParseStep = stepStatus[2] === "done" || currentStep >= 3;
   const visibleSteps = hideParseStep ? STEPS.filter(({ num }) => num !== 1) : STEPS;
@@ -1252,6 +1572,13 @@ export default function ImportPage({
     return setVoices as Dispatch<SetStateAction<WorkbenchAsset[]>>;
   }
 
+  function getWorkbenchAssetList(tab: AssetTab): WorkbenchAsset[] {
+    if (tab === "characters") return characters;
+    if (tab === "items") return items;
+    if (tab === "environments") return environments;
+    return voices;
+  }
+
   function assetCategoryForTab(tab: AssetTab) {
     if (tab === "items") return "props";
     if (tab === "environments") return "scenes";
@@ -1277,6 +1604,7 @@ export default function ImportPage({
       provider: result.provider || "manual-upload",
       status: result.status || "succeeded",
       imageUrl: result.imageUrl || "",
+      audioUrl: result.audioUrl || "",
       note,
     };
   }
@@ -1310,6 +1638,179 @@ export default function ImportPage({
     setter((prev) => prev.map((asset, index) => index === assetIndex ? patcher(asset) : asset));
   }
 
+  function updateWorkbenchVariant(variantIndex: number, patch: Partial<AssetVariant>) {
+    if (activeWorkbenchAssetIndex < 0) return;
+    patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+      const variants = [...(current.variants || [])];
+      const currentVariant = variants[variantIndex];
+      if (!currentVariant) return current;
+      variants[variantIndex] = { ...currentVariant, ...patch };
+      return { ...current, variants };
+    });
+  }
+
+  function addWorkbenchVariant() {
+    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
+    patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+      const nextIndex = (current.variants || []).length + 1;
+      const isCharacter = activeAssetTab === "characters";
+      const variantName = `${current.name || "资产"}自定义变体${nextIndex}`;
+      return {
+        ...current,
+        variants: [
+          ...(current.variants || []),
+          {
+            id: `${current.assetId || current.name || "asset"}-variant-${Date.now()}-${nextIndex}`,
+            name: variantName,
+            description: isCharacter
+              ? "自定义剧情状态：保持同一人物脸型、五官和辨识度，仅根据当前剧情调整发型、服装、妆造和表情。"
+              : "自定义变体：根据当前使用场景调整状态、角度或细节。",
+            prompt: isCharacter
+              ? `人物资产变体，${current.name || "角色"}，自定义剧情状态，严格保持同一角色身份、脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；只允许调整发型、服装、妆造强弱和剧情状态，真人实拍质感。`
+              : "基于主图生成指定变体，不改变资产身份。",
+            imageUrl: "",
+            history: [],
+            editInstruction: "",
+          },
+        ],
+      };
+    });
+    toast.success("已新增自定义变体");
+  }
+
+  function renameWorkbenchAsset(tab: AssetTab, assetIndex: number) {
+    const list = getWorkbenchAssetList(tab);
+    const asset = list[assetIndex];
+    if (!asset) return;
+    const nextName = window.prompt("请输入新的名称", asset.name)?.trim();
+    if (!nextName || nextName === asset.name) return;
+    patchWorkbenchAsset(tab, assetIndex, (current) => ({
+      ...current,
+      name: nextName,
+      mainImageName: current.mainImageName === current.name || !current.mainImageName ? nextName : current.mainImageName,
+      visualHint: current.visualHint === current.name || !current.visualHint ? nextName : current.visualHint,
+    }));
+    if (tab === activeAssetTab && getAssetKey(asset, assetIndex, tab) === activeAssetKey) {
+      setActiveAssetKey(getAssetKey({ ...asset, name: nextName }, assetIndex, tab));
+    }
+    toast.success("名称已更新");
+  }
+
+  function deleteWorkbenchAsset(tab: AssetTab, assetIndex: number) {
+    const list = getWorkbenchAssetList(tab);
+    const asset = list[assetIndex];
+    if (!asset) return;
+    if (!window.confirm(`确定删除「${asset.name}」吗？`)) return;
+    const key = getAssetKey(asset, assetIndex, tab);
+    const setter = getAssetSetter(tab);
+    setter((prev) => prev.filter((_, index) => index !== assetIndex));
+    setActiveAssetKey((current) => (current === key ? "" : current));
+    toast.success("已删除资产");
+  }
+
+  function makeVariantPromptFromDescription(asset: WorkbenchAsset, variant: AssetVariant, tab: AssetTab) {
+    const description = String(variant.description || variant.prompt || "").trim();
+    const variantName = String(variant.name || "").trim();
+    const identityRule = tab === "characters"
+      ? "严格保持主图同一角色身份、脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；只允许改变发型、服装、妆造强弱、表情动作和剧情状态；真人实拍质感，禁止漫画、二次元、插画风。"
+      : "严格保持同一资产的核心造型、材质、比例和辨识度；只围绕变体要求调整状态、角度、细节或剧情使用状态。";
+    return [
+      variantName ? `变体名称：${variantName}` : "",
+      description ? `变体生成要求：${description}` : "",
+      identityRule,
+      asset.faceTemplate?.label ? `参考模板：${asset.faceTemplate.label}` : "",
+      asset.faceTemplate?.note ? `模板约束：${asset.faceTemplate.note}` : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  function resolveVariantPrompt(asset: WorkbenchAsset, variant: AssetVariant, tab: AssetTab) {
+    const variantPrompt = makeVariantPromptFromDescription(asset, variant, tab);
+    const basePrompt = String(asset.prompt || "").trim();
+    if (!variantPrompt.trim()) return basePrompt;
+    return [
+      basePrompt,
+      "基于主图生成指定变体，不改变资产身份：",
+      variantPrompt,
+    ].filter(Boolean).join("\n\n");
+  }
+
+  function openImagePreview(title: string, imageUrl?: string) {
+    if (!imageUrl) {
+      toast.error("暂无可预览图片");
+      return;
+    }
+    setImagePreview({ title, imageUrl });
+  }
+
+  function playVoiceSample(audioUrl?: string) {
+    if (!audioUrl) {
+      toast.error("请先上传音频");
+      return;
+    }
+    const audio = new Audio(displayImageUrl(audioUrl));
+    void audio.play().catch(() => toast.error("音频播放失败"));
+  }
+
+  function openAssetHistory(tab: AssetTab, assetIndex: number) {
+    const list = getWorkbenchAssetList(tab);
+    const asset = list[assetIndex] as WorkbenchAsset | undefined;
+    const entries = asset?.history || [];
+    if (!entries.length) {
+      toast.error("暂无生图历史");
+      return;
+    }
+    setHistoryDialog({
+      title: `${asset?.name || "资产"} 生图历史`,
+      tab,
+      assetIndex,
+      entries,
+    });
+  }
+
+  function openVariantHistory(tab: AssetTab, assetIndex: number, variantIndex: number) {
+    const list = getWorkbenchAssetList(tab);
+    const asset = list[assetIndex] as WorkbenchAsset | undefined;
+    const variant = asset?.variants?.[variantIndex];
+    const entries = variant?.history || [];
+    if (!entries.length) {
+      toast.error("暂无生图历史");
+      return;
+    }
+    setHistoryDialog({
+      title: `${asset?.name || "资产"} · ${variant?.name || "变体"} 生图历史`,
+      tab,
+      assetIndex,
+      variantIndex,
+      entries,
+    });
+  }
+
+  function restoreHistoryImage(
+    tab: AssetTab,
+    assetIndex: number,
+    imageUrl: string,
+    variantIndex?: number,
+  ) {
+    if (!imageUrl) return;
+    patchWorkbenchAsset(tab, assetIndex, (current) => {
+      if (typeof variantIndex === "number") {
+        const variants = [...(current.variants || [])];
+        const currentVariant = variants[variantIndex];
+        if (!currentVariant) return current;
+        variants[variantIndex] = { ...currentVariant, imageUrl };
+        return { ...current, variants };
+      }
+      return { ...current, imageUrl };
+    });
+    toast.success("已恢复历史图片");
+  }
+
+  function restoreHistoryAudio(tab: AssetTab, assetIndex: number, audioUrl: string) {
+    if (!audioUrl || tab !== "voices") return;
+    patchWorkbenchAsset(tab, assetIndex, (current) => ({ ...current, audioUrl }));
+    toast.success("已恢复历史音频");
+  }
+
   async function generateWorkbenchAsset(
     tab: AssetTab,
     assetIndex: number,
@@ -1323,7 +1824,7 @@ export default function ImportPage({
 
     const variant = typeof variantIndex === "number" ? asset.variants?.[variantIndex] : undefined;
     const target = variant || asset;
-    const prompt = target.prompt || asset.prompt || "";
+    const prompt = variant ? resolveVariantPrompt(asset, variant, tab) : (target.prompt || asset.prompt || "");
     if (!prompt.trim()) {
       toast.error(t("assetPromptMissing"));
       return false;
@@ -1512,8 +2013,14 @@ export default function ImportPage({
   }
 
   async function uploadWorkbenchImage(file: File, variantIndex?: number) {
-    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
-    if (!file.type.startsWith("image/")) {
+    if (activeWorkbenchAssetIndex < 0) return;
+    const isVoice = activeAssetTab === "voices";
+    if (isVoice && typeof variantIndex === "number") return;
+    if (isVoice && !file.type.startsWith("audio/")) {
+      toast.error("请选择音频文件");
+      return;
+    }
+    if (!isVoice && !file.type.startsWith("image/")) {
       toast.error("请选择图片文件");
       return;
     }
@@ -1522,12 +2029,13 @@ export default function ImportPage({
     try {
       const formData = new FormData();
       formData.append("file", file);
+      formData.append("kind", isVoice ? "audio" : "image");
       formData.append("targetType", typeof variantIndex === "number" ? "variant" : "main");
       formData.append("targetName", typeof variantIndex === "number"
         ? activeWorkbenchAsset?.variants?.[variantIndex]?.name || ""
         : activeWorkbenchAsset?.name || "");
 
-      const res = await apiFetch(`/api/projects/${projectId}/import/upload-image`, {
+      const res = await apiFetch(`/api/projects/${projectId}/import/${isVoice ? "upload-asset" : "upload-image"}`, {
         method: "POST",
         body: formData,
       });
@@ -1536,6 +2044,13 @@ export default function ImportPage({
 
       patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
         const historyEntry = makeManualHistoryEntry(result, "手动上传");
+        if (isVoice) {
+          return {
+            ...current,
+            audioUrl: result.audioUrl || "",
+            history: [historyEntry, ...(current.history || [])],
+          };
+        }
         if (typeof variantIndex === "number") {
           const variants = [...(current.variants || [])];
           const currentVariant = variants[variantIndex];
@@ -1554,7 +2069,7 @@ export default function ImportPage({
         };
       });
 
-      toast.success("图片已上传");
+      toast.success(isVoice ? "音频已上传" : "图片已上传");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "上传失败");
     } finally {
@@ -1562,15 +2077,83 @@ export default function ImportPage({
     }
   }
 
-  function updateVariantEditInstruction(variantIndex: number, editInstruction: string) {
+  function updateMainEditInstruction(editInstruction: string) {
     if (activeWorkbenchAssetIndex < 0) return;
-    patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
-      const variants = [...(current.variants || [])];
-      const currentVariant = variants[variantIndex];
-      if (!currentVariant) return current;
-      variants[variantIndex] = { ...currentVariant, editInstruction };
-      return { ...current, variants };
-    });
+    patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => ({ ...current, editInstruction }));
+  }
+
+  function updateVariantEditInstruction(variantIndex: number, editInstruction: string) {
+    updateWorkbenchVariant(variantIndex, { editInstruction });
+  }
+
+  async function editWorkbenchMainImage() {
+    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
+    const asset = activeWorkbenchAsset;
+    if (!asset) return;
+    if (!asset.imageUrl) {
+      toast.error("请先生成或上传主图");
+      return;
+    }
+    const editInstruction = String(asset.editInstruction || "").trim();
+    if (!editInstruction) {
+      toast.error("请先填写主图改图要求");
+      return;
+    }
+
+    const targetKey = `${activeAssetTab}:${activeWorkbenchAssetIndex}:main`;
+    setAssetEditingTarget(targetKey);
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/import/edit-image`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageUrl: asset.imageUrl,
+          editPrompt: editInstruction,
+          prompt: asset.prompt || "",
+          negativePrompt: asset.negativePrompt,
+          category: assetCategoryForTab(activeAssetTab),
+          asset,
+          size: sizeForAssetTab(activeAssetTab),
+          targetName: getAssetPreviewLabel(asset, activeAssetTab),
+          targetType: "main-edit",
+        }),
+      });
+      const result = await res.json();
+      if (!res.ok || result.status !== "succeeded" || !result.imageUrl) {
+        throw new Error(result.error || result.message || "改图失败");
+      }
+
+      patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+        const historyEntry = {
+          ...makeHistoryEntry(result),
+          editInstruction,
+          sourceImageUrl: current.imageUrl || "",
+        };
+        return {
+          ...current,
+          imageUrl: result.imageUrl || current.imageUrl,
+          editInstruction: "",
+          history: [historyEntry, ...(current.history || [])],
+        };
+      });
+
+      toast.success("主图已改图");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "改图失败";
+      patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => ({
+        ...current,
+        history: [{
+          at: new Date().toISOString(),
+          provider: "jimapi:image-edit",
+          status: "failed",
+          editInstruction,
+          error: msg,
+        }, ...(current.history || [])],
+      }));
+      toast.error(msg);
+    } finally {
+      setAssetEditingTarget(null);
+    }
   }
 
   async function editWorkbenchVariant(variantIndex: number) {
@@ -1597,7 +2180,7 @@ export default function ImportPage({
         body: JSON.stringify({
           imageUrl: variant.imageUrl,
           editPrompt: editInstruction,
-          prompt: variant.prompt || asset.prompt || "",
+          prompt: resolveVariantPrompt(asset, variant, activeAssetTab),
           negativePrompt: asset.negativePrompt,
           category: assetCategoryForTab(activeAssetTab),
           asset,
@@ -1699,6 +2282,45 @@ export default function ImportPage({
       }
     } finally {
       endAssetGenerating(categoryTargetKey);
+    }
+  }
+
+  async function generateAllMainImages() {
+    const tabs: AssetTab[] = ["characters", "items", "environments"];
+    const jobs: Array<{ tab: AssetTab; assetIndex: number }> = [];
+    for (const tab of tabs) {
+      const list = tab === "characters" ? characters : tab === "items" ? items : environments;
+      for (let assetIndex = 0; assetIndex < list.length; assetIndex += 1) {
+        jobs.push({ tab, assetIndex });
+      }
+    }
+    if (!jobs.length) return;
+
+    const targetKey = "all:main";
+    beginAssetGenerating(targetKey);
+    let successCount = 0;
+    let nextIndex = 0;
+
+    async function runner() {
+      while (nextIndex < jobs.length) {
+        const job = jobs[nextIndex++];
+        const ok = await generateWorkbenchAsset(job.tab, job.assetIndex, undefined, {
+          quiet: true,
+          keepBusy: true,
+        });
+        if (ok) successCount += 1;
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(10, jobs.length) }, () => runner()));
+      if (successCount > 0) {
+        toast.success(`已生成 ${successCount}/${jobs.length} 张主图`);
+      } else {
+        toast.error("图片生成失败，请检查 image2/JimAPI 密钥配置");
+      }
+    } finally {
+      endAssetGenerating(targetKey);
     }
   }
 
@@ -2290,6 +2912,23 @@ export default function ImportPage({
                 <Button
                   type="button"
                   variant="outline"
+                  onClick={generateAllMainImages}
+                  disabled={
+                    characters.length + items.length + environments.length === 0
+                    || isAssetGenerating("all:main")
+                  }
+                  className="rounded-xl"
+                >
+                  {isAssetGenerating("all:main") ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Images className="size-4" />
+                  )}
+                  一键生成所有主图
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
                   onClick={confirmAllWorkbenchAssets}
                   disabled={allWorkbenchAssets.length === 0 || allAssetsConfirmed}
                   className="rounded-xl"
@@ -2369,23 +3008,46 @@ export default function ImportPage({
                       const key = getAssetKey(asset, index, activeAssetTab);
                       const isActive = key === activeWorkbenchKey;
                       return (
-                        <button
+                        <div
                           key={key}
-                          onClick={() => setActiveAssetKey(key)}
-                          className={`mb-1.5 grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg border p-2 text-left transition-colors ${
+                          className={`mb-1.5 grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-1 rounded-lg border p-1.5 transition-colors ${
                             isActive
                               ? "border-primary/50 bg-primary/8"
                               : "border-transparent bg-white hover:border-[--border-hover]"
                           }`}
                         >
-                          <span className="min-w-0">
+                          <button
+                            type="button"
+                            onClick={() => setActiveAssetKey(key)}
+                            className="min-w-0 rounded-md px-1 py-0.5 text-left"
+                          >
                             <span className="block truncate text-xs font-bold text-[--text-primary]">{asset.name}</span>
                             <span className="mt-0.5 block truncate text-[10px] text-[--text-muted]">
                               {(asset.role || asset.visualHint || assetTabInfo(activeAssetTab).label)} · {formatEpisodeRefs(asset.episodes)}
                             </span>
-                          </span>
-                          <span className={`h-2 w-2 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
-                        </button>
+                          </button>
+                          <div className="flex items-center gap-1">
+                            <span className={`mr-1 h-2 w-2 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
+                            <Button
+                              type="button"
+                              size="icon-xs"
+                              variant="ghost"
+                              title="改名"
+                              onClick={() => renameWorkbenchAsset(activeAssetTab, index)}
+                            >
+                              <Pencil className="size-3" />
+                            </Button>
+                            <Button
+                              type="button"
+                              size="icon-xs"
+                              variant="ghost"
+                              title="删除"
+                              onClick={() => deleteWorkbenchAsset(activeAssetTab, index)}
+                            >
+                              <Trash2 className="size-3" />
+                            </Button>
+                          </div>
+                        </div>
                       );
                     })
                   )}
@@ -2426,28 +3088,6 @@ export default function ImportPage({
 
                     <div className="grid gap-4 lg:grid-cols-2">
                       <div className="grid min-h-[520px] gap-3 rounded-xl border border-[--border-subtle] bg-white p-3">
-                        <div className="grid gap-3 rounded-xl border border-[--border-subtle] bg-[--surface] p-3">
-                          <div className="grid gap-1">
-                            <div className="text-xs font-bold text-[--text-secondary]">{t("assetDescription")}</div>
-                            <p className="text-xs leading-relaxed text-[--text-muted]">{activeWorkbenchAsset.description || "-"}</p>
-                          </div>
-                          {activeAssetTab === "characters" && (
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => updateActiveWorkbenchAsset({ scope: activeWorkbenchAsset.scope === "main" ? "guest" : "main" })}
-                                className={`rounded-lg px-2 py-1 text-xs font-bold ${
-                                  activeWorkbenchAsset.scope === "main"
-                                    ? "bg-blue-50 text-blue-600"
-                                    : "bg-purple-50 text-purple-600"
-                                }`}
-                              >
-                                {activeWorkbenchAsset.scope === "main" ? t("main") : t("guest")}
-                              </button>
-                              <span className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || ""}</span>
-                            </div>
-                          )}
-                        </div>
-
                         <div className="grid gap-2">
                           <div className="flex items-center justify-between">
                             <label className="text-xs font-bold text-[--text-secondary]">
@@ -2458,35 +3098,19 @@ export default function ImportPage({
                           <Textarea
                             value={activeWorkbenchAsset.prompt || ""}
                             onChange={(event) => updateActiveWorkbenchAsset({ prompt: event.target.value })}
-                            className="min-h-[320px] flex-1 resize-y rounded-xl bg-white font-mono text-xs leading-relaxed"
+                            className="min-h-[380px] flex-1 resize-y rounded-xl bg-white font-mono text-xs leading-relaxed"
                           />
                         </div>
-
-                        {activeAssetTab !== "voices" && (
-                          <div className="grid gap-2">
-                            <label className="text-xs font-bold text-[--text-secondary]">{t("assetNegativePrompt")}</label>
-                            <Textarea
-                              value={activeWorkbenchAsset.negativePrompt || ""}
-                              onChange={(event) => updateActiveWorkbenchAsset({ negativePrompt: event.target.value })}
-                              className="min-h-20 resize-y rounded-xl bg-white text-xs leading-relaxed"
-                            />
-                          </div>
-                        )}
                       </div>
 
                       <div className="grid min-h-[520px] content-start gap-3 rounded-xl border border-[--border-subtle] bg-white p-3">
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0 flex-1">
-                            <div className="text-xs font-bold text-[--text-secondary]">{t("assetMainImageName")}</div>
-                            <Input
-                              value={getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab)}
-                              onChange={(event) => updateActiveWorkbenchAsset({ mainImageName: event.target.value, visualHint: event.target.value })}
-                              disabled={activeAssetTab === "voices"}
-                              className="mt-1 h-9 rounded-lg text-xs font-semibold"
-                            />
-                          </div>
-                          {activeAssetTab !== "voices" && (
-                            <div className="flex shrink-0 flex-wrap justify-end gap-2 pt-5">
+                        {activeAssetTab === "voices" ? (
+                          <div className="grid gap-4">
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <div className="text-xs font-bold text-[--text-secondary]">音频样本</div>
+                                <div className="mt-1 text-xs text-[--text-muted]">上传角色参考音频后可直接试听。</div>
+                              </div>
                               <Button
                                 size="sm"
                                 variant="outline"
@@ -2498,10 +3122,10 @@ export default function ImportPage({
                                 ) : (
                                   <Upload className="size-3.5" />
                                 )}
-                                上传主图
+                                上传音频
                                 <input
                                   type="file"
-                                  accept="image/*"
+                                  accept="audio/*"
                                   className="absolute inset-0 cursor-pointer opacity-0"
                                   onChange={(event) => {
                                     const selectedFile = event.target.files?.[0];
@@ -2512,63 +3136,198 @@ export default function ImportPage({
                               </Button>
                               <Button
                                 size="sm"
-                                onClick={() => generateActiveWorkbenchAsset()}
-                                disabled={isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex)}
+                                onClick={() => playVoiceSample(activeWorkbenchAsset.audioUrl)}
+                                disabled={!activeWorkbenchAsset.audioUrl}
                                 className="rounded-lg"
                               >
-                                {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:main`) ? (
-                                  <Loader2 className="size-3.5 animate-spin" />
-                                ) : (
-                                  <ImageIcon className="size-3.5" />
-                                )}
-                                {activeWorkbenchAsset.imageUrl ? t("assetRegenerateMain") : t("assetGenerateMain")}
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                onClick={generateCurrentAssetTab}
-                                disabled={hasAssetGenerationInTab(activeAssetTab)}
-                                className="rounded-lg"
-                              >
-                                {isAssetGenerating(`${activeAssetTab}:category`) ? (
-                                  <Loader2 className="size-3.5 animate-spin" />
-                                ) : (
-                                  <Images className="size-3.5" />
-                                )}
-                                {t("assetGenerateCurrentType")}
+                                <Play className="size-3.5" />
+                                播放
                               </Button>
                             </div>
-                          )}
-                        </div>
+                            <div className="rounded-xl border border-[--border-subtle] bg-[--surface] p-4">
+                              {activeWorkbenchAsset.audioUrl ? (
+                                <div className="grid gap-3">
+                                  <audio controls src={displayImageUrl(activeWorkbenchAsset.audioUrl)} className="w-full" />
+                                  <div className="flex justify-end gap-2">
+                                    <Button
+                                      size="xs"
+                                      variant="outline"
+                                      onClick={() => openAssetHistory(activeAssetTab, activeWorkbenchAssetIndex)}
+                                      disabled={!activeWorkbenchAsset.history?.length}
+                                    >
+                                      <History className="size-3" />
+                                      上传历史{activeWorkbenchAsset.history?.length ? ` ${activeWorkbenchAsset.history.length}` : ""}
+                                    </Button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex min-h-[260px] items-center justify-center text-sm font-bold text-[--text-primary]">
+                                  未上传音频
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="text-xs font-bold text-[--text-secondary]">{t("assetMainImageName")}</div>
+                              <Input
+                                value={getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab)}
+                                onChange={(event) => updateActiveWorkbenchAsset({ mainImageName: event.target.value, visualHint: event.target.value })}
+                                className="mt-1 h-9 rounded-lg text-xs font-semibold"
+                              />
+                            </div>
+                              <div className="flex shrink-0 flex-wrap justify-end gap-2 pt-5">
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={Boolean(assetUploadingTarget)}
+                                  className="relative overflow-hidden rounded-lg"
+                                >
+                                  {assetUploadingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                  ) : (
+                                    <Upload className="size-3.5" />
+                                  )}
+                                  上传主图
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    className="absolute inset-0 cursor-pointer opacity-0"
+                                    onChange={(event) => {
+                                      const selectedFile = event.target.files?.[0];
+                                      event.target.value = "";
+                                      if (selectedFile) void uploadWorkbenchImage(selectedFile);
+                                    }}
+                                  />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  onClick={() => generateActiveWorkbenchAsset()}
+                                  disabled={isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex)}
+                                  className="rounded-lg"
+                                >
+                                  {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:main`) ? (
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                  ) : (
+                                    <ImageIcon className="size-3.5" />
+                                  )}
+                                  {activeWorkbenchAsset.imageUrl ? t("assetRegenerateMain") : t("assetGenerateMain")}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={generateCurrentAssetTab}
+                                  disabled={hasAssetGenerationInTab(activeAssetTab)}
+                                  className="rounded-lg"
+                                >
+                                  {isAssetGenerating(`${activeAssetTab}:category`) ? (
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                  ) : (
+                                    <Images className="size-3.5" />
+                                  )}
+                                  {t("assetGenerateCurrentType")}
+                                </Button>
+                              </div>
+                          </div>
 
-                        <div className="relative flex aspect-[16/10] min-h-[360px] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
+                          <div className="relative flex aspect-[16/10] min-h-[360px] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
                           {activeWorkbenchAsset.imageUrl ? (
                             <>
-                              <Button
-                                type="button"
-                                size="icon"
-                                variant="secondary"
-                                className="absolute right-3 top-3 z-10 h-8 w-8 rounded-lg bg-white/90 shadow-sm hover:bg-white"
-                                title="下载图片"
-                                onClick={() => downloadWorkbenchImage(
-                                  activeWorkbenchAsset.imageUrl || "",
-                                  getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab),
-                                )}
-                              >
-                                <Download className="size-4" />
-                              </Button>
+                              <div className="absolute right-3 top-3 z-10 flex gap-1.5">
+                                <Button
+                                  type="button"
+                                  size="icon-sm"
+                                  variant="secondary"
+                                  className="bg-white/90 shadow-sm hover:bg-white"
+                                  title="放大预览"
+                                  onClick={() => openImagePreview(
+                                    getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab),
+                                    activeWorkbenchAsset.imageUrl,
+                                  )}
+                                >
+                                  <Maximize2 className="size-4" />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="icon-sm"
+                                  variant="secondary"
+                                  className="bg-white/90 shadow-sm hover:bg-white"
+                                  title="下载图片"
+                                  onClick={() => downloadWorkbenchImage(
+                                    activeWorkbenchAsset.imageUrl || "",
+                                    getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab),
+                                  )}
+                                >
+                                  <Download className="size-4" />
+                                </Button>
+                              </div>
                               {/* eslint-disable-next-line @next/next/no-img-element */}
                               <img src={displayImageUrl(activeWorkbenchAsset.imageUrl || "")} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
                             </>
                           ) : (
                             <div className="grid gap-1 text-center">
                               <div className="text-sm font-bold text-[--text-primary]">
-                                {activeAssetTab === "voices" ? activeWorkbenchAsset.name : t("assetNoImage")}
+                                {t("assetNoImage")}
                               </div>
                               <div className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || assetTabInfo(activeAssetTab).label}</div>
                             </div>
                           )}
-                        </div>
+                          </div>
+                          <div className="grid gap-2 rounded-lg border border-[--border-subtle] bg-[--surface] p-2">
+                            <Textarea
+                              value={activeWorkbenchAsset.editInstruction || ""}
+                              onChange={(event) => updateMainEditInstruction(event.target.value)}
+                              placeholder="输入主图改图要求，例如：服装更正式，表情更克制，保持同一角色脸型五官"
+                              className="min-h-16 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                            />
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="text-[10px] text-[--text-muted]">主形象三视图功能</span>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Button
+                                  size="xs"
+                                  variant="outline"
+                                  onClick={editWorkbenchMainImage}
+                                  disabled={
+                                    Boolean(assetEditingTarget)
+                                    || !activeWorkbenchAsset.imageUrl
+                                    || !activeWorkbenchAsset.editInstruction?.trim()
+                                  }
+                                >
+                                  {assetEditingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:main` ? (
+                                    <Loader2 className="size-3 animate-spin" />
+                                  ) : (
+                                    <Pencil className="size-3" />
+                                  )}
+                                  改图
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  variant="outline"
+                                  onClick={() => openAssetHistory(activeAssetTab, activeWorkbenchAssetIndex)}
+                                  disabled={!activeWorkbenchAsset.history?.length}
+                                >
+                                  <History className="size-3" />
+                                  生图历史
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  variant="outline"
+                                  onClick={() => openImagePreview(
+                                    getAssetPreviewLabel(activeWorkbenchAsset, activeAssetTab),
+                                    activeWorkbenchAsset.imageUrl,
+                                  )}
+                                  disabled={!activeWorkbenchAsset.imageUrl}
+                                >
+                                  <Maximize2 className="size-3" />
+                                  放大预览
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                          </>
+                        )}
                       </div>
                     </div>
 
@@ -2581,6 +3340,18 @@ export default function ImportPage({
                           </div>
                         </div>
                         <div className="flex items-center gap-2">
+                          {activeAssetTab !== "voices" && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={addWorkbenchVariant}
+                              disabled={activeWorkbenchAssetIndex < 0}
+                              className="rounded-lg"
+                            >
+                              <Plus className="size-3.5" />
+                              新增变体
+                            </Button>
+                          )}
                           {activeAssetTab !== "voices" && (
                             <Button
                               size="sm"
@@ -2610,29 +3381,52 @@ export default function ImportPage({
                           {activeWorkbenchAsset.variants.map((variant, index) => (
                             <div key={variant.id || `${variant.name}:${index}`} className="flex min-h-[180px] flex-col rounded-xl border border-[--border-subtle] bg-white p-4">
                               <div className="flex items-start justify-between gap-2">
-                                <div className="min-w-0">
-                                  <div className="truncate text-xs font-bold text-[--text-primary]">{variant.name}</div>
-                                  {variant.description && (
-                                    <p className="mt-2 line-clamp-3 text-[11px] leading-relaxed text-[--text-muted]">{variant.description}</p>
-                                  )}
+                                <div className="min-w-0 flex-1">
+                                  <Input
+                                    value={variant.name || ""}
+                                    onChange={(event) => updateWorkbenchVariant(index, { name: event.target.value })}
+                                    className="h-8 rounded-lg text-xs font-bold"
+                                    placeholder="变体名称"
+                                  />
+                                  <Textarea
+                                    value={variant.description || ""}
+                                    onChange={(event) => updateWorkbenchVariant(index, { description: event.target.value })}
+                                    placeholder="输入这个变体的短描述/生成要求，例如：雨夜受伤、婚礼妆造、疲惫状态，保持同一人物脸型五官"
+                                    className="mt-2 min-h-20 resize-y rounded-lg bg-[--surface] text-xs leading-relaxed"
+                                  />
                                 </div>
                                 {variant.imageUrl && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">OK</span>}
                               </div>
                               {variant.imageUrl && (
                                 <div className="relative mt-2 overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
-                                  <Button
-                                    type="button"
-                                    size="icon"
-                                    variant="secondary"
-                                    className="absolute right-2 top-2 z-10 h-7 w-7 rounded-md bg-white/90 shadow-sm hover:bg-white"
-                                    title="下载图片"
-                                    onClick={() => downloadWorkbenchImage(
-                                      variant.imageUrl || "",
-                                      `${activeWorkbenchAsset.name}-${variant.name}`,
-                                    )}
-                                  >
-                                    <Download className="size-3.5" />
-                                  </Button>
+                                  <div className="absolute right-2 top-2 z-10 flex gap-1">
+                                    <Button
+                                      type="button"
+                                      size="icon-xs"
+                                      variant="secondary"
+                                      className="bg-white/90 shadow-sm hover:bg-white"
+                                      title="放大预览"
+                                      onClick={() => openImagePreview(
+                                        `${activeWorkbenchAsset.name}-${variant.name}`,
+                                        variant.imageUrl,
+                                      )}
+                                    >
+                                      <Maximize2 className="size-3.5" />
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      size="icon-xs"
+                                      variant="secondary"
+                                      className="bg-white/90 shadow-sm hover:bg-white"
+                                      title="下载图片"
+                                      onClick={() => downloadWorkbenchImage(
+                                        variant.imageUrl || "",
+                                        `${activeWorkbenchAsset.name}-${variant.name}`,
+                                      )}
+                                    >
+                                      <Download className="size-3.5" />
+                                    </Button>
+                                  </div>
                                   {/* eslint-disable-next-line @next/next/no-img-element */}
                                   <img src={displayImageUrl(variant.imageUrl || "")} alt={variant.name} className="h-56 w-full object-contain" />
                                 </div>
@@ -2676,6 +3470,27 @@ export default function ImportPage({
                                       )}
                                       {variant.imageUrl ? t("assetRegenerateVariant") : t("assetGenerateVariant")}
                                     </Button>
+                                    <Button
+                                      size="xs"
+                                      variant="outline"
+                                      onClick={() => openVariantHistory(activeAssetTab, activeWorkbenchAssetIndex, index)}
+                                      disabled={!variant.history?.length}
+                                    >
+                                      <History className="size-3" />
+                                      生图历史{variant.history?.length ? ` ${variant.history.length}` : ""}
+                                    </Button>
+                                    <Button
+                                      size="xs"
+                                      variant="outline"
+                                      onClick={() => openImagePreview(
+                                        `${activeWorkbenchAsset.name}-${variant.name}`,
+                                        variant.imageUrl,
+                                      )}
+                                      disabled={!variant.imageUrl}
+                                    >
+                                      <Maximize2 className="size-3" />
+                                      放大预览
+                                    </Button>
                                   </div>
 
                                   <div className="grid gap-2 rounded-lg border border-[--border-subtle] bg-[--surface] p-2">
@@ -2702,37 +3517,6 @@ export default function ImportPage({
                                     </div>
                                   </div>
 
-                                  {variant.history?.length ? (
-                                    <details className="rounded-lg border border-[--border-subtle] bg-white px-2 py-1.5">
-                                      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[11px] font-semibold text-[--text-secondary]">
-                                        <History className="size-3" />
-                                        历史 {variant.history.length}
-                                      </summary>
-                                      <div className="mt-2 grid max-h-36 gap-1 overflow-y-auto">
-                                        {variant.history.slice(0, 8).map((entry, historyIndex) => (
-                                          <button
-                                            key={`${entry.at || historyIndex}:${historyIndex}`}
-                                            type="button"
-                                            onClick={() => {
-                                              const historyImageUrl = typeof entry.imageUrl === "string" ? entry.imageUrl : "";
-                                              if (!historyImageUrl) return;
-                                              patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
-                                                const variants = [...(current.variants || [])];
-                                                const currentVariant = variants[index];
-                                                if (!currentVariant) return current;
-                                                variants[index] = { ...currentVariant, imageUrl: historyImageUrl };
-                                                return { ...current, variants };
-                                              });
-                                            }}
-                                            className="grid gap-0.5 rounded border border-transparent px-2 py-1 text-left text-[10px] hover:border-[--border-hover] hover:bg-[--surface]"
-                                          >
-                                            <span className="truncate font-medium text-[--text-primary]">{getHistoryLabel(entry)}</span>
-                                            <span className="truncate text-[--text-muted]">{formatHistoryTime(entry.at)}</span>
-                                          </button>
-                                        ))}
-                                      </div>
-                                    </details>
-                                  ) : null}
                                 </div>
                               )}
                             </div>
@@ -2754,6 +3538,83 @@ export default function ImportPage({
             </div>
           </div>
         )}
+
+        <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
+          <DialogContent className="max-h-[92vh] gap-3 overflow-hidden sm:max-w-5xl">
+            <DialogHeader>
+              <DialogTitle>{imagePreview?.title || "放大预览"}</DialogTitle>
+            </DialogHeader>
+            {imagePreview?.imageUrl && (
+              <div className="flex max-h-[76vh] items-center justify-center overflow-auto rounded-xl border border-[--border-subtle] bg-[--surface] p-2">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={displayImageUrl(imagePreview.imageUrl)}
+                  alt={imagePreview.title}
+                  className="max-h-[72vh] w-auto max-w-full object-contain"
+                />
+              </div>
+            )}
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={Boolean(historyDialog)} onOpenChange={(open) => !open && setHistoryDialog(null)}>
+          <DialogContent className="max-h-[88vh] overflow-hidden sm:max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>{historyDialog?.title || "生图历史"}</DialogTitle>
+              <DialogDescription>
+                {historyDialog?.tab === "voices" ? "点击历史记录可恢复对应音频。" : "点击历史记录可恢复对应图片。"}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid max-h-[64vh] gap-2 overflow-y-auto pr-1">
+              {(historyDialog?.entries || []).map((entry, index) => {
+                const historyImageUrl = typeof entry.imageUrl === "string" ? entry.imageUrl : "";
+                const historyAudioUrl = typeof entry.audioUrl === "string" ? entry.audioUrl : "";
+                const isVoiceHistory = historyDialog?.tab === "voices";
+                const canRestore = isVoiceHistory ? Boolean(historyAudioUrl) : Boolean(historyImageUrl);
+                return (
+                  <button
+                    key={`${entry.at || index}:${index}`}
+                    type="button"
+                    onClick={() => {
+                      if (!historyDialog || !canRestore) return;
+                      if (isVoiceHistory) {
+                        restoreHistoryAudio(historyDialog.tab, historyDialog.assetIndex, historyAudioUrl);
+                      } else {
+                        restoreHistoryImage(
+                          historyDialog.tab,
+                          historyDialog.assetIndex,
+                          historyImageUrl,
+                          historyDialog.variantIndex,
+                        );
+                      }
+                      setHistoryDialog(null);
+                    }}
+                    disabled={!canRestore}
+                    className="grid grid-cols-[96px_minmax(0,1fr)] gap-3 rounded-lg border border-[--border-subtle] bg-white p-2 text-left transition-colors hover:border-[--border-hover] hover:bg-[--surface] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <div className="flex h-16 items-center justify-center overflow-hidden rounded-md bg-[--surface]">
+                      {isVoiceHistory && historyAudioUrl ? (
+                        <Play className="size-5 text-primary" />
+                      ) : historyImageUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={displayImageUrl(historyImageUrl)} alt="" className="h-full w-full object-contain" />
+                      ) : (
+                        <ImageIcon className="size-5 text-[--text-muted]" />
+                      )}
+                    </div>
+                    <div className="min-w-0 self-center">
+                      <div className="truncate text-xs font-bold text-[--text-primary]">{getHistoryLabel(entry)}</div>
+                      <div className="mt-1 truncate text-[11px] text-[--text-muted]">{formatHistoryTime(entry.at)}</div>
+                      {typeof entry.error === "string" && (
+                        <div className="mt-1 line-clamp-2 text-[11px] text-red-500">{entry.error}</div>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </DialogContent>
+        </Dialog>
 
         {/* Episodes review (after step 3) */}
         {showEpReview && (
