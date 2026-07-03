@@ -60,6 +60,13 @@ import {
 } from "@/lib/shot-asset-utils";
 import { buildRefImagePromptsRequest } from "@/lib/ai/prompts/ref-image-prompts";
 import { buildKeyframePromptsRequest } from "@/lib/ai/prompts/keyframe-prompts";
+import { getProductionBiblePromptBlock } from "@/lib/production-bible";
+import {
+  createStoryboardPromptsForShots,
+  generateStoryboardFrameImage,
+  upsertShotSpecFromShot,
+  upsertStoryboardFramePrompt,
+} from "@/lib/story-pipeline-utils";
 
 export const maxDuration = 300;
 
@@ -224,6 +231,18 @@ export async function POST(
 
   if (action === "shot_split") {
     return handleShotSplitStream(projectId, userId, modelConfig, episodeId);
+  }
+
+  if (action === "generate_storyboard_prompts") {
+    return handleGenerateStoryboardPrompts(projectId, payload, episodeId);
+  }
+
+  if (action === "single_storyboard_generate") {
+    return handleSingleStoryboardGenerate(projectId, payload, modelConfig, episodeId);
+  }
+
+  if (action === "batch_storyboard_generate") {
+    return handleBatchStoryboardGenerate(projectId, payload, modelConfig, episodeId);
   }
 
   if (action === "generate_keyframe_prompts") {
@@ -992,6 +1011,7 @@ async function handleShotSplitStream(
     script = project.script ?? null;
     generationMode = project.generationMode ?? "keyframe";
   }
+  const productionBibleContext = await getProductionBiblePromptBlock(projectId, episodeId);
 
   // === 智能体路由 ===
   console.log(`[ShotSplit] projectId=${projectId}, episodeId=${episodeId}, script length=${script?.length ?? 0}`);
@@ -1012,7 +1032,10 @@ async function handleShotSplitStream(
           return NextResponse.json({ error: "没有剧本内容，请先编写或生成剧本" }, { status: 400 });
         }
       }
-      const agentResult = await callAndValidateAgent(boundAgent, "shot_split", script);
+      const agentPrompt = productionBibleContext
+        ? `${productionBibleContext}\n\n## 剧本\n${script}`
+        : script;
+      const agentResult = await callAndValidateAgent(boundAgent, "shot_split", agentPrompt);
       if (agentResult instanceof NextResponse) return agentResult;
 
       // Parse agent output and save to DB (same logic as built-in pipeline)
@@ -1079,6 +1102,12 @@ async function handleShotSplitStream(
             await db.insert(dialogues).values({ id: genId(), shotId, characterId: mc.id, text: d.text, sequence: i });
           }
         }
+        await upsertShotSpecFromShot({
+          projectId,
+          episodeId: episodeId ?? null,
+          shotId,
+          parsedShot: shot,
+        });
       }
       console.log(`[ShotSplit Agent] Created ${agentShots.length} shots`);
       return NextResponse.json({ shots: agentShots.length });
@@ -1210,8 +1239,10 @@ async function handleShotSplitStream(
       // Inject character relations (drives on-screen interaction framing)
       if (relationsText) prompt += relationsText;
 
-      // Inject world setting
-      if (projData?.worldSetting) {
+      // Inject production bible / world setting
+      if (productionBibleContext) {
+        prompt = `${productionBibleContext}\n\n${prompt}`;
+      } else if (projData?.worldSetting) {
         prompt = `【世界观设定】\n${projData.worldSetting}\n\n所有镜头必须与此世界观设定保持一致。\n\n` + prompt;
       }
 
@@ -1334,10 +1365,188 @@ async function handleShotSplitStream(
         });
       }
     }
+    await upsertShotSpecFromShot({
+      projectId,
+      episodeId: episodeId ?? null,
+      shotId,
+      parsedShot: shot,
+    });
   }
 
   console.log(`[ShotSplit] Created ${allShots.length} shots from ${sceneChunks.length} chunks`);
   return NextResponse.json({ shots: allShots.length });
+}
+
+// --- storyboard_prompts: shot_specs -> storyboard_frames prompt layer ---
+
+async function handleGenerateStoryboardPrompts(
+  projectId: string,
+  payload?: Record<string, unknown>,
+  episodeId?: string
+) {
+  const versionId = payload?.versionId as string | undefined;
+  const overwrite = payload?.overwrite === true;
+  const result = await createStoryboardPromptsForShots({
+    projectId,
+    episodeId: episodeId ?? null,
+    versionId: versionId ?? null,
+    overwrite,
+  });
+
+  return NextResponse.json({
+    specs: result.specs.length,
+    frames: result.frames.map((frame) => ({
+      id: frame.id,
+      shotId: frame.shotId,
+      shotSpecId: frame.shotSpecId,
+      status: frame.status,
+      hasImage: Boolean(frame.imageUrl),
+    })),
+  });
+}
+
+async function handleSingleStoryboardGenerate(
+  projectId: string,
+  payload?: Record<string, unknown>,
+  modelConfig?: ModelConfig,
+  episodeId?: string
+) {
+  if (!modelConfig?.image) {
+    return NextResponse.json({ error: "No image model configured" }, { status: 400 });
+  }
+
+  const shotId = payload?.shotId as string | undefined;
+  let shotSpecId = payload?.shotSpecId as string | undefined;
+  let frameId = payload?.frameId as string | undefined;
+  const overwrite = payload?.overwrite === true;
+
+  if (!frameId && !shotSpecId && shotId) {
+    const spec = await upsertShotSpecFromShot({
+      projectId,
+      episodeId: episodeId ?? null,
+      shotId,
+    });
+    shotSpecId = spec.id;
+  }
+
+  if (!frameId && shotSpecId) {
+    const frame = await upsertStoryboardFramePrompt({
+      projectId,
+      episodeId: episodeId ?? null,
+      shotSpecId,
+      frameIndex: typeof payload?.frameIndex === "number" ? payload.frameIndex : 0,
+      overwrite,
+    });
+    frameId = frame.id;
+  }
+
+  if (!frameId) {
+    return NextResponse.json({ error: "No frameId, shotSpecId, or shotId provided" }, { status: 400 });
+  }
+
+  const versionedUploadDir = shotId
+    ? await db
+        .select({ versionId: shots.versionId })
+        .from(shots)
+        .where(eq(shots.id, shotId))
+        .limit(1)
+        .then((rows) => getVersionedUploadDir(rows[0]?.versionId))
+    : process.env.UPLOAD_DIR || "./uploads";
+  const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
+  const frame = await generateStoryboardFrameImage({
+    frameId,
+    imageProvider,
+    imageOptions: ratioToImageOpts(payload?.ratio as string | undefined),
+    modelProvider: modelConfig.image.protocol,
+    modelId: modelConfig.image.modelId,
+    overwrite,
+  });
+
+  return NextResponse.json({
+    frameId: frame.id,
+    shotId: frame.shotId,
+    shotSpecId: frame.shotSpecId,
+    imageUrl: frame.imageUrl,
+    status: frame.status,
+  });
+}
+
+async function handleBatchStoryboardGenerate(
+  projectId: string,
+  payload?: Record<string, unknown>,
+  modelConfig?: ModelConfig,
+  episodeId?: string
+) {
+  if (!modelConfig?.image) {
+    return NextResponse.json({ error: "No image model configured" }, { status: 400 });
+  }
+
+  const versionId = payload?.versionId as string | undefined;
+  const overwrite = payload?.overwrite === true;
+  const promptResult = await createStoryboardPromptsForShots({
+    projectId,
+    episodeId: episodeId ?? null,
+    versionId: versionId ?? null,
+    overwrite,
+  });
+  const versionedUploadDir = versionId
+    ? await getVersionedUploadDir(versionId)
+    : process.env.UPLOAD_DIR || "./uploads";
+  const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
+  const imageOptions = ratioToImageOpts(payload?.ratio as string | undefined);
+  const results: Array<{
+    frameId: string;
+    shotId: string | null;
+    shotSpecId: string | null;
+    status: string;
+    imageUrl?: string | null;
+    error?: string;
+  }> = [];
+
+  for (const frame of promptResult.frames) {
+    if (frame.imageUrl && !overwrite) {
+      results.push({
+        frameId: frame.id,
+        shotId: frame.shotId,
+        shotSpecId: frame.shotSpecId,
+        status: "skipped",
+        imageUrl: frame.imageUrl,
+      });
+      continue;
+    }
+
+    try {
+      const updated = await generateStoryboardFrameImage({
+        frameId: frame.id,
+        imageProvider,
+        imageOptions,
+        modelProvider: modelConfig.image.protocol,
+        modelId: modelConfig.image.modelId,
+        overwrite,
+      });
+      results.push({
+        frameId: updated.id,
+        shotId: updated.shotId,
+        shotSpecId: updated.shotSpecId,
+        status: updated.status,
+        imageUrl: updated.imageUrl,
+      });
+    } catch (err) {
+      results.push({
+        frameId: frame.id,
+        shotId: frame.shotId,
+        shotSpecId: frame.shotSpecId,
+        status: "error",
+        error: extractErrorMessage(err),
+      });
+    }
+  }
+
+  return NextResponse.json({
+    specs: promptResult.specs.length,
+    frames: promptResult.frames.length,
+    results,
+  });
 }
 
 /** Split screenplay text into chunks by SCENE markers, ~maxScenes per chunk.
@@ -2811,7 +3020,7 @@ async function handleSingleVideoPrompt(
   // Reference mode: pass ALL scene reference frames (ordered) so multi-
   // scene shots (ground → sky etc.) get the full spatial context.
   const visionFrames: string[] = [];
-  let sceneMetaList: Array<{ sceneName?: string } | null> = [];
+  const sceneMetaList: Array<{ sceneName?: string } | null> = [];
   if (genMode === "reference") {
     const sceneAssets = shotView.referenceImages
       .filter((r) => r.fileUrl)
@@ -3309,6 +3518,8 @@ async function handleGenerateRefPrompts(
   modelConfig?: ModelConfig,
   episodeId?: string
 ) {
+  const productionBibleContext = await getProductionBiblePromptBlock(projectId, episodeId);
+
   // === 智能体路由 ===
   const refBoundAgent = await findBoundAgent(projectId, "ref_image_prompts");
   if (refBoundAgent) {
@@ -3330,6 +3541,7 @@ async function handleGenerateRefPrompts(
         duration: s.duration,
       })),
       characters: refAgentChars.map((c) => ({ name: c.name, description: c.description, visualHint: c.visualHint })),
+      productionBible: productionBibleContext,
     }, null, 2);
 
     const agentResult = await callAndValidateAgent(refBoundAgent, "ref_image_prompts", refPrompt);
@@ -3443,6 +3655,7 @@ async function handleGenerateRefPrompts(
     metaMood && `氛围情绪：${metaMood}`,
     metaRatio && `画幅比例：${metaRatio}`,
   ].filter(Boolean).join("；");
+  const visualStyleWithBible = [visualStyle, productionBibleContext].filter(Boolean).join("\n\n");
 
   // Load character relationships — drives on-screen interaction framing
   // when scene frames plan out the space for enemies / allies.
@@ -3503,7 +3716,7 @@ async function handleGenerateRefPrompts(
           duration: s.duration,
         })),
         projectCharacters.map((c) => ({ name: c.name, description: c.description })),
-        visualStyle
+        visualStyleWithBible
       );
 
       let promptRequest = refRelationsText
@@ -3679,6 +3892,8 @@ async function handleGenerateKeyframePrompts(
   modelConfig?: ModelConfig,
   episodeId?: string
 ) {
+  const productionBibleContext = await getProductionBiblePromptBlock(projectId, episodeId);
+
   // === 智能体路由 ===
   const kpBoundAgent = await findBoundAgent(projectId, "keyframe_prompts");
   if (kpBoundAgent) {
@@ -3701,6 +3916,7 @@ async function handleGenerateKeyframePrompts(
         duration: s.duration,
       })),
       characters: kpAgentChars.map((c) => ({ name: c.name, description: c.description, visualHint: c.visualHint })),
+      productionBible: productionBibleContext,
     }, null, 2);
 
     const agentResult = await callAndValidateAgent(kpBoundAgent, "keyframe_prompts", kpPrompt);
@@ -3792,6 +4008,7 @@ async function handleGenerateKeyframePrompts(
     pickField("氛围情绪") && `氛围情绪：${pickField("氛围情绪")}`,
     pickField("画幅比例") && `画幅比例：${pickField("画幅比例")}`,
   ].filter(Boolean).join("；");
+  const visualStyleWithBible = [visualStyle, productionBibleContext].filter(Boolean).join("\n\n");
 
   // Load character relationships — drives on-screen interaction framing.
   // Enemies must face each other as live combatants, not background icons.
@@ -3844,7 +4061,7 @@ async function handleGenerateKeyframePrompts(
             description: c.description,
             visualHint: c.visualHint,
           })),
-          visualStyle
+          visualStyleWithBible
         );
         const promptRequest = kfRelationsText
           ? basePromptRequest + kfRelationsText

@@ -8,7 +8,6 @@ import {
   Upload, FileText, Users, Layers, Sparkles,
   Loader2, Check, X, ArrowLeft, AlertCircle,
   ImageIcon, Images, Plus, ChevronDown, History, Download,
-  Pencil, Trash2, Maximize2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -232,14 +231,6 @@ export default function ImportPage({
   const [assetGeneratingTargets, setAssetGeneratingTargets] = useState<string[]>([]);
   const [assetUploadingTarget, setAssetUploadingTarget] = useState<string | null>(null);
   const [assetEditingTarget, setAssetEditingTarget] = useState<string | null>(null);
-  const [variantPreview, setVariantPreview] = useState<{ title: string; imageUrl: string } | null>(null);
-  const [variantHistoryDialog, setVariantHistoryDialog] = useState<{
-    title: string;
-    tab: AssetTab;
-    assetIndex: number;
-    variantIndex: number;
-    entries: Array<Record<string, unknown>>;
-  } | null>(null);
 
   const isAssetGenerating = useCallback(
     (targetKey: string) => assetGeneratingTargets.includes(targetKey),
@@ -584,10 +575,10 @@ export default function ImportPage({
     try {
       setSelectedIssueIndexes(new Set());
       setActiveIssueIndex(null);
-      const res = await apiFetch(`/api/projects/${projectId}/import/review`, {
+      const res = await apiFetch(`/api/projects/${projectId}/import/structure`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, modelConfig: getModelConfig(), reviewConcurrency: 3 }),
+        body: JSON.stringify({ modelConfig: getModelConfig(), concurrency: 2 }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -1175,13 +1166,13 @@ export default function ImportPage({
   const stepColor = (status: string, selected: boolean) => {
     const base = (() => {
       switch (status) {
-        case "running": return "border-primary/45 bg-primary/10 text-primary";
-        case "done": return "border-[--success]/35 bg-[--success]/10 text-[--text-primary]";
-        case "error": return "border-red-400/45 bg-red-500/10 text-red-400";
-        default: return "border-[--border-subtle] bg-[--surface]/70 text-[--text-muted]";
+        case "running": return "border-primary/30 bg-primary/5 text-primary";
+        case "done": return "border-transparent bg-[--surface] text-[--text-primary]";
+        case "error": return "border-red-300 bg-red-50 text-red-500";
+        default: return "border-transparent bg-[--surface] text-[--text-muted]";
       }
     })();
-    if (selected) return base + " !bg-primary/12 !border-primary/60 !text-primary shadow-[0_0_24px_rgba(47,107,255,0.18)]";
+    if (selected) return base + " !bg-primary/10 !border-primary/40 !text-primary shadow-sm";
     return base;
   };
 
@@ -1309,103 +1300,6 @@ export default function ImportPage({
     setter((prev) => prev.map((asset, index) => index === assetIndex ? patcher(asset) : asset));
   }
 
-  function renameWorkbenchAsset(tab: AssetTab, assetIndex: number, asset: WorkbenchAsset) {
-    const nextName = window.prompt("修改资产名称", asset.name);
-    const trimmedName = nextName?.trim();
-    if (!trimmedName || trimmedName === asset.name) return;
-
-    const updatedAsset: WorkbenchAsset = {
-      ...asset,
-      name: trimmedName,
-      visualHint: asset.visualHint === asset.name ? trimmedName : asset.visualHint,
-      mainImageName: !asset.mainImageName || asset.mainImageName === asset.name ? trimmedName : asset.mainImageName,
-    };
-    getAssetSetter(tab)((prev) => prev.map((item, index) => index === assetIndex ? updatedAsset : item));
-    setActiveAssetKey(getAssetKey(updatedAsset, assetIndex, tab));
-    toast.success("资产名称已更新");
-  }
-
-  function deleteWorkbenchAsset(tab: AssetTab, assetIndex: number, asset: WorkbenchAsset) {
-    if (!window.confirm(`确认删除资产「${asset.name}」吗？`)) return;
-
-    const targetKey = getAssetKey(asset, assetIndex, tab);
-    const nextList = activeAssetList.filter((_, index) => index !== assetIndex);
-    getAssetSetter(tab)((prev) => prev.filter((_, index) => index !== assetIndex));
-    if (targetKey === activeAssetKey || targetKey === activeWorkbenchKey) {
-      const nextIndex = Math.min(assetIndex, nextList.length - 1);
-      setActiveAssetKey(nextIndex >= 0 ? getAssetKey(nextList[nextIndex], nextIndex, tab) : "");
-    } else if (activeWorkbenchAsset) {
-      const nextActiveIndex = nextList.findIndex((item) =>
-        item === activeWorkbenchAsset
-        || (item.assetId && item.assetId === activeWorkbenchAsset.assetId)
-        || (item.name === activeWorkbenchAsset.name && item.role === activeWorkbenchAsset.role)
-      );
-      if (nextActiveIndex >= 0) setActiveAssetKey(getAssetKey(nextList[nextActiveIndex], nextActiveIndex, tab));
-    }
-    toast.success("资产已删除");
-  }
-
-  function makeCustomVariant(asset: WorkbenchAsset, index: number): AssetVariant {
-    const variantName = `${asset.name}自定义变体${index + 1}`;
-    const isCharacter = activeAssetTab === "characters";
-    return {
-      id: `${asset.assetId || asset.name}-variant-${Date.now()}-${index}`,
-      name: variantName,
-      description: isCharacter
-        ? "自定义造型，保持人物辨识度一致。"
-        : "自定义状态，保持主体设定一致。",
-      prompt: `${asset.prompt || ""}\n\n【变体要求】${variantName}。${isCharacter
-        ? "保持同一人物的脸型、五官、骨相、身材比例和整体风格一致，仅调整造型、服装、表情或剧情状态。"
-        : "保持主体身份、比例和整体风格一致，仅调整当前变体指定的状态。"
-      }`,
-      imageUrl: "",
-      history: [],
-      editInstruction: "",
-    };
-  }
-
-  function addWorkbenchVariant() {
-    if (activeWorkbenchAssetIndex < 0 || activeAssetTab === "voices") return;
-    patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
-      const variants = [...(current.variants || [])];
-      variants.push(makeCustomVariant(current, variants.length));
-      return { ...current, variants };
-    });
-    toast.success("已新增变体");
-  }
-
-  function openVariantPreview(variant: AssetVariant) {
-    const imageUrl = variant.imageUrl || "";
-    if (!imageUrl) {
-      toast.error("暂无图片可预览");
-      return;
-    }
-    setVariantPreview({ title: variant.name, imageUrl });
-  }
-
-  function openVariantHistory(variant: AssetVariant, variantIndex: number) {
-    setVariantHistoryDialog({
-      title: variant.name,
-      tab: activeAssetTab,
-      assetIndex: activeWorkbenchAssetIndex,
-      variantIndex,
-      entries: variant.history || [],
-    });
-  }
-
-  function restoreVariantHistoryImage(tab: AssetTab, assetIndex: number, variantIndex: number, imageUrl: string) {
-    if (!imageUrl || assetIndex < 0) return;
-    patchWorkbenchAsset(tab, assetIndex, (current) => {
-      const variants = [...(current.variants || [])];
-      const currentVariant = variants[variantIndex];
-      if (!currentVariant) return current;
-      variants[variantIndex] = { ...currentVariant, imageUrl };
-      return { ...current, variants };
-    });
-    setVariantHistoryDialog(null);
-    toast.success("已切换到历史图片");
-  }
-
   async function generateWorkbenchAsset(
     tab: AssetTab,
     assetIndex: number,
@@ -1424,30 +1318,51 @@ export default function ImportPage({
       toast.error(t("assetPromptMissing"));
       return false;
     }
+    if (variant && !asset.imageUrl) {
+      toast.error("请先生成或上传主图，变体会基于主图修改生成");
+      return false;
+    }
 
     const targetKey = `${tab}:${assetIndex}:${variantIndex ?? "main"}`;
     if (!options.keepBusy) beginAssetGenerating(targetKey);
 
     try {
-      const res = await apiFetch(`/api/projects/${projectId}/import/generate-image`, {
+      const res = await apiFetch(
+        `/api/projects/${projectId}/import/${variant ? "edit-image" : "generate-image"}`,
+        {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          category: assetCategoryForTab(tab),
-          asset,
-          prompt,
-          negativePrompt: asset.negativePrompt,
-          size: sizeForAssetTab(tab),
-          targetName: target.name,
-          targetType: variant ? "variant" : "main",
-          referenceImages: [
-            ...(options.referenceImages || []),
-            ...(asset.faceTemplate?.url ? [asset.faceTemplate.url] : []),
-          ],
-        }),
-      });
+        body: JSON.stringify(variant
+          ? {
+              imageUrl: options.referenceImages?.[0] || asset.imageUrl,
+              editPrompt: prompt,
+              prompt: asset.prompt || "",
+              negativePrompt: asset.negativePrompt,
+              category: assetCategoryForTab(tab),
+              asset,
+              size: sizeForAssetTab(tab),
+              targetName: target.name,
+              targetType: "variant",
+            }
+          : {
+              category: assetCategoryForTab(tab),
+              asset,
+              prompt,
+              negativePrompt: asset.negativePrompt,
+              size: sizeForAssetTab(tab),
+              targetName: target.name,
+              targetType: "main",
+              referenceImages: [
+                ...(options.referenceImages || []),
+                ...(asset.faceTemplate?.url ? [asset.faceTemplate.url] : []),
+              ],
+            }),
+        },
+      );
       const result = await res.json();
-      if (result.status === "error") throw new Error(result.error || "image2 生成失败");
+      if (!res.ok || result.status !== "succeeded" || !result.imageUrl) {
+        throw new Error(result.error || result.message || "image2 生成失败");
+      }
 
       patchWorkbenchAsset(tab, assetIndex, (current) => {
         const historyEntry = makeHistoryEntry(result);
@@ -1504,16 +1419,25 @@ export default function ImportPage({
 
   async function downloadWorkbenchImage(imageUrl: string, filenameBase: string) {
     const filename = `${slugifyFileName(filenameBase || "image")}.png`;
+    const safeUrl = displayImageUrl(imageUrl);
     try {
-      const res = await fetch(imageUrl, { cache: "no-store" });
+      const res = await fetch(safeUrl, { cache: "no-store" });
       if (!res.ok) throw new Error(`download failed: ${res.status}`);
       const blob = await res.blob();
       const objectUrl = URL.createObjectURL(blob);
       triggerDownload(objectUrl, filename);
       setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
     } catch {
-      triggerDownload(imageUrl, filename);
+      triggerDownload(safeUrl, filename);
     }
+  }
+
+  function displayImageUrl(imageUrl: string) {
+    if (!imageUrl || imageUrl.startsWith("data:") || /^https?:\/\//i.test(imageUrl)) return imageUrl;
+    return imageUrl
+      .split("/")
+      .map((part, index) => index === 0 ? part : encodeURIComponent(part))
+      .join("/");
   }
 
   function triggerDownload(href: string, filename: string) {
@@ -1536,6 +1460,11 @@ export default function ImportPage({
       .slice(0, 80) || "image";
   }
 
+  function isRedundantBaseVariant(variant?: AssetVariant) {
+    const text = `${variant?.name || ""} ${variant?.description || ""} ${variant?.prompt || ""}`;
+    return /基础三视图|基础主形象|主形象版本|保持人物一致/.test(text);
+  }
+
   async function generateActiveWorkbenchAsset(variantIndex?: number) {
     if (activeWorkbenchAssetIndex < 0) return;
     await generateWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, variantIndex);
@@ -1549,12 +1478,18 @@ export default function ImportPage({
       return;
     }
     const variants = asset.variants || [];
-    if (!variants.length) return;
+    const variantJobs = variants
+      .map((variant, index) => ({ variant, index }))
+      .filter(({ variant }) => !isRedundantBaseVariant(variant));
+    if (!variantJobs.length) {
+      toast.error("没有需要生成的差异变体；基础三视图已由主图覆盖");
+      return;
+    }
 
     const variantsTargetKey = `${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`;
     beginAssetGenerating(variantsTargetKey);
     let successCount = 0;
-    for (let variantIndex = 0; variantIndex < variants.length; variantIndex += 1) {
+    for (const { index: variantIndex } of variantJobs) {
       const ok = await generateWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, variantIndex, {
         quiet: true,
         keepBusy: true,
@@ -1662,7 +1597,9 @@ export default function ImportPage({
         }),
       });
       const result = await res.json();
-      if (result.status === "error") throw new Error(result.error || "改图失败");
+      if (!res.ok || result.status !== "succeeded" || !result.imageUrl) {
+        throw new Error(result.error || result.message || "改图失败");
+      }
 
       patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
         const variants = [...(current.variants || [])];
@@ -1707,6 +1644,27 @@ export default function ImportPage({
     }
   }
 
+  async function runAssetGenerationJobs(
+    jobs: Array<{ assetIndex: number; variantIndex?: number }>,
+    concurrency: number,
+    worker: (job: { assetIndex: number; variantIndex?: number }) => Promise<boolean>,
+  ) {
+    let nextIndex = 0;
+    let successCount = 0;
+
+    async function runner() {
+      while (nextIndex < jobs.length) {
+        const job = jobs[nextIndex++];
+        if (await worker(job)) successCount += 1;
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(Math.max(1, concurrency), jobs.length) }, () => runner()),
+    );
+    return successCount;
+  }
+
   async function generateCurrentAssetTab() {
     if (activeAssetTab === "voices") return;
     const tab = activeAssetTab;
@@ -1715,17 +1673,23 @@ export default function ImportPage({
     const categoryTargetKey = `${tab}:category`;
     beginAssetGenerating(categoryTargetKey);
 
-    let successCount = 0;
+    const jobs: Array<{ assetIndex: number; variantIndex?: number }> = [];
     for (let assetIndex = 0; assetIndex < list.length; assetIndex += 1) {
-      if (await generateWorkbenchAsset(tab, assetIndex, undefined, { quiet: true, keepBusy: true })) successCount += 1;
-      const variants = list[assetIndex].variants || [];
-      for (let variantIndex = 0; variantIndex < variants.length; variantIndex += 1) {
-        if (await generateWorkbenchAsset(tab, assetIndex, variantIndex, { quiet: true, keepBusy: true })) successCount += 1;
-      }
+      jobs.push({ assetIndex });
     }
 
-    toast.success(t("assetGenerateBatchSuccess", { count: successCount }));
-    endAssetGenerating(categoryTargetKey);
+    try {
+      const successCount = await runAssetGenerationJobs(jobs, 10, (job) =>
+        generateWorkbenchAsset(tab, job.assetIndex, job.variantIndex, { quiet: true, keepBusy: true }),
+      );
+      if (successCount > 0) {
+        toast.success(t("assetGenerateBatchSuccess", { count: successCount }));
+      } else {
+        toast.error("图片生成失败，请检查 image2/JimAPI 密钥配置");
+      }
+    } finally {
+      endAssetGenerating(categoryTargetKey);
+    }
   }
 
   function assetTabInfo(tab: AssetTab) {
@@ -1853,9 +1817,9 @@ export default function ImportPage({
   const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed !== false).length;
   const allAssetsConfirmed = allWorkbenchAssets.length > 0 && confirmedAssetCount === allWorkbenchAssets.length;
   return (
-    <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-frame-grid">
+    <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-[--surface]">
       {/* Top: Steps navigation */}
-      <div className="shrink-0 border-b border-[--border-subtle] bg-[#070A10]/88 px-3 py-2 backdrop-blur-xl">
+      <div className="shrink-0 border-b border-[--border-subtle] bg-white px-3 py-2">
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
           <button
             onClick={() => router.push(`/${locale}`)}
@@ -1878,7 +1842,7 @@ export default function ImportPage({
                     if (!isClickable) return;
                     goToStep(num);
                   }}
-                  className={`relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2.5 text-left transition-all duration-200 ${stepColor(stepStatus[num], isSelected)} ${isClickable ? "cursor-pointer hover:border-primary/45 hover:bg-primary/10" : ""}`}
+                  className={`relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2.5 text-left transition-all duration-200 ${stepColor(stepStatus[num], isSelected)} ${isClickable ? "cursor-pointer hover:bg-primary/5" : ""}`}
                 >
                   {isSelected && (
                     <div className="absolute inset-x-3 bottom-0 h-[3px] rounded-t-full bg-primary" />
@@ -1888,7 +1852,7 @@ export default function ImportPage({
                       ? isSelected ? "bg-primary/15 text-primary" : "bg-emerald-100 text-emerald-600"
                       : stepStatus[num] === "running" ? "bg-primary/15"
                       : stepStatus[num] === "error" ? "bg-red-100"
-                       : "bg-[--surface]"
+                      : "bg-white"
                   }`}>
                     {stepIcon(stepStatus[num]) || <Icon className="h-4 w-4" />}
                   </div>
@@ -1899,9 +1863,9 @@ export default function ImportPage({
             <button
               type="button"
               onClick={() => router.push(`/${locale}/project/${projectId}/episodes`)}
-               className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-[--border-subtle] bg-[--surface]/70 px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:border-primary/45 hover:bg-primary/10 hover:text-primary"
+              className="relative flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent bg-[--surface] px-2.5 text-left text-[--text-primary] transition-all duration-200 hover:bg-primary/5 hover:text-primary"
             >
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/12">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white">
                 <Layers className="h-4 w-4" />
               </div>
               <span className="truncate text-xs font-medium xl:text-sm">分集管理</span>
@@ -1917,12 +1881,12 @@ export default function ImportPage({
           <div className="mx-auto w-full max-w-xl space-y-6">
             {/* Drop zone */}
             <div
-              className={`relative flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-12 transition-colors ${
+              className={`relative flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed p-12 transition-colors ${
                 dragOver
                   ? "border-primary bg-primary/5"
                   : file
-                    ? "border-emerald-400/60 bg-emerald-500/10"
-                    : "frame-panel border-[--border-subtle]"
+                    ? "border-emerald-300 bg-emerald-50/50"
+                    : "border-[--border-subtle] bg-white"
               }`}
               onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
               onDragLeave={() => setDragOver(false)}
@@ -2395,50 +2359,23 @@ export default function ImportPage({
                       const key = getAssetKey(asset, index, activeAssetTab);
                       const isActive = key === activeWorkbenchKey;
                       return (
-                        <div
+                        <button
                           key={key}
-                          className={`mb-1.5 grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg border p-2 transition-colors ${
+                          onClick={() => setActiveAssetKey(key)}
+                          className={`mb-1.5 grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg border p-2 text-left transition-colors ${
                             isActive
                               ? "border-primary/50 bg-primary/8"
                               : "border-transparent bg-white hover:border-[--border-hover]"
                           }`}
                         >
-                          <button
-                            type="button"
-                            onClick={() => setActiveAssetKey(key)}
-                            className="min-w-0 text-left"
-                          >
-                            <span className="flex items-center gap-2">
-                              <span className="block min-w-0 flex-1 truncate text-xs font-bold text-[--text-primary]">{asset.name}</span>
-                              <span className={`h-2 w-2 shrink-0 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
-                            </span>
+                          <span className="min-w-0">
+                            <span className="block truncate text-xs font-bold text-[--text-primary]">{asset.name}</span>
                             <span className="mt-0.5 block truncate text-[10px] text-[--text-muted]">
                               {(asset.role || asset.visualHint || assetTabInfo(activeAssetTab).label)} · {formatEpisodeRefs(asset.episodes)}
                             </span>
-                          </button>
-                          <div className="flex shrink-0 items-center gap-1">
-                            <Button
-                              type="button"
-                              size="xs"
-                              variant="outline"
-                              className="h-7 px-2 text-[11px]"
-                              onClick={() => renameWorkbenchAsset(activeAssetTab, index, asset)}
-                            >
-                              <Pencil className="size-3" />
-                              改名
-                            </Button>
-                            <Button
-                              type="button"
-                              size="xs"
-                              variant="outline"
-                              className="h-7 px-2 text-[11px] text-red-400 hover:text-red-300"
-                              onClick={() => deleteWorkbenchAsset(activeAssetTab, index, asset)}
-                            >
-                              <Trash2 className="size-3" />
-                              删除
-                            </Button>
-                          </div>
-                        </div>
+                          </span>
+                          <span className={`h-2 w-2 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
+                        </button>
                       );
                     })
                   )}
@@ -2478,15 +2415,28 @@ export default function ImportPage({
                     </div>
 
                     <div className="grid gap-4 lg:grid-cols-2">
-                      <div className="grid min-h-[520px] content-start gap-3 rounded-xl border border-[--border-subtle] bg-white p-3">
-                        {activeAssetTab !== "characters" && (
-                          <div className="grid gap-3 rounded-xl border border-[--border-subtle] bg-[--surface] p-3">
-                            <div className="grid gap-1">
-                              <div className="text-xs font-bold text-[--text-secondary]">{t("assetDescription")}</div>
-                              <p className="text-xs leading-relaxed text-[--text-muted]">{activeWorkbenchAsset.description || "-"}</p>
-                            </div>
+                      <div className="grid min-h-[520px] gap-3 rounded-xl border border-[--border-subtle] bg-white p-3">
+                        <div className="grid gap-3 rounded-xl border border-[--border-subtle] bg-[--surface] p-3">
+                          <div className="grid gap-1">
+                            <div className="text-xs font-bold text-[--text-secondary]">{t("assetDescription")}</div>
+                            <p className="text-xs leading-relaxed text-[--text-muted]">{activeWorkbenchAsset.description || "-"}</p>
                           </div>
-                        )}
+                          {activeAssetTab === "characters" && (
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => updateActiveWorkbenchAsset({ scope: activeWorkbenchAsset.scope === "main" ? "guest" : "main" })}
+                                className={`rounded-lg px-2 py-1 text-xs font-bold ${
+                                  activeWorkbenchAsset.scope === "main"
+                                    ? "bg-blue-50 text-blue-600"
+                                    : "bg-purple-50 text-purple-600"
+                                }`}
+                              >
+                                {activeWorkbenchAsset.scope === "main" ? t("main") : t("guest")}
+                              </button>
+                              <span className="text-xs text-[--text-muted]">{activeWorkbenchAsset.role || ""}</span>
+                            </div>
+                          )}
+                        </div>
 
                         <div className="grid gap-2">
                           <div className="flex items-center justify-between">
@@ -2498,13 +2448,11 @@ export default function ImportPage({
                           <Textarea
                             value={activeWorkbenchAsset.prompt || ""}
                             onChange={(event) => updateActiveWorkbenchAsset({ prompt: event.target.value })}
-                            className={`flex-1 resize-y rounded-xl bg-white font-mono text-xs leading-relaxed ${
-                              activeAssetTab === "characters" ? "min-h-[470px]" : "min-h-[320px]"
-                            }`}
+                            className="min-h-[320px] flex-1 resize-y rounded-xl bg-white font-mono text-xs leading-relaxed"
                           />
                         </div>
 
-                        {activeAssetTab !== "voices" && activeAssetTab !== "characters" && (
+                        {activeAssetTab !== "voices" && (
                           <div className="grid gap-2">
                             <label className="text-xs font-bold text-[--text-secondary]">{t("assetNegativePrompt")}</label>
                             <Textarea
@@ -2600,7 +2548,7 @@ export default function ImportPage({
                                 <Download className="size-4" />
                               </Button>
                               {/* eslint-disable-next-line @next/next/no-img-element */}
-                              <img src={activeWorkbenchAsset.imageUrl} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
+                              <img src={displayImageUrl(activeWorkbenchAsset.imageUrl || "")} alt={activeWorkbenchAsset.name} className="h-full w-full object-contain" />
                             </>
                           ) : (
                             <div className="grid gap-1 text-center">
@@ -2624,35 +2572,23 @@ export default function ImportPage({
                         </div>
                         <div className="flex items-center gap-2">
                           {activeAssetTab !== "voices" && (
-                            <>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                onClick={addWorkbenchVariant}
-                                disabled={activeWorkbenchAssetIndex < 0}
-                                className="rounded-lg"
-                              >
-                                <Plus className="size-3.5" />
-                                新增变体
-                              </Button>
-                              <Button
-                                size="sm"
-                                onClick={generateActiveWorkbenchVariantsFromMain}
-                                disabled={
-                                  !activeWorkbenchAsset.imageUrl
-                                  || !activeWorkbenchAsset.variants?.length
-                                  || isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex)
-                                }
-                                className="rounded-lg"
-                              >
-                                {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`) ? (
-                                  <Loader2 className="size-3.5 animate-spin" />
-                                ) : (
-                                  <Images className="size-3.5" />
-                                )}
-                                批量生成变体
-                              </Button>
-                            </>
+                            <Button
+                              size="sm"
+                              onClick={generateActiveWorkbenchVariantsFromMain}
+                              disabled={
+                                !activeWorkbenchAsset.imageUrl
+                                || !activeWorkbenchAsset.variants?.length
+                                || isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex)
+                              }
+                              className="rounded-lg"
+                            >
+                              {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:variants`) ? (
+                                <Loader2 className="size-3.5 animate-spin" />
+                              ) : (
+                                <Images className="size-3.5" />
+                              )}
+                              批量生成变体
+                            </Button>
                           )}
                           <span className="rounded-full bg-[--surface] px-2 py-0.5 text-xs font-semibold text-[--text-muted]">
                             {activeWorkbenchAsset.variants?.length || 0}
@@ -2662,39 +2598,38 @@ export default function ImportPage({
                       {activeWorkbenchAsset.variants?.length ? (
                         <div className="grid gap-4 lg:grid-cols-2">
                           {activeWorkbenchAsset.variants.map((variant, index) => (
-                            <div key={variant.id || `${variant.name}:${index}`} className="flex min-h-[360px] flex-col rounded-xl border border-[--border-subtle] bg-white p-3">
-                              <div className="rounded-lg border border-[--border-subtle] bg-[--surface] px-3 py-2">
-                                <div className="truncate text-sm font-bold text-[--text-primary]">{variant.name}</div>
+                            <div key={variant.id || `${variant.name}:${index}`} className="flex min-h-[180px] flex-col rounded-xl border border-[--border-subtle] bg-white p-4">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="truncate text-xs font-bold text-[--text-primary]">{variant.name}</div>
+                                  {variant.description && (
+                                    <p className="mt-2 line-clamp-3 text-[11px] leading-relaxed text-[--text-muted]">{variant.description}</p>
+                                  )}
+                                </div>
+                                {variant.imageUrl && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-600">OK</span>}
                               </div>
-                              <div className="relative mt-2 flex aspect-[16/10] min-h-56 items-center justify-center overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
-                                {variant.imageUrl ? (
-                                  <>
-                                    <Button
-                                      type="button"
-                                      size="icon"
-                                      variant="secondary"
-                                      className="absolute right-2 top-2 z-10 h-7 w-7 rounded-md bg-white/90 shadow-sm hover:bg-white"
-                                      title="下载图片"
-                                      onClick={() => downloadWorkbenchImage(
-                                        variant.imageUrl || "",
-                                        `${activeWorkbenchAsset.name}-${variant.name}`,
-                                      )}
-                                    >
-                                      <Download className="size-3.5" />
-                                    </Button>
-                                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                                    <img src={variant.imageUrl} alt={variant.name} className="h-full w-full object-contain" />
-                                  </>
-                                ) : (
-                                  <div className="px-4 text-center text-sm font-semibold text-[--text-muted]">{variant.name}</div>
-                                )}
-                              </div>
-                              {variant.description && (
-                                <p className="px-0.5 py-2 text-[11px] leading-relaxed text-[--text-muted]">{variant.description}</p>
+                              {variant.imageUrl && (
+                                <div className="relative mt-2 overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
+                                  <Button
+                                    type="button"
+                                    size="icon"
+                                    variant="secondary"
+                                    className="absolute right-2 top-2 z-10 h-7 w-7 rounded-md bg-white/90 shadow-sm hover:bg-white"
+                                    title="下载图片"
+                                    onClick={() => downloadWorkbenchImage(
+                                      variant.imageUrl || "",
+                                      `${activeWorkbenchAsset.name}-${variant.name}`,
+                                    )}
+                                  >
+                                    <Download className="size-3.5" />
+                                  </Button>
+                                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                                  <img src={displayImageUrl(variant.imageUrl || "")} alt={variant.name} className="h-56 w-full object-contain" />
+                                </div>
                               )}
                               {activeAssetTab !== "voices" && (
-                                <div className="mt-auto grid gap-3 pt-2">
-                                  <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+                                <div className="mt-auto grid gap-3 pt-4">
+                                  <div className="flex flex-wrap items-center justify-end gap-2">
                                     <Button
                                       size="xs"
                                       variant="outline"
@@ -2721,51 +2656,73 @@ export default function ImportPage({
                                     <Button
                                       size="xs"
                                       variant="outline"
-                                      onClick={() => {
-                                        if (variant.imageUrl && variant.editInstruction?.trim()) {
-                                          void editWorkbenchVariant(index);
-                                        } else {
-                                          void generateActiveWorkbenchAsset(index);
-                                        }
-                                      }}
-                                      disabled={
-                                        isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex, index)
-                                        || Boolean(assetEditingTarget)
-                                      }
+                                      onClick={() => generateActiveWorkbenchAsset(index)}
+                                      disabled={isAssetGenerationBlocked(activeAssetTab, activeWorkbenchAssetIndex, index)}
                                     >
-                                      {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}`)
-                                      || assetEditingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                      {isAssetGenerating(`${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}`) ? (
                                         <Loader2 className="size-3 animate-spin" />
                                       ) : (
                                         <ImageIcon className="size-3" />
                                       )}
-                                      改图
-                                    </Button>
-                                    <Button
-                                      size="xs"
-                                      variant="outline"
-                                      onClick={() => openVariantHistory(variant, index)}
-                                    >
-                                      <History className="size-3" />
-                                      生图历史
-                                    </Button>
-                                    <Button
-                                      size="xs"
-                                      variant="outline"
-                                      onClick={() => openVariantPreview(variant)}
-                                      disabled={!variant.imageUrl}
-                                    >
-                                      <Maximize2 className="size-3" />
-                                      放大预览
+                                      {variant.imageUrl ? t("assetRegenerateVariant") : t("assetGenerateVariant")}
                                     </Button>
                                   </div>
 
-                                  <Textarea
-                                    value={variant.editInstruction || ""}
-                                    onChange={(event) => updateVariantEditInstruction(index, event.target.value)}
-                                    placeholder="输入改图要求；留空时点击“改图”会按变体提示词重新生成"
-                                    className="min-h-16 resize-y rounded-lg bg-white text-xs leading-relaxed"
-                                  />
+                                  <div className="grid gap-2 rounded-lg border border-[--border-subtle] bg-[--surface] p-2">
+                                    <Textarea
+                                      value={variant.editInstruction || ""}
+                                      onChange={(event) => updateVariantEditInstruction(index, event.target.value)}
+                                      placeholder="输入变体改图要求，例如：换成深色外套，表情更疲惫，保持同一人物"
+                                      className="min-h-20 resize-y rounded-lg bg-white text-xs leading-relaxed"
+                                    />
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-[10px] text-[--text-muted]">基于当前变体图进行修改</span>
+                                      <Button
+                                        size="xs"
+                                        onClick={() => editWorkbenchVariant(index)}
+                                        disabled={Boolean(assetEditingTarget) || !variant.imageUrl || !variant.editInstruction?.trim()}
+                                      >
+                                        {assetEditingTarget === `${activeAssetTab}:${activeWorkbenchAssetIndex}:${index}` ? (
+                                          <Loader2 className="size-3 animate-spin" />
+                                        ) : (
+                                          <Sparkles className="size-3" />
+                                        )}
+                                        变体改图
+                                      </Button>
+                                    </div>
+                                  </div>
+
+                                  {variant.history?.length ? (
+                                    <details className="rounded-lg border border-[--border-subtle] bg-white px-2 py-1.5">
+                                      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[11px] font-semibold text-[--text-secondary]">
+                                        <History className="size-3" />
+                                        历史 {variant.history.length}
+                                      </summary>
+                                      <div className="mt-2 grid max-h-36 gap-1 overflow-y-auto">
+                                        {variant.history.slice(0, 8).map((entry, historyIndex) => (
+                                          <button
+                                            key={`${entry.at || historyIndex}:${historyIndex}`}
+                                            type="button"
+                                            onClick={() => {
+                                              const historyImageUrl = typeof entry.imageUrl === "string" ? entry.imageUrl : "";
+                                              if (!historyImageUrl) return;
+                                              patchWorkbenchAsset(activeAssetTab, activeWorkbenchAssetIndex, (current) => {
+                                                const variants = [...(current.variants || [])];
+                                                const currentVariant = variants[index];
+                                                if (!currentVariant) return current;
+                                                variants[index] = { ...currentVariant, imageUrl: historyImageUrl };
+                                                return { ...current, variants };
+                                              });
+                                            }}
+                                            className="grid gap-0.5 rounded border border-transparent px-2 py-1 text-left text-[10px] hover:border-[--border-hover] hover:bg-[--surface]"
+                                          >
+                                            <span className="truncate font-medium text-[--text-primary]">{getHistoryLabel(entry)}</span>
+                                            <span className="truncate text-[--text-muted]">{formatHistoryTime(entry.at)}</span>
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </details>
+                                  ) : null}
                                 </div>
                               )}
                             </div>
@@ -2787,60 +2744,6 @@ export default function ImportPage({
             </div>
           </div>
         )}
-
-        <Dialog open={Boolean(variantPreview)} onOpenChange={(open) => !open && setVariantPreview(null)}>
-          <DialogContent className="max-w-5xl">
-            <DialogHeader>
-              <DialogTitle>{variantPreview?.title || "放大预览"}</DialogTitle>
-            </DialogHeader>
-            <div className="flex max-h-[72vh] min-h-[420px] items-center justify-center overflow-hidden rounded-xl border border-[--border-subtle] bg-[--surface]">
-              {variantPreview?.imageUrl && (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={variantPreview.imageUrl} alt={variantPreview.title} className="h-full max-h-[72vh] w-full object-contain" />
-              )}
-            </div>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={Boolean(variantHistoryDialog)} onOpenChange={(open) => !open && setVariantHistoryDialog(null)}>
-          <DialogContent className="max-w-2xl">
-            <DialogHeader>
-              <DialogTitle>生图历史</DialogTitle>
-              <DialogDescription>{variantHistoryDialog?.title || ""}</DialogDescription>
-            </DialogHeader>
-            {variantHistoryDialog?.entries.length ? (
-              <div className="grid max-h-[60vh] gap-2 overflow-y-auto pr-1">
-                {variantHistoryDialog.entries.slice(0, 12).map((entry, historyIndex) => {
-                  const imageUrl = typeof entry.imageUrl === "string" ? entry.imageUrl : "";
-                  return (
-                    <button
-                      key={`${entry.at || historyIndex}:${historyIndex}`}
-                      type="button"
-                      disabled={!imageUrl}
-                      onClick={() => {
-                        if (!variantHistoryDialog || !imageUrl) return;
-                        restoreVariantHistoryImage(
-                          variantHistoryDialog.tab,
-                          variantHistoryDialog.assetIndex,
-                          variantHistoryDialog.variantIndex,
-                          imageUrl,
-                        );
-                      }}
-                      className="grid gap-1 rounded-lg border border-[--border-subtle] bg-white px-3 py-2 text-left text-xs transition-colors hover:border-[--border-hover] disabled:cursor-default disabled:opacity-60"
-                    >
-                      <span className="font-semibold text-[--text-primary]">{getHistoryLabel(entry)}</span>
-                      <span className="text-[--text-muted]">{formatHistoryTime(entry.at)}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="rounded-xl border border-dashed border-[--border-subtle] bg-[--surface] p-6 text-center text-sm text-[--text-muted]">
-                暂无生图历史
-              </div>
-            )}
-          </DialogContent>
-        </Dialog>
 
         {/* Episodes review (after step 3) */}
         {showEpReview && (

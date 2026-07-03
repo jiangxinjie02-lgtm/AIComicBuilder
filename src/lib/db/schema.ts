@@ -263,6 +263,386 @@ export const importStates = sqliteTable("import_states", {
     .$defaultFn(() => new Date()),
 });
 
+export const scripts = sqliteTable("scripts", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "set null",
+  }),
+  title: text("title").notNull().default(""),
+  sourceFilename: text("source_filename").default(""),
+  sourceType: text("source_type").default(""),
+  language: text("language").default(""),
+  contentHash: text("content_hash").default(""),
+  rawText: text("raw_text").notNull().default(""),
+  cleanedText: text("cleaned_text").default(""),
+  status: text("status", {
+    enum: ["uploaded", "cleaning", "chunked", "parsed", "failed"],
+  })
+    .notNull()
+    .default("uploaded"),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const scriptChunks = sqliteTable("script_chunks", {
+  id: text("id").primaryKey(),
+  scriptId: text("script_id")
+    .notNull()
+    .references(() => scripts.id, { onDelete: "cascade" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "set null",
+  }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  chunkIndex: integer("chunk_index").notNull(),
+  episodeIndex: integer("episode_index").default(0),
+  sceneIndex: integer("scene_index").default(0),
+  text: text("text").notNull(),
+  startIndex: integer("start_index").notNull().default(0),
+  endIndex: integer("end_index").notNull().default(0),
+  overlapBefore: integer("overlap_before").notNull().default(0),
+  overlapAfter: integer("overlap_after").notNull().default(0),
+  status: text("status", {
+    enum: ["pending", "parsed", "reviewed", "failed"],
+  })
+    .notNull()
+    .default("pending"),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const complianceReports = sqliteTable("compliance_reports", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "cascade",
+  }),
+  chunkId: text("chunk_id").references(() => scriptChunks.id, {
+    onDelete: "set null",
+  }),
+  riskLevel: text("risk_level", {
+    enum: ["none", "low", "medium", "high", "critical"],
+  })
+    .notNull()
+    .default("low"),
+  riskType: text("risk_type").notNull().default(""),
+  sourceText: text("source_text").notNull().default(""),
+  reason: text("reason").notNull().default(""),
+  suggestion: text("suggestion").notNull().default(""),
+  needHumanReview: integer("need_human_review").notNull().default(0),
+  status: text("status", {
+    enum: ["open", "accepted", "resolved", "ignored"],
+  })
+    .notNull()
+    .default("open"),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const assets = sqliteTable("assets", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  type: text("type", { enum: ["character", "scene", "prop"] }).notNull(),
+  name: text("name").notNull(),
+  aliases: text("aliases").notNull().default("[]"),
+  importance: integer("importance").notNull().default(0),
+  description: text("description").notNull().default(""),
+  visualConstraints: text("visual_constraints").notNull().default(""),
+  negativeConstraints: text("negative_constraints").notNull().default(""),
+  firstAppearance: text("first_appearance").notNull().default(""),
+  firstAppearanceChunkId: text("first_appearance_chunk_id").references(
+    () => scriptChunks.id,
+    { onDelete: "set null" },
+  ),
+  confirmed: integer("confirmed").notNull().default(0),
+  referenceImage: text("reference_image"),
+  version: integer("version").notNull().default(1),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const assetCandidates = sqliteTable("asset_candidates", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "cascade",
+  }),
+  chunkId: text("chunk_id").references(() => scriptChunks.id, {
+    onDelete: "cascade",
+  }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "set null",
+  }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  assetType: text("asset_type", {
+    enum: ["character", "scene", "prop"],
+  }).notNull(),
+  name: text("name").notNull(),
+  normalizedName: text("normalized_name").notNull().default(""),
+  aliases: text("aliases", { mode: "json" }),
+  role: text("role").notNull().default(""),
+  description: text("description").notNull().default(""),
+  evidenceText: text("evidence_text").notNull().default(""),
+  confidence: integer("confidence").notNull().default(50),
+  source: text("source", {
+    enum: ["ai", "local", "rule", "manual"],
+  })
+    .notNull()
+    .default("ai"),
+  status: text("status", {
+    enum: ["candidate", "merged", "rejected", "confirmed"],
+  })
+    .notNull()
+    .default("candidate"),
+  mergedAssetId: text("merged_asset_id").references(() => assets.id, {
+    onDelete: "set null",
+  }),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const assetOccurrences = sqliteTable("asset_occurrences", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  assetId: text("asset_id")
+    .notNull()
+    .references(() => assets.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "set null",
+  }),
+  chunkId: text("chunk_id").references(() => scriptChunks.id, {
+    onDelete: "set null",
+  }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "set null",
+  }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  candidateId: text("candidate_id").references(() => assetCandidates.id, {
+    onDelete: "set null",
+  }),
+  occurrenceType: text("occurrence_type", {
+    enum: ["mention", "appearance", "state_change", "ownership", "location"],
+  })
+    .notNull()
+    .default("mention"),
+  evidenceText: text("evidence_text").notNull().default(""),
+  importance: integer("importance").notNull().default(0),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const characterAssets = sqliteTable("character_assets", {
+  assetId: text("asset_id")
+    .primaryKey()
+    .references(() => assets.id, { onDelete: "cascade" }),
+  characterId: text("character_id").references(() => characters.id, {
+    onDelete: "set null",
+  }),
+  roleName: text("role_name").default(""),
+  age: text("age").default(""),
+  gender: text("gender").default(""),
+  personality: text("personality").default(""),
+  costume: text("costume").default(""),
+  voice: text("voice").default(""),
+  relationshipNotes: text("relationship_notes").default(""),
+});
+
+export const sceneAssets = sqliteTable("scene_assets", {
+  assetId: text("asset_id")
+    .primaryKey()
+    .references(() => assets.id, { onDelete: "cascade" }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  locationType: text("location_type").default(""),
+  timeOfDay: text("time_of_day").default(""),
+  lighting: text("lighting").default(""),
+  weather: text("weather").default(""),
+  layout: text("layout").default(""),
+});
+
+export const propAssets = sqliteTable("prop_assets", {
+  assetId: text("asset_id")
+    .primaryKey()
+    .references(() => assets.id, { onDelete: "cascade" }),
+  propCategory: text("prop_category").default(""),
+  ownerCharacterId: text("owner_character_id").references(() => characters.id, {
+    onDelete: "set null",
+  }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  state: text("state").default(""),
+  usageRules: text("usage_rules").default(""),
+});
+
+export const productionBibles = sqliteTable("production_bibles", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "set null",
+  }),
+  sourceScriptId: text("source_script_id").references(() => scripts.id, {
+    onDelete: "set null",
+  }),
+  version: integer("version").notNull().default(1),
+  title: text("title").notNull().default(""),
+  worldSetting: text("world_setting").notNull().default(""),
+  visualStyle: text("visual_style").notNull().default(""),
+  eraConstraints: text("era_constraints").notNull().default(""),
+  locationRules: text("location_rules").notNull().default(""),
+  characterRules: text("character_rules").notNull().default(""),
+  sceneRules: text("scene_rules").notNull().default(""),
+  propRules: text("prop_rules").notNull().default(""),
+  positivePromptTemplate: text("positive_prompt_template")
+    .notNull()
+    .default(""),
+  negativePromptTemplate: text("negative_prompt_template")
+    .notNull()
+    .default(""),
+  complianceRules: text("compliance_rules").notNull().default(""),
+  status: text("status", { enum: ["draft", "active", "archived"] })
+    .notNull()
+    .default("draft"),
+  isActive: integer("is_active").notNull().default(0),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const shotSpecs = sqliteTable("shot_specs", {
+  id: text("id").primaryKey(),
+  shotId: text("shot_id").references(() => shots.id, { onDelete: "set null" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "cascade",
+  }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  scriptChunkId: text("script_chunk_id").references(() => scriptChunks.id, {
+    onDelete: "set null",
+  }),
+  sequence: integer("sequence").notNull().default(0),
+  duration: integer("duration").notNull().default(10),
+  characters: text("characters").notNull().default("[]"),
+  sceneAssetId: text("scene_asset_id").references(() => assets.id, {
+    onDelete: "set null",
+  }),
+  propAssetIds: text("prop_asset_ids").notNull().default("[]"),
+  shotType: text("shot_type").notNull().default(""),
+  cameraAngle: text("camera_angle").notNull().default(""),
+  cameraMovement: text("camera_movement").notNull().default(""),
+  action: text("action").notNull().default(""),
+  emotion: text("emotion").notNull().default(""),
+  dialogue: text("dialogue").notNull().default(""),
+  voiceover: text("voiceover").notNull().default(""),
+  continuityIn: text("continuity_in").notNull().default(""),
+  continuityOut: text("continuity_out").notNull().default(""),
+  positivePrompt: text("positive_prompt").notNull().default(""),
+  negativePrompt: text("negative_prompt").notNull().default(""),
+  status: text("status", {
+    enum: ["draft", "ready", "generating", "completed", "failed"],
+  })
+    .notNull()
+    .default("draft"),
+  version: integer("version").notNull().default(1),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const storyboardFrames = sqliteTable("storyboard_frames", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  episodeId: text("episode_id").references(() => episodes.id, {
+    onDelete: "cascade",
+  }),
+  sceneId: text("scene_id").references(() => scenes.id, {
+    onDelete: "set null",
+  }),
+  shotId: text("shot_id").references(() => shots.id, { onDelete: "cascade" }),
+  shotSpecId: text("shot_spec_id").references(() => shotSpecs.id, {
+    onDelete: "set null",
+  }),
+  frameIndex: integer("frame_index").notNull().default(0),
+  imageUrl: text("image_url"),
+  prompt: text("prompt").notNull().default(""),
+  negativePrompt: text("negative_prompt").notNull().default(""),
+  status: text("status", {
+    enum: ["pending", "generating", "completed", "failed"],
+  })
+    .notNull()
+    .default("pending"),
+  modelProvider: text("model_provider"),
+  modelId: text("model_id"),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const promptTemplates = sqliteTable("prompt_templates", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),

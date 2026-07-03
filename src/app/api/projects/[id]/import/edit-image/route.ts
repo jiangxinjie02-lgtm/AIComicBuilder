@@ -82,12 +82,22 @@ export async function POST(
 
   const category = String(body.category || body.asset?.category || "");
   const providerImage = await toProviderImage(sourceImage);
-  const prompt = [
-    basePrompt,
-    "Edit instruction:",
-    editPrompt,
-    "Keep the same identity, facial features, body proportions, composition continuity, and visual style unless the instruction explicitly changes them.",
-  ].filter(Boolean).join("\n\n");
+  const isVariantTarget = String(body.targetType || "").startsWith("variant");
+  const prompt = isVariantTarget
+    ? [
+        "Create a visibly different variant from the source image.",
+        "Apply this variant instruction as the highest priority:",
+        editPrompt,
+        "Preserve only the same character identity, facial features, body proportions, and overall visual style.",
+        "Do not copy the source image exactly. If the instruction mentions outfit, hair, expression, weather, time of day, or state, make that change obvious.",
+        basePrompt ? `Base identity/context, lower priority:\n${basePrompt}` : "",
+      ].filter(Boolean).join("\n\n")
+    : [
+        basePrompt,
+        "Edit instruction:",
+        editPrompt,
+        "Keep the same identity, facial features, body proportions, composition continuity, and visual style unless the instruction explicitly changes them.",
+      ].filter(Boolean).join("\n\n");
 
   const payload: EditImagePayload = {
     model: getEditImageModel(),
@@ -109,6 +119,14 @@ export async function POST(
   };
 
   const result = await callImageEdit(payload);
+  const resultRecord = result as Record<string, unknown>;
+  const status = String(resultRecord.status || "");
+  const imageUrl = typeof resultRecord.imageUrl === "string" ? resultRecord.imageUrl : "";
+  if (status !== "succeeded" || !imageUrl) {
+    const message = String(resultRecord.error || resultRecord.message || "image edit failed");
+    return NextResponse.json({ ...result, error: message }, { status: 400 });
+  }
+
   return NextResponse.json(result);
 }
 
@@ -117,11 +135,10 @@ async function callImageEdit(payload: EditImagePayload) {
   const keyPool = getImageKeyPool();
   if (!endpoint || !keyPool) {
     return {
-      provider: "mock",
-      status: "skipped",
-      imageUrl: makePlaceholderImage(payload),
+      provider: "jimapi:image-edit",
+      status: "error",
       request: payload,
-      message: "Image edit endpoint is not configured; returned a local placeholder.",
+      error: "Image edit endpoint or API key is not configured.",
     };
   }
 
@@ -135,14 +152,14 @@ async function callImageEdit(payload: EditImagePayload) {
       const startedAt = Date.now();
 
       try {
+        const formData = await buildMultipartPayload(payload);
         const response = await fetch(endpoint, {
           method: "POST",
           signal: controller.signal,
           headers: {
-            "Content-Type": "application/json",
             Authorization: `Bearer ${entry.apiKey}`,
           },
-          body: JSON.stringify(stripMetadataForProvider(payload)),
+          body: formData,
         });
 
         const text = await response.text();
@@ -222,18 +239,38 @@ function getEditImageModel() {
   return process.env.JIMAPI_IMAGE_EDIT_MODEL || process.env.IMAGE_EDIT_MODEL || process.env.JIMAPI_IMAGE_MODEL || process.env.IMAGE2_MODEL || "gpt-image-2";
 }
 
-function stripMetadataForProvider(payload: EditImagePayload) {
-  const providerPayload = {
-    ...payload,
-    image_url: payload.image,
-    referenceImages: [payload.image],
-  } as Omit<EditImagePayload, "metadata"> & {
-    image_url: string;
-    referenceImages: string[];
-    metadata?: EditImagePayload["metadata"];
+async function buildMultipartPayload(payload: EditImagePayload) {
+  const formData = new FormData();
+  formData.append("model", payload.model);
+  formData.append("prompt", payload.prompt);
+  formData.append("n", String(payload.n));
+  formData.append("size", payload.size);
+  formData.append("quality", payload.quality);
+  formData.append("output_format", payload.output_format);
+
+  const image = await imageBlobFromProviderImage(payload.image, payload.metadata.assetName || payload.metadata.targetName);
+  formData.append("image", image.blob, image.filename);
+  return formData;
+}
+
+async function imageBlobFromProviderImage(image: string, filenameBase: string) {
+  if (image.startsWith("data:image/")) {
+    const match = image.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!match) throw new Error("Invalid data image");
+    const buffer = Buffer.from(match[2], "base64");
+    return {
+      blob: new Blob([buffer], { type: match[1] }),
+      filename: `${slugify(filenameBase || "source")}.${extensionFromMime(match[1])}`,
+    };
+  }
+
+  const response = await fetch(image);
+  if (!response.ok) throw new Error(`Failed to load source image: ${response.status}`);
+  const contentType = response.headers.get("content-type") || "image/png";
+  return {
+    blob: await response.blob(),
+    filename: `${slugify(filenameBase || "source")}.${extensionFromMime(contentType)}`,
   };
-  delete providerPayload.metadata;
-  return providerPayload;
 }
 
 async function toProviderImage(imageUrl: string) {
@@ -263,6 +300,14 @@ function mimeTypeFor(filePath: string) {
   if (ext === ".gif") return "image/gif";
   if (ext === ".bmp") return "image/bmp";
   return "image/png";
+}
+
+function extensionFromMime(mimeType: string) {
+  if (mimeType.includes("jpeg") || mimeType.includes("jpg")) return "jpg";
+  if (mimeType.includes("webp")) return "webp";
+  if (mimeType.includes("gif")) return "gif";
+  if (mimeType.includes("bmp")) return "bmp";
+  return "png";
 }
 
 async function extractImageResult(json: unknown, payload: EditImagePayload) {

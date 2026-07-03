@@ -10,6 +10,7 @@ import { resolveSlotContents } from "@/lib/ai/prompts/resolver";
 import { eq, and, lt, desc } from "drizzle-orm";
 import type { Task } from "@/lib/task-queue";
 import { getActiveAsset, insertAssetVersion, patchAsset } from "@/lib/shot-asset-utils";
+import { getProductionBiblePromptBlock } from "@/lib/production-bible";
 
 export async function handleFrameGenerate(task: Task) {
   const payload = task.payload as {
@@ -88,6 +89,7 @@ export async function handleFrameGenerate(task: Task) {
     const [project] = await db.select().from(projects).where(eq(projects.id, payload.projectId));
     if (project?.colorPalette) colorPalette = project.colorPalette;
   }
+  const productionBibleContext = await getProductionBiblePromptBlock(payload.projectId, shot.episodeId);
 
   // Build composition suffix
   let compositionSuffix = "";
@@ -104,6 +106,9 @@ export async function handleFrameGenerate(task: Task) {
   }
   if (colorPalette) {
     compositionSuffix += `\n\nGLOBAL COLOR PALETTE (mandatory): ${colorPalette}. All frames must adhere to this color scheme.`;
+  }
+  if (productionBibleContext) {
+    compositionSuffix += `\n\n${productionBibleContext}`;
   }
 
   // Build character height context for multi-character shots

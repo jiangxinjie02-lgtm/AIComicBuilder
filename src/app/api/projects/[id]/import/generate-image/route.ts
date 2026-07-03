@@ -4,6 +4,7 @@ import { projects } from "@/lib/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
+import { patchStoryAsset } from "@/lib/story-assets";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -110,6 +111,29 @@ export async function POST(
   };
 
   const result = await callImage2(payload);
+  const resultRecord = result as Record<string, unknown>;
+  const status = String(resultRecord.status || "");
+  const imageUrl = typeof resultRecord.imageUrl === "string" ? resultRecord.imageUrl : "";
+  if (status !== "succeeded" || !imageUrl) {
+    const message = String(resultRecord.error || resultRecord.message || "image2 generation failed");
+    return NextResponse.json({ ...result, error: message }, { status: 400 });
+  }
+
+  const dbAssetId = body.asset?.id || body.asset?.assetId || "";
+  if (dbAssetId && imageUrl && body.targetType !== "variant") {
+    await patchStoryAsset(projectId, dbAssetId, {
+      referenceImage: imageUrl,
+      metadata: {
+        generatedFromImportImage: {
+          provider: result.provider,
+          status: result.status,
+          targetName: payload.metadata.targetName,
+          category: payload.metadata.category,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+  }
   return NextResponse.json(result);
 }
 
@@ -118,11 +142,10 @@ async function callImage2(payload: ProviderPayload) {
   const keyPool = getImageKeyPool();
   if (!endpoint || !keyPool) {
     return {
-      provider: "mock",
-      status: "skipped",
-      imageUrl: makePlaceholderImage(payload),
+      provider: "jimapi:image2",
+      status: "error",
       request: payload,
-      message: "IMAGE2/JimAPI image key is not configured; returned a local placeholder image.",
+      error: "IMAGE2/JimAPI image key is not configured. Please set JIMAPI_API_KEY, JIMAPI_API_KEYS, IMAGE2_API_KEY, or IMAGE2_API_KEYS.",
     };
   }
 

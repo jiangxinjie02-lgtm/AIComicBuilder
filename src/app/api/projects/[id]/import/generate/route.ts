@@ -5,6 +5,7 @@ import { eq, and, max } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
+import { findCharacterIdByName, syncImportAssets } from "@/lib/story-assets";
 
 export const maxDuration = 60;
 
@@ -21,6 +22,20 @@ interface CharacterData {
   scope: "main" | "guest";
   description: string;
   visualHint?: string;
+  frequency?: number;
+  confirmed?: boolean;
+  assetId?: string;
+  role?: string;
+  roleKey?: string;
+  episodes?: string[];
+  prompt?: string;
+  negativePrompt?: string;
+  variants?: unknown[];
+  imageUrl?: string;
+  history?: unknown[];
+  mainImageName?: string;
+  tags?: string[];
+  faceTemplate?: unknown;
 }
 
 interface AssetData {
@@ -28,6 +43,20 @@ interface AssetData {
   frequency: number;
   description: string;
   visualHint?: string;
+  confirmed?: boolean;
+  assetId?: string;
+  category?: string;
+  role?: string;
+  roleKey?: string;
+  episodes?: string[];
+  prompt?: string;
+  negativePrompt?: string;
+  variants?: unknown[];
+  imageUrl?: string;
+  history?: unknown[];
+  mainImageName?: string;
+  tags?: string[];
+  faceTemplate?: unknown;
 }
 
 export async function POST(
@@ -108,6 +137,21 @@ export async function POST(
     `已创建 ${body.characters.length} 个角色${body.relationships?.length ? `和 ${body.relationships.length} 个关系` : ""}`
   );
 
+  const persistedAssetRows = await syncImportAssets(
+    projectId,
+    {
+      characters: body.characters,
+      items: body.items || [],
+      environments: body.environments || [],
+    },
+    { characterIdByName: await findCharacterIdByName(projectId) }
+  );
+
+  await addImportLog(
+    projectId, 5, "running",
+    `已写入资产库：人物 ${body.characters.length}、道具 ${body.items?.length || 0}、场景 ${body.environments?.length || 0}`
+  );
+
   // 2. Create episodes
   const [seqResult] = await db
     .select({ maxSeq: max(episodes.sequence) })
@@ -161,9 +205,15 @@ export async function POST(
       itemCount: body.items?.length || 0,
       environmentCount: body.environments?.length || 0,
       voiceCount: body.voices?.length || 0,
+      assetCount: persistedAssetRows.length,
       items: body.items || [],
       environments: body.environments || [],
       voices: body.voices || [],
+      assetIds: persistedAssetRows.map((asset) => ({
+        id: asset.id,
+        type: asset.type,
+        name: asset.name,
+      })),
     }
   );
 
@@ -173,6 +223,7 @@ export async function POST(
     itemCount: body.items?.length || 0,
     environmentCount: body.environments?.length || 0,
     voiceCount: body.voices?.length || 0,
+    assetCount: persistedAssetRows.length,
   }, { status: 201 });
 }
 
