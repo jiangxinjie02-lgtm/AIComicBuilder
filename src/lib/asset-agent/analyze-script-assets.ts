@@ -18,6 +18,7 @@ interface AnalyzeScriptAssetsInput {
 type AssetPromptSettings = Required<Pick<AnalyzeScriptAssetsInput, "aspectRatio" | "targetSize" | "style">> & {
   eraConstraint: string;
   genreConstraint: string;
+  visualStyleGuide: string;
 };
 
 export interface StoryMetaAnalysis {
@@ -66,6 +67,7 @@ export interface AssetAgentAsset {
   appearances: number;
   episodes: string[];
   description: string;
+  background?: string;
   visualConstraints: string;
   prompt: string;
   negativePrompt: string;
@@ -368,6 +370,7 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
     style,
     eraConstraint: inferAssetEraConstraint(storyMeta, normalized),
     genreConstraint: inferAssetGenreConstraint(storyMeta),
+    visualStyleGuide: buildProjectStyleGuide(storyMeta, normalized, style),
   };
   const characters = characterSeeds.slice(0, 80).map((seed, index) =>
     makeCharacterAsset(seed, index, normalized, episodes, settings)
@@ -753,6 +756,7 @@ function makeCharacterAsset(
   const temperament = inferTemperament(joined);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
   const profile = buildCharacterProfile(seed, snippets, joined);
+  const background = buildCharacterBackground(seed, snippets);
   const faceTemplate = FACE_TEMPLATES[roleKey] || null;
   const visualConstraints = [
     faceTemplate ? `${faceTemplate.label}；${faceTemplate.note}` : "",
@@ -778,7 +782,7 @@ function makeCharacterAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = buildCharacterImagePrompt(seed.name, seed.role, profile, visualConstraints, faceTemplate);
+  const prompt = buildCharacterImagePrompt(seed.name, seed.role, profile, background, visualConstraints, faceTemplate, settings.visualStyleGuide);
 
   return {
     id: `char_${index + 1}_${slugify(seed.name)}`,
@@ -795,6 +799,7 @@ function makeCharacterAsset(
     appearances: seed.score,
     episodes: epRefs,
     description: profile,
+    background,
     visualConstraints,
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("characters"),
@@ -839,7 +844,7 @@ function makePropAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = buildPropImagePrompt(seed.name, seed.type, description);
+  const prompt = buildPropImagePrompt(seed.name, seed.type, description, settings.visualStyleGuide);
 
   return {
     id: `prop_${index + 1}_${slugify(seed.name)}`,
@@ -901,7 +906,7 @@ function makeSceneAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = buildSceneImagePrompt(seed.name, seed.type, description, times);
+  const prompt = buildSceneImagePrompt(seed.name, seed.type, description, times, settings.visualStyleGuide);
 
   return {
     id: `scene_${index + 1}_${slugify(seed.name)}`,
@@ -1312,74 +1317,172 @@ function normalizeCharacterProfileLength(text: string, name: string, role: strin
     .filter(Boolean);
   let profile = sentences.join("");
   if (!profile.startsWith(name)) profile = `${name}是剧本中的${role}。${profile}`;
-  if (profile.length > 200) {
+  if (profile.length > 120) {
     let shortened = "";
     for (const sentence of sentences) {
-      if ((shortened + sentence).length > 190) break;
+      if ((shortened + sentence).length > 110) break;
       shortened += sentence;
     }
-    profile = shortened || profile.slice(0, 190);
+    profile = shortened || profile.slice(0, 110);
     profile = ensureSentenceEnd(profile);
   }
-  const fillers = [
-    `${name}在故事中围绕${role || "角色"}身份承担清晰的叙事功能，处事方式、情绪底色和与主要阵营的关系需要保持连贯。`,
-    `${name}的人物动机应来自剧本中的经历和处境，外在状态可随情节变化，但性格核心、年龄层次、身份气质和辨识记忆点要稳定。`,
-    `${name}的表演应强调可信的生活细节、情绪层次和人物关系张力。`,
-  ];
-  for (const filler of fillers) {
-    if (profile.length >= 120) break;
-    profile += filler;
+  if (profile.length < 30) {
+    profile += `${name}在剧本中承担${role || "角色"}定位，外在状态随剧情变化但核心身份保持稳定。`;
   }
-  if (profile.length > 200) profile = ensureSentenceEnd(profile.slice(0, 196));
   return ensureSentenceEnd(profile);
+}
+
+const PROMPT_OVERALL_AESTHETIC = "真人实拍摄影质感，自然皮肤毛孔与织物纹理，影棚级光影，35mm 胶片质地。";
+const PROMPT_ENVIRONMENT_AESTHETIC = "院线电影级宏大时代叙事与细腻情感氛围，Teal-Orange 暖金冷青调，35mm 胶片颗粒质感，Cinematic。";
+
+function buildOverallAesthetic(projectStyleGuide = "") {
+  return [
+    PROMPT_OVERALL_AESTHETIC,
+    projectStyleGuide,
+  ].filter(Boolean);
+}
+
+function buildProjectStyleGuide(meta: StoryMetaAnalysis | undefined, script: string, fallbackStyle = "") {
+  const seed = [
+    meta?.visualStyleBase,
+    meta?.genre,
+    meta?.background,
+    meta?.locationBackground,
+    meta?.time,
+    fallbackStyle,
+    script.slice(0, 500),
+  ].filter(Boolean).join("，");
+  const compact = [
+    meta?.visualStyleBase,
+    meta?.genre,
+    meta?.background,
+  ].filter(Boolean).join("；").replace(/\s+/g, " ").trim();
+  if (/古装|宫廷|权谋|武侠|仙侠|玄幻|修仙|江湖/.test(seed)) {
+    return `整体画风：古装写实影视画风，服饰、建筑、道具、光影和色彩都统一到${compact || "古代东方叙事氛围"}。`;
+  }
+  if (/末世|废土|丧尸|灾变|避难所|重卡|荒凉|末日/.test(seed)) {
+    return `整体画风：末世废土写实画风，荒凉废墟、钢铁载具、冷酷战斗和生存压迫感统一呈现；参考${compact || "末世灾变世界观"}。`;
+  }
+  if (/民国|年代|军阀|谍战|抗战/.test(seed)) {
+    return `整体画风：年代写实影视画风，服装、建筑、道具和色彩统一到${compact || "年代剧质感"}。`;
+  }
+  if (/校园|青春|学生|学校/.test(seed)) {
+    return `整体画风：青春校园写实画风，人物、场景、服装和道具统一到${compact || "清爽真实的校园氛围"}。`;
+  }
+  if (/都市|豪门|总裁|职场|商业|婚恋/.test(seed)) {
+    return `整体画风：都市短剧写实画风，人物造型、室内外空间和物品质感统一到${compact || "现代都市叙事氛围"}。`;
+  }
+  return `整体画风：${compact || fallbackStyle || "真人短剧写实画风"}；所有角色、场景、物品必须保持同一剧本世界观和视觉风格。`;
+}
+
+function joinPromptSections(sections: Array<[string, string | string[]]>) {
+  return sections
+    .map(([title, content]) => {
+      const body = (Array.isArray(content) ? content : [content])
+        .map((line) => String(line || "").trim())
+        .filter(Boolean)
+        .join("\n");
+      return body ? `【${title}】\n${body}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildCharacterBackground(seed: CharacterSeed, snippets: string[]) {
+  const source = seed.contexts.concat(snippets).join(" ");
+  const sentences = source
+    .replace(/\s+/g, " ")
+    .split(/(?<=[。！？!?])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const first = ensureSentenceEnd(sentences[0] || `${seed.name}的主要剧情围绕${seed.role}身份、关键选择和人物关系展开`);
+  const second = ensureSentenceEnd(
+    compactText(sentences.slice(1).join(""), 90)
+    || `${seed.name}在冲突推进、情绪转折和阵营关系中承担重要叙事作用`,
+  );
+  return `${first}\n${second}`;
 }
 
 function buildCharacterImagePrompt(
   name: string,
   role: string,
   profile: string,
+  background: string,
   visualConstraints: string,
   faceTemplate: FaceTemplate | null,
+  projectStyleGuide: string,
 ) {
-  const templateLine = faceTemplate ? `${faceTemplate.label}（${faceTemplate.url}）` : "同一角色身份锁定";
-  return [
-    "【角色真人模板锁定】",
-    templateLine,
-    "主图和全部变体必须保持同一张脸：脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱、表情动作和剧情状态。",
-    "真人实拍摄影质感，禁止漫画风、二次元、插画风、AI 换脸感或改变角色性别年龄。",
-    "",
-    "【角色档案】",
-    ensureSentenceEnd(profile || `${name}是剧本中的${role}。`),
-    "",
-    "【视觉约束】",
-    visualConstraints,
-    "",
-    "【主图生成要求】",
-    "真人实拍角色设定三视图，纯白背景，左侧面部近景，右侧正面、侧面、背面全身三视图；保持模板脸型五官和面部辨识度一致。",
-  ].join("\n");
+  const templateLock = faceTemplate
+    ? `参考${faceTemplate.label}（${faceTemplate.url}），脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须与模板一致。`
+    : "同一角色身份锁定，脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须保持一致。";
+  const genderConstraint = /男/.test(role)
+    ? "性别识别保持男性，不改变年龄层次和人物辨识度。"
+    : /女/.test(role)
+      ? "性别识别保持女性，不改变年龄层次和人物辨识度。"
+      : "";
+  const supportConstraint = faceTemplate ? genderConstraint : [genderConstraint, visualConstraints].filter(Boolean).join("；");
+  return joinPromptSections([
+    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
+    ["画面规格", [
+      `角色设定图，“${name}”，16:9 横版，纯白背景，平视视角。`,
+      "左 40%：3/4 面部近景；右 60%：正面、侧面、背面全身三视图。",
+      "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
+    ]],
+    ["角色档案", `主体：${ensureSentenceEnd(profile || `${name}是剧本中的${role}。`)}`],
+    ["角色背景说明", background],
+    ["模板锁定", [
+      `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
+      supportConstraint ? `身份约束：${supportConstraint}` : "",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印、UI；无其他人物；不复制身体或同脸分身；禁止漫画风、二次元、插画风。"],
+  ]);
 }
 
-function buildPropImagePrompt(name: string, type: string, description: string) {
-  return [
-    "【道具主图】",
-    `${name}，${type || "剧情道具"}。`,
-    "",
-    "【生成要求】",
-    "真人短剧质感的道具资产参考图，纯白或浅灰背景，单体清晰展示，结构、材质、颜色和尺寸比例稳定，适合后续多镜头复用。",
-    `概述：${name}是剧本中的${type || "剧情道具"}，需要保持清晰稳定的外观、材质和比例，便于后续镜头反复复用。`,
-  ].filter(Boolean).join("\n");
+function buildPropImagePrompt(name: string, type: string, description: string, projectStyleGuide: string) {
+  const assetType = type || "剧情道具";
+  const propSource = String(description || "").replace(/\s+/g, " ").trim();
+  const propFallback = `${name}是剧本中的${assetType}，需体现核心功能、材质结构和关键识别特征。`;
+  const propDescription = propSource.length > 150 || /剧名|人设|第\d+集|陆铮|沈念|赵衡/.test(propSource)
+    ? propFallback
+    : propSource || propFallback;
+  const assetDescription = ensureSentenceEnd(
+    compactText(propDescription, 120)
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  return joinPromptSections([
+    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
+    ["画面规格", `物品参考图，“${name}”。单个物品，居中构图，纯白背景，正面视角，完整展示全貌与表面质感。`],
+    ["物品档案", [
+      `类型：${assetType}。${assetDescription}`,
+      "突出形状、尺寸、材质、颜色、磨损痕迹和可反复识别的细节。",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印；无持握者、手、人物、人影；无背景环境。"],
+  ]);
 }
 
-function buildSceneImagePrompt(name: string, type: string, description: string, times: string[]) {
+function buildSceneImagePrompt(name: string, type: string, description: string, times: string[], projectStyleGuide: string) {
+  const sceneType = type || "剧情场景";
   const timeText = times.length ? `可扩展为${times.map((time) => `${time}景`).join("、")}。` : "";
-  return [
-    "【场景主图】",
-    `${name}，${type || "剧情场景"}。`,
-    "",
-    "【生成要求】",
-    `真人短剧质感的空镜场景资产参考图，无人物，保持空间结构、主要陈设、镜头高度和方位清晰稳定，适合后续分镜复用。${timeText}`,
-    `概述：${name}是剧本中的${type || "剧情场景"}，需要建立稳定的空间结构、环境氛围和主要陈设，便于后续镜头反复复用。`,
-  ].filter(Boolean).join("\n");
+  const sceneSource = String(description || "").replace(/\s+/g, " ").trim();
+  const sceneFallback = `${name}是剧本中的${sceneType}，需要建立稳定的空间结构、环境氛围和可复用方位关系。`;
+  const sceneBase = sceneSource.length > 170 || /剧名|人设|第\d+集|陆铮|沈念|赵衡/.test(sceneSource)
+    ? sceneFallback
+    : sceneSource || sceneFallback;
+  const sceneDescription = ensureSentenceEnd(
+    `${compactText(sceneBase, 140)}${timeText}`
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  return joinPromptSections([
+    ["整体美学", [...buildOverallAesthetic(projectStyleGuide), PROMPT_ENVIRONMENT_AESTHETIC]],
+    ["画面规格", `环境概念图，“${name}”。16:9 宽银幕，大全景，超广角，平视视角，大气透视。`],
+    ["环境档案", [
+      `空间类型：${sceneType}。${sceneDescription}`,
+      "突出空间尺度、布局、建筑材质、主色调、标志性陈设和光源基调。",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印；无人物、人影、行人、路人。"],
+  ]);
 }
 
 function suggestCharacterVariants(name: string, role: string, snippets: string[], faceTemplate: FaceTemplate | null) {

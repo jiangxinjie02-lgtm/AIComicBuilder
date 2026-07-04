@@ -36,6 +36,7 @@ interface ExtractedCharacter {
   description: string;
   visualHint?: string;
   visualConstraints?: string;
+  background?: string;
   scope: "main" | "guest";
   confirmed?: boolean;
   assetId?: string;
@@ -114,21 +115,48 @@ const CHARACTER_FACE_TEMPLATES: Record<string, NonNullable<ExtractedCharacter["f
   },
 };
 
-function normalizeImportedCharacters(characters: ExtractedCharacter[]) {
-  return characters.map((character) => normalizeImportedCharacter(character));
+const PROMPT_OVERALL_AESTHETIC = "真人实拍摄影质感，自然皮肤毛孔与织物纹理，影棚级光影，35mm 胶片质地。";
+const PROMPT_ENVIRONMENT_AESTHETIC = "院线电影级宏大时代叙事与细腻情感氛围，Teal-Orange 暖金冷青调，35mm 胶片颗粒质感，Cinematic。";
+
+function normalizeImportedCharacters(characters: ExtractedCharacter[], projectStyleGuide = "") {
+  return characters.map((character) => normalizeImportedCharacter(character, projectStyleGuide));
 }
 
-function normalizeImportedCharacter(character: ExtractedCharacter): ExtractedCharacter {
+function normalizeImportedItems(items: ExtractedAsset[], projectStyleGuide = "") {
+  return items.map((item) => normalizeImportedItem(item, projectStyleGuide));
+}
+
+function normalizeImportedEnvironments(environments: ExtractedAsset[], projectStyleGuide = "") {
+  return environments.map((environment) => normalizeImportedEnvironment(environment, projectStyleGuide));
+}
+
+function normalizeImportedItem(item: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
+  return {
+    ...item,
+    prompt: buildItemPromptTemplate(item, projectStyleGuide),
+  };
+}
+
+function normalizeImportedEnvironment(environment: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
+  return {
+    ...environment,
+    prompt: buildEnvironmentPromptTemplate(environment, projectStyleGuide),
+  };
+}
+
+function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleGuide = ""): ExtractedCharacter {
   const roleKey = inferCharacterRoleKey(character);
   const faceTemplate = CHARACTER_FACE_TEMPLATES[roleKey] || character.faceTemplate || null;
   const profile = sanitizeCharacterProfile(character);
+  const background = buildCharacterBackground(character, profile);
   const variants = buildExpectedCharacterVariants(character, faceTemplate, profile);
   const visualConstraints = ensureCharacterVisualConstraints(character, faceTemplate, roleKey);
-  const prompt = ensureCharacterPrompt(character, faceTemplate, visualConstraints, profile);
+  const prompt = ensureCharacterPrompt(character, faceTemplate, visualConstraints, profile, background, projectStyleGuide);
 
   return {
     ...character,
     description: profile,
+    background,
     roleKey,
     faceTemplate,
     visualConstraints,
@@ -173,25 +201,168 @@ function ensureCharacterPrompt(
   faceTemplate: ExtractedCharacter["faceTemplate"],
   visualConstraints: string,
   profile: string,
+  background: string,
+  projectStyleGuide: string,
 ) {
-  const templateLine = faceTemplate
-    ? `${faceTemplate.label}（${faceTemplate.url}）`
-    : "同一角色身份锁定";
+  const templateLock = faceTemplate
+    ? `参考${faceTemplate.label}（${faceTemplate.url}），脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须与模板一致。`
+    : "同一角色身份锁定，脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须保持一致。";
+  const genderConstraint = inferCharacterGenderConstraint(character, inferCharacterRoleKey(character));
+  const supportConstraint = faceTemplate ? genderConstraint : [genderConstraint, visualConstraints].filter(Boolean).join("；");
+  return joinPromptSections([
+    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
+    ["画面规格", [
+      `角色设定图，“${character.name || "角色"}”，16:9 横版，纯白背景，平视视角。`,
+      "左 40%：3/4 面部近景；右 60%：正面、侧面、背面全身三视图。",
+      "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
+    ]],
+    ["角色档案", `主体：${ensureChineseSentence(profile || `${character.name || "角色"}是剧本中的${character.role || "角色"}`)}`],
+    ["角色背景说明", background],
+    ["模板锁定", [
+      `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
+      supportConstraint ? `身份约束：${supportConstraint}` : "",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印、UI；无其他人物；不复制身体或同脸分身；禁止漫画风、二次元、插画风。"],
+  ]);
+}
+
+function joinPromptSections(sections: Array<[string, string | string[]]>) {
+  return sections
+    .map(([title, content]) => {
+      const body = (Array.isArray(content) ? content : [content])
+        .map((line) => String(line || "").trim())
+        .filter(Boolean)
+        .join("\n");
+      return body ? `【${title}】\n${body}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildOverallAesthetic(projectStyleGuide = "") {
   return [
-    "【角色真人模板锁定】",
-    templateLine,
-    "主图和全部变体必须保持同一张脸：脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱、表情动作和剧情状态。",
-    "真人实拍摄影质感，禁止漫画风、二次元、插画风、AI 换脸感或改变角色性别年龄。",
-    "",
-    "【角色档案】",
-    profile,
-    "",
-    "【视觉约束】",
-    visualConstraints,
-    "",
-    "【主图生成要求】",
-    "真人实拍角色设定三视图，纯白背景，左侧面部近景，右侧正面、侧面、背面全身三视图；保持模板脸型五官和面部辨识度一致。",
-  ].join("\n");
+    PROMPT_OVERALL_AESTHETIC,
+    projectStyleGuide,
+  ].filter(Boolean);
+}
+
+function buildProjectStyleGuide(storyAnalysis?: StoryAssetAnalysis | null, sourceText = "") {
+  const meta = storyAnalysis?.storyMeta;
+  const seed = [
+    meta?.visualStyleBase,
+    meta?.genre,
+    meta?.background,
+    meta?.locationBackground,
+    meta?.time,
+    sourceText.slice(0, 500),
+  ].filter(Boolean).join("，");
+  const compact = [
+    meta?.visualStyleBase,
+    meta?.genre,
+    meta?.background,
+  ].filter(Boolean).join("；").replace(/\s+/g, " ").trim();
+  if (/古装|宫廷|权谋|武侠|仙侠|玄幻|修仙|江湖/.test(seed)) {
+    return `整体画风：古装写实影视画风，服饰、建筑、道具、光影和色彩都统一到${compact || "古代东方叙事氛围"}。`;
+  }
+  if (/末世|废土|丧尸|灾变|避难所|重卡|荒凉|末日/.test(seed)) {
+    return `整体画风：末世废土写实画风，荒凉废墟、钢铁载具、冷酷战斗和生存压迫感统一呈现；参考${compact || "末世灾变世界观"}。`;
+  }
+  if (/民国|年代|军阀|谍战|抗战/.test(seed)) {
+    return `整体画风：年代写实影视画风，服装、建筑、道具和色彩统一到${compact || "年代剧质感"}。`;
+  }
+  if (/校园|青春|学生|学校/.test(seed)) {
+    return `整体画风：青春校园写实画风，人物、场景、服装和道具统一到${compact || "清爽真实的校园氛围"}。`;
+  }
+  if (/都市|豪门|总裁|职场|商业|婚恋/.test(seed)) {
+    return `整体画风：都市短剧写实画风，人物造型、室内外空间和物品质感统一到${compact || "现代都市叙事氛围"}。`;
+  }
+  return `整体画风：${compact || "真人短剧写实画风"}；所有角色、场景、物品必须保持同一剧本世界观和视觉风格。`;
+}
+
+function extractCharacterSubject(prompt: string) {
+  const raw = extractPromptSection(prompt || "", "【角色档案】");
+  const subjectLine = raw
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("主体：") || line.startsWith("主体:"));
+  return (subjectLine ? subjectLine.replace(/^主体[:：]\s*/, "") : raw.split(/\n+/)[0] || "").trim();
+}
+
+function extractCharacterBackground(prompt: string) {
+  return extractPromptSection(prompt || "", "【角色背景说明】")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 2)
+    .join("\n");
+}
+
+function buildCharacterBackground(character: ExtractedCharacter, profile: string) {
+  const source = character.background || extractCharacterBackground(character.prompt || "") || character.visualHint || profile;
+  return normalizeTwoLineBackground(source, character.name || "角色");
+}
+
+function normalizeTwoLineBackground(source: string, name: string) {
+  const sentences = String(source || "")
+    .replace(/【[\s\S]*$/g, "")
+    .replace(/主体[:：]/g, "")
+    .replace(/模板锁定[:：][\s\S]*$/g, "")
+    .replace(/身份约束[:：][\s\S]*$/g, "")
+    .replace(/\s+/g, " ")
+    .split(/(?<=[。！？!?])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const first = ensureChineseSentence(sentences[0] || `${name}的主要剧情围绕其身份、关键选择和人物关系展开`);
+  const second = ensureChineseSentence(sentences.slice(1).join("").slice(0, 90) || `${name}在冲突推进、情绪转折和阵营关系中承担重要叙事作用`);
+  return `${first}\n${second}`;
+}
+
+function assetTypeLabel(asset: ExtractedAsset, fallback: string) {
+  return asset.role || asset.category || asset.tags?.[0] || fallback;
+}
+
+function assetPromptDescription(asset: ExtractedAsset, fallback: string) {
+  const source = String(asset.description || asset.visualHint || fallback)
+    .replace(/\s+/g, " ")
+    .trim();
+  const polluted = source.length > 150 || /剧名|人设|第\d+集|陆铮|沈念|赵衡/.test(source);
+  const base = polluted ? fallback : source;
+  const compact = base.length > 120
+    ? base.slice(0, 116).replace(/[，,；;：:、][^，,；;：:、]*$/, "")
+    : base;
+  return ensureChineseSentence(
+    compact || fallback,
+  );
+}
+
+function buildItemPromptTemplate(item: ExtractedAsset, projectStyleGuide = "") {
+  const name = item.name || "物品";
+  const type = assetTypeLabel(item, "剧情道具");
+  const description = assetPromptDescription(item, `${name}是剧本中的${type}，需要清晰展示外观、材质、颜色、尺寸比例和显著标记。`);
+  return joinPromptSections([
+    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
+    ["画面规格", `物品参考图，“${name}”。单个物品，居中构图，纯白背景，正面视角，完整展示全貌与表面质感。`],
+    ["物品档案", [
+      `类型：${type}。${description}`,
+      "突出形状、尺寸、材质、颜色、磨损痕迹和可反复识别的细节。",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印；无持握者、手、人物、人影；无背景环境。"],
+  ]);
+}
+
+function buildEnvironmentPromptTemplate(environment: ExtractedAsset, projectStyleGuide = "") {
+  const name = environment.name || "环境";
+  const type = assetTypeLabel(environment, "剧情场景");
+  const description = assetPromptDescription(environment, `${name}是剧本中的${type}，需要建立稳定的空间结构、环境氛围和主要陈设。`);
+  return joinPromptSections([
+    ["整体美学", [...buildOverallAesthetic(projectStyleGuide), PROMPT_ENVIRONMENT_AESTHETIC]],
+    ["画面规格", `环境概念图，“${name}”。16:9 宽银幕，大全景，超广角，平视视角，大气透视。`],
+    ["环境档案", [
+      `空间类型：${type}。${description}`,
+      "突出空间尺度、布局、建筑材质、主色调、标志性陈设和光源基调。",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印；无人物、人影、行人、路人。"],
+  ]);
 }
 
 function buildExpectedCharacterVariants(
@@ -243,15 +414,23 @@ function buildExpectedCharacterVariants(
 }
 
 function sanitizeCharacterProfile(character: ExtractedCharacter) {
-  const promptProfile = extractPromptSection(character.prompt || "", "【角色档案】");
+  const promptProfile = extractCharacterSubject(character.prompt || "");
   const source = promptProfile || character.description || `${character.name || "角色"}是剧本中的${character.role || "角色"}`;
   const cleaned = String(source)
     .replace(/人物：[^。！？!?]*/g, "")
+    .replace(/主体[:：]/g, "")
     .replace(/【角色真人模板锁定】[\s\S]*$/g, "")
+    .replace(/【整体美学】[\s\S]*$/g, "")
+    .replace(/【画面规格】[\s\S]*$/g, "")
+    .replace(/【角色背景说明】[\s\S]*$/g, "")
+    .replace(/【模板锁定】[\s\S]*$/g, "")
+    .replace(/【排除项】[\s\S]*$/g, "")
     .replace(/【视觉约束】[\s\S]*$/g, "")
     .replace(/【主图生成要求】[\s\S]*$/g, "")
     .replace(/【原始生图提示词】[\s\S]*$/g, "")
     .replace(/Asset reference sheet[\s\S]*$/gi, "")
+    .replace(/描述呈现。?/g, "")
+    .replace(/所有视图保持同一人物[^。！？!?]*[。！？!?]?/g, "")
     .replace(/需要根据整体剧本建立稳定、可复用的个人形象；?/g, "")
     .replace(/资产设定/g, "")
     .replace(/\s+/g, " ")
@@ -291,27 +470,17 @@ function normalizeCharacterProfileLength(text: string, name: string, role: strin
   if (!profile.startsWith(name)) {
     profile = `${name}是剧本中的${role}。${profile}`;
   }
-  if (profile.length > 200) {
+  if (profile.length > 120) {
     let shortened = "";
     for (const sentence of sentences) {
-      if ((shortened + sentence).length > 190) break;
+      if ((shortened + sentence).length > 110) break;
       shortened += sentence;
     }
-    profile = shortened || profile.slice(0, 190);
+    profile = shortened || profile.slice(0, 110);
     profile = ensureChineseSentence(profile);
   }
-  const roleText = role || "角色";
-  const fillers = [
-    `${name}在故事中围绕${roleText}身份承担清晰的叙事功能，处事方式、情绪底色和与主要阵营的关系需要保持连贯。`,
-    `${name}的人物动机应来自剧本中的经历和处境，外在状态可随情节变化，但性格核心、年龄层次、身份气质和辨识记忆点要稳定。`,
-    `${name}的表演应强调可信的生活细节、情绪层次和人物关系张力。`,
-  ];
-  for (const filler of fillers) {
-    if (profile.length >= 120) break;
-    profile += filler;
-  }
-  if (profile.length > 200) {
-    profile = ensureChineseSentence(profile.slice(0, 196));
+  if (profile.length < 30) {
+    profile += `${name}在剧本中承担${role || "角色"}定位，外在状态随剧情变化但核心身份保持稳定。`;
   }
   return ensureChineseSentence(profile);
 }
@@ -542,6 +711,7 @@ export default function ImportPage({
   const [activeAssetTab, setActiveAssetTab] = useState<AssetTab>("characters");
   const [activeAssetKey, setActiveAssetKey] = useState("");
   const [assetGeneratingTargets, setAssetGeneratingTargets] = useState<string[]>([]);
+  const [allMainGenerationProgress, setAllMainGenerationProgress] = useState<{ completed: number; total: number } | null>(null);
   const [assetUploadingTarget, setAssetUploadingTarget] = useState<string | null>(null);
   const [assetEditingTarget, setAssetEditingTarget] = useState<string | null>(null);
   const [draftHydrated, setDraftHydrated] = useState(false);
@@ -672,6 +842,8 @@ export default function ImportPage({
         ]);
         const draft = (await draftRes.json()) as ImportDraftState | null;
         const data = await logsRes.json();
+        let restoredTextForStyle = "";
+        let storyAnalysisForStyle: StoryAssetAnalysis | null = null;
         if (data.length > 0) {
           setLogs(data);
           setHistoryMode(true);
@@ -686,6 +858,9 @@ export default function ImportPage({
           const restoredText = storyMeta?.text || parseMeta?.text || storyMeta?.preview;
           if (restoredText) setFullText(restoredText);
           if (storyMeta?.storyAnalysis) setStoryAnalysis(storyMeta.storyAnalysis);
+          restoredTextForStyle = restoredText || "";
+          storyAnalysisForStyle = storyMeta?.storyAnalysis ?? null;
+          const logProjectStyleGuide = buildProjectStyleGuide(storyMeta?.storyAnalysis ?? null, restoredText || "");
 
           const assetLog = data.find((l: LogEntry) => l.step === 3 && l.status === "done" && l.metadata);
           const assetMeta = assetLog?.metadata as {
@@ -695,9 +870,9 @@ export default function ImportPage({
             voices?: ExtractedAsset[];
             relationships?: Array<{ characterA: string; characterB: string; relationType: string; description?: string }>;
           } | undefined;
-          if (assetMeta?.characters) setCharacters(normalizeImportedCharacters(assetMeta.characters));
-          if (assetMeta?.items) setItems(assetMeta.items);
-          if (assetMeta?.environments) setEnvironments(assetMeta.environments);
+          if (assetMeta?.characters) setCharacters(normalizeImportedCharacters(assetMeta.characters, logProjectStyleGuide));
+          if (assetMeta?.items) setItems(normalizeImportedItems(assetMeta.items, logProjectStyleGuide));
+          if (assetMeta?.environments) setEnvironments(normalizeImportedEnvironments(assetMeta.environments, logProjectStyleGuide));
           if (assetMeta?.voices) setVoices(assetMeta.voices);
           if (assetMeta?.relationships) setRelationships(assetMeta.relationships);
 
@@ -728,9 +903,13 @@ export default function ImportPage({
           if (typeof draft.fullText === "string") setFullText(draft.fullText);
           if (Array.isArray(draft.reviewIssues)) setReviewIssues(draft.reviewIssues);
           if (draft.storyAnalysis !== undefined) setStoryAnalysis(draft.storyAnalysis ?? null);
-          if (Array.isArray(draft.characters)) setCharacters(normalizeImportedCharacters(draft.characters));
-          if (Array.isArray(draft.items)) setItems(draft.items);
-          if (Array.isArray(draft.environments)) setEnvironments(draft.environments);
+          const draftProjectStyleGuide = buildProjectStyleGuide(
+            draft.storyAnalysis ?? storyAnalysisForStyle,
+            typeof draft.fullText === "string" ? draft.fullText : restoredTextForStyle,
+          );
+          if (Array.isArray(draft.characters)) setCharacters(normalizeImportedCharacters(draft.characters, draftProjectStyleGuide));
+          if (Array.isArray(draft.items)) setItems(normalizeImportedItems(draft.items, draftProjectStyleGuide));
+          if (Array.isArray(draft.environments)) setEnvironments(normalizeImportedEnvironments(draft.environments, draftProjectStyleGuide));
           if (Array.isArray(draft.voices)) setVoices(draft.voices);
           if (Array.isArray(draft.relationships)) setRelationships(draft.relationships);
           if (Array.isArray(draft.episodes)) {
@@ -1228,9 +1407,13 @@ export default function ImportPage({
         throw new Error(errData.error || `HTTP ${res.status}`);
       }
       const data = await res.json();
-      setCharacters(normalizeImportedCharacters(data.characters));
-      setItems(data.items || []);
-      setEnvironments(data.environments || []);
+      const projectStyleGuide = buildProjectStyleGuide(storyAnalysis, fullText);
+      const normalizedCharacters = normalizeImportedCharacters(data.characters, projectStyleGuide);
+      const normalizedItems = normalizeImportedItems(data.items || [], projectStyleGuide);
+      const normalizedEnvironments = normalizeImportedEnvironments(data.environments || [], projectStyleGuide);
+      setCharacters(normalizedCharacters);
+      setItems(normalizedItems);
+      setEnvironments(normalizedEnvironments);
       setVoices(data.voices || []);
       setRelationships(data.relationships || []);
       const mainCount = data.characters.filter((c: ExtractedCharacter) => c.scope === "main").length;
@@ -1241,9 +1424,9 @@ export default function ImportPage({
         ...buildDraftPayload(),
         currentStep: 3,
         stepStatus: { ...stepStatus, 3: "done" },
-        characters: normalizeImportedCharacters(data.characters),
-        items: data.items || [],
-        environments: data.environments || [],
+        characters: normalizedCharacters,
+        items: normalizedItems,
+        environments: normalizedEnvironments,
         voices: data.voices || [],
         relationships: data.relationships || [],
       });
@@ -2298,7 +2481,9 @@ export default function ImportPage({
 
     const targetKey = "all:main";
     beginAssetGenerating(targetKey);
+    setAllMainGenerationProgress({ completed: 0, total: jobs.length });
     let successCount = 0;
+    let completedCount = 0;
     let nextIndex = 0;
 
     async function runner() {
@@ -2309,6 +2494,8 @@ export default function ImportPage({
           keepBusy: true,
         });
         if (ok) successCount += 1;
+        completedCount += 1;
+        setAllMainGenerationProgress({ completed: completedCount, total: jobs.length });
       }
     }
 
@@ -2909,23 +3096,32 @@ export default function ImportPage({
                 <div className={`text-xs font-semibold ${allAssetsConfirmed ? "text-emerald-600" : "text-amber-600"}`}>
                   资产确认 {confirmedAssetCount}/{allWorkbenchAssets.length}
                 </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={generateAllMainImages}
-                  disabled={
-                    characters.length + items.length + environments.length === 0
-                    || isAssetGenerating("all:main")
-                  }
-                  className="rounded-xl"
-                >
-                  {isAssetGenerating("all:main") ? (
-                    <Loader2 className="size-4 animate-spin" />
+                <div className="flex min-w-[142px] flex-col items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={generateAllMainImages}
+                    disabled={
+                      characters.length + items.length + environments.length === 0
+                      || isAssetGenerating("all:main")
+                    }
+                    className="w-full rounded-xl"
+                  >
+                    {isAssetGenerating("all:main") ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Images className="size-4" />
+                    )}
+                    一键生成所有主图
+                  </Button>
+                  {allMainGenerationProgress ? (
+                    <div className="text-[11px] font-semibold leading-none text-primary">
+                      生图进度 {allMainGenerationProgress.completed}/{allMainGenerationProgress.total}
+                    </div>
                   ) : (
-                    <Images className="size-4" />
+                    <div className="h-[11px]" aria-hidden="true" />
                   )}
-                  一键生成所有主图
-                </Button>
+                </div>
                 <Button
                   type="button"
                   variant="outline"
