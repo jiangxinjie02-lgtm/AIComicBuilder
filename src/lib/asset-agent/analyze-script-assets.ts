@@ -1333,8 +1333,6 @@ function normalizeCharacterProfileLength(text: string, name: string, role: strin
 }
 
 const PROMPT_OVERALL_AESTHETIC = "真人实拍摄影质感，自然皮肤毛孔与织物纹理，影棚级光影，35mm 胶片质地。";
-const PROMPT_ENVIRONMENT_AESTHETIC = "院线电影级宏大时代叙事与细腻情感氛围，Teal-Orange 暖金冷青调，35mm 胶片颗粒质感，Cinematic。";
-
 function buildOverallAesthetic(projectStyleGuide = "") {
   return [
     PROMPT_OVERALL_AESTHETIC,
@@ -1352,27 +1350,22 @@ function buildProjectStyleGuide(meta: StoryMetaAnalysis | undefined, script: str
     fallbackStyle,
     script.slice(0, 500),
   ].filter(Boolean).join("，");
-  const compact = [
-    meta?.visualStyleBase,
-    meta?.genre,
-    meta?.background,
-  ].filter(Boolean).join("；").replace(/\s+/g, " ").trim();
   if (/古装|宫廷|权谋|武侠|仙侠|玄幻|修仙|江湖/.test(seed)) {
-    return `整体画风：古装写实影视画风，服饰、建筑、道具、光影和色彩都统一到${compact || "古代东方叙事氛围"}。`;
+    return "整体画风：古装写实影视画风，东方古代服饰、建筑、器物、光影与色彩保持统一。";
   }
   if (/末世|废土|丧尸|灾变|避难所|重卡|荒凉|末日/.test(seed)) {
-    return `整体画风：末世废土写实画风，荒凉废墟、钢铁载具、冷酷战斗和生存压迫感统一呈现；参考${compact || "末世灾变世界观"}。`;
+    return "整体画风：末世废土写实画风，荒凉废墟、钢铁载具、冷酷战斗、生存压迫感保持统一。";
   }
   if (/民国|年代|军阀|谍战|抗战/.test(seed)) {
-    return `整体画风：年代写实影视画风，服装、建筑、道具和色彩统一到${compact || "年代剧质感"}。`;
+    return "整体画风：年代写实影视画风，服装、建筑、道具、色彩和光影保持时代质感统一。";
   }
   if (/校园|青春|学生|学校/.test(seed)) {
-    return `整体画风：青春校园写实画风，人物、场景、服装和道具统一到${compact || "清爽真实的校园氛围"}。`;
+    return "整体画风：青春校园写实画风，人物、场景、服装和道具保持清爽真实的校园质感。";
   }
   if (/都市|豪门|总裁|职场|商业|婚恋/.test(seed)) {
-    return `整体画风：都市短剧写实画风，人物造型、室内外空间和物品质感统一到${compact || "现代都市叙事氛围"}。`;
+    return "整体画风：都市短剧写实画风，人物造型、室内外空间和物品质感保持现代真实。";
   }
-  return `整体画风：${compact || fallbackStyle || "真人短剧写实画风"}；所有角色、场景、物品必须保持同一剧本世界观和视觉风格。`;
+  return "整体画风：真人短剧写实画风，角色、场景、物品保持同一剧本世界观和视觉风格。";
 }
 
 function joinPromptSections(sections: Array<[string, string | string[]]>) {
@@ -1403,6 +1396,49 @@ function buildCharacterBackground(seed: CharacterSeed, snippets: string[]) {
   return `${first}\n${second}`;
 }
 
+function buildCharacterProfileSummary(name: string, role: string, profile: string, background: string) {
+  const sourceLines = [
+    profile,
+    ...String(background || "").split(/\n+/),
+  ]
+    .map((line) => cleanPromptSentence(line))
+    .filter(Boolean);
+  const first = shortenPromptLine(
+    sourceLines[0] || `${name}是剧本中的${role}，承担清晰的人物定位。`,
+    72,
+  );
+  const second = shortenPromptLine(
+    sourceLines[1] || `${name}的主要剧情围绕身份选择、人物关系和关键冲突展开。`,
+    72,
+  );
+  const third = shortenPromptLine(
+    sourceLines.slice(2).join("") || `${name}在剧情推进、情绪转折和阵营关系中承担重要作用。`,
+    72,
+  );
+  return [first, second, third].join("\n");
+}
+
+function cleanPromptSentence(text: string) {
+  return String(text || "")
+    .replace(/^主体[:：]\s*/, "")
+    .replace(/人物[:：][^。！？!?]*/g, "")
+    .replace(/【[\s\S]*$/g, "")
+    .replace(/模板锁定[:：][\s\S]*$/g, "")
+    .replace(/身份约束[:：][\s\S]*$/g, "")
+    .replace(/[！？]{2,}/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function shortenPromptLine(text: string, maxLength: number) {
+  const value = cleanPromptSentence(text);
+  if (!value) return "";
+  const compact = value.length > maxLength
+    ? value.slice(0, maxLength).replace(/[，,；;：:、][^，,；;：:、]*$/, "")
+    : value;
+  return ensureSentenceEnd(compact);
+}
+
 function buildCharacterImagePrompt(
   name: string,
   role: string,
@@ -1428,8 +1464,7 @@ function buildCharacterImagePrompt(
       "左 40%：3/4 面部近景；右 60%：正面、侧面、背面全身三视图。",
       "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
     ]],
-    ["角色档案", `主体：${ensureSentenceEnd(profile || `${name}是剧本中的${role}。`)}`],
-    ["角色背景说明", background],
+    ["角色档案", buildCharacterProfileSummary(name, role, profile, background)],
     ["模板锁定", [
       `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
       supportConstraint ? `身份约束：${supportConstraint}` : "",
@@ -1475,7 +1510,7 @@ function buildSceneImagePrompt(name: string, type: string, description: string, 
       .trim(),
   );
   return joinPromptSections([
-    ["整体美学", [...buildOverallAesthetic(projectStyleGuide), PROMPT_ENVIRONMENT_AESTHETIC]],
+    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
     ["画面规格", `环境概念图，“${name}”。16:9 宽银幕，大全景，超广角，平视视角，大气透视。`],
     ["环境档案", [
       `空间类型：${sceneType}。${sceneDescription}`,
