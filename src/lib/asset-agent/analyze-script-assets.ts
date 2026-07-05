@@ -1439,6 +1439,31 @@ function shortenPromptLine(text: string, maxLength: number) {
   return ensureSentenceEnd(compact);
 }
 
+function buildCharacterVisualAnchors(
+  name: string,
+  role: string,
+  profile: string,
+  background: string,
+  projectStyleGuide: string,
+) {
+  const text = `${name} ${role} ${profile} ${background} ${projectStyleGuide}`;
+  const anchors: string[] = [];
+  if (/医疗|医生|外科|急救|护士|医疗官/.test(text)) {
+    anchors.push("医疗职业必须可视化：服装和配件体现据点医疗官或外科医生身份，可使用战术医疗背心、急救包、医用腰包、医疗臂章等，不要普通白衫牛仔裤。");
+  }
+  if (/重卡|指挥官|车队|队长|战神|系统|救援/.test(text)) {
+    anchors.push("指挥/车队身份必须可视化：服装体现末世重卡指挥官或救援队核心身份，可使用战术夹克、工装裤、战术靴、腰挂装备、通讯配件等，不要普通黑衬衫棚拍。");
+  }
+  if (/工程师|工兵|机械|焊接|维修|工厂/.test(text)) {
+    anchors.push("工程职业必须可视化：服装和配件体现机械工程师或工兵身份，可使用耐磨工装、工具腰带、焊接痕迹、机械油污或护具。");
+  }
+  if (/反派|暴君|城主|军官|武装|势力|黑市|商会/.test(text)) {
+    anchors.push("阵营身份必须可视化：服装、配饰和气质体现所属势力、权力层级或黑市/武装背景，避免普通路人造型。");
+  }
+  anchors.push("整体画风必须落到服装材质、配件磨损、妆发状态、色彩气氛和资产细节；禁止与角色档案无关的普通都市棚拍装。");
+  return anchors.slice(0, 3);
+}
+
 function buildCharacterImagePrompt(
   name: string,
   role: string,
@@ -1465,6 +1490,7 @@ function buildCharacterImagePrompt(
       "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
     ]],
     ["角色档案", buildCharacterProfileSummary(name, role, profile, background)],
+    ["职业与画风锚点", buildCharacterVisualAnchors(name, role, profile, background, projectStyleGuide)],
     ["模板锁定", [
       `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
       supportConstraint ? `身份约束：${supportConstraint}` : "",
@@ -1491,6 +1517,7 @@ function buildPropImagePrompt(name: string, type: string, description: string, p
     ["物品档案", [
       `类型：${assetType}。${assetDescription}`,
       "突出形状、尺寸、材质、颜色、磨损痕迹和可反复识别的细节。",
+      "物品必须与剧本用途和整体画风强相关，功能、材质、使用痕迹和时代/世界观特征要清晰可见。",
     ]],
     ["排除项", "无字幕、文字、Logo、水印；无持握者、手、人物、人影；无背景环境。"],
   ]);
@@ -1515,6 +1542,7 @@ function buildSceneImagePrompt(name: string, type: string, description: string, 
     ["环境档案", [
       `空间类型：${sceneType}。${sceneDescription}`,
       "突出空间尺度、布局、建筑材质、主色调、标志性陈设和光源基调。",
+      "环境必须与剧本整体画风强相关，建筑、陈设、磨损、光线和氛围不能变成通用干净场景。",
     ]],
     ["排除项", "无字幕、文字、Logo、水印；无人物、人影、行人、路人。"],
   ]);

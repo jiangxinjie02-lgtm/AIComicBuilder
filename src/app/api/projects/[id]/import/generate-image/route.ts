@@ -7,6 +7,7 @@ import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 import { patchStoryAsset } from "@/lib/story-assets";
 import {
   buildAssetImagePrompt,
+  buildPromptAnchoredFinalPrompt,
   categoryToAssetType,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
@@ -68,6 +69,8 @@ interface ProviderPayload {
     compiledFinalPrompt?: string;
     validation?: unknown;
     negativePrompt?: string;
+    sourcePrompt?: string;
+    providerPrompt?: string;
   };
 }
 
@@ -135,6 +138,7 @@ export async function POST(
   const category = String(body.category || body.asset?.category || "");
   const assetType = categoryToAssetType(category);
   const effectiveFaceTemplate = resolveFaceTemplate(body.asset, category);
+  const authoritativePrompt = String(body.prompt || body.asset?.prompt || "").trim();
   const builtPrompt = buildAssetImagePrompt({
     asset: {
       id: body.asset?.id || body.asset?.assetId || "",
@@ -142,6 +146,7 @@ export async function POST(
       name: body.asset?.name || body.targetName || "asset",
       role: body.asset?.role || "",
       category,
+      prompt: authoritativePrompt,
       description: body.asset?.description || "",
       visualHint: body.asset?.visualHint || "",
       visualConstraints: body.asset?.visualConstraints || "",
@@ -161,6 +166,13 @@ export async function POST(
       ...(body.asset?.styleSpec || {}),
       ...(body.styleSpec || {}),
     },
+  });
+  const providerPrompt = buildPromptAnchoredFinalPrompt({
+    sourcePrompt: authoritativePrompt,
+    compiledPrompt: builtPrompt.compiled_final_prompt,
+    category,
+    targetName: body.targetName || body.asset?.name || "asset",
+    mode: "main",
   });
 
   if (!builtPrompt.compiled_final_prompt.trim()) {
@@ -182,7 +194,7 @@ export async function POST(
   const payload: ProviderPayload = {
     model: getImageModel(),
     prompt: mergePromptWithNegative(
-      enforceCharacterIdentityPrompt(builtPrompt.compiled_final_prompt, category, effectiveFaceTemplate),
+      enforceCharacterIdentityPrompt(providerPrompt, category, effectiveFaceTemplate),
       builtPrompt.compiled_negative_prompt || defaultNegativePrompt(category),
     ),
     n: 1,
@@ -201,6 +213,8 @@ export async function POST(
       promptBuilder: "asset_prompt_compiler_v2",
       compilerInput: builtPrompt.compiler_input,
       compilerIR: builtPrompt.compiler_ir,
+      sourcePrompt: authoritativePrompt,
+      providerPrompt,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
       negativePrompt: builtPrompt.compiled_negative_prompt,
@@ -229,6 +243,8 @@ export async function POST(
           promptBuilder: "asset_prompt_compiler_v2",
           compilerInput: builtPrompt.compiler_input,
           compilerIR: builtPrompt.compiler_ir,
+          sourcePrompt: authoritativePrompt,
+          providerPrompt,
           compiledFinalPrompt: builtPrompt.compiled_final_prompt,
           validation: builtPrompt.validation_report,
           negativePrompt: builtPrompt.compiled_negative_prompt,
@@ -347,8 +363,7 @@ function getImageKeyPool() {
 }
 
 function getImageModel() {
-  const model = process.env.JIMAPI_IMAGE_MODEL || process.env.IMAGE2_MODEL || "gpt-image-2";
-  return model === "image2" ? "gpt-image-2" : model;
+  return "gpt-image-2";
 }
 
 function stripMetadataForProvider(payload: ProviderPayload) {

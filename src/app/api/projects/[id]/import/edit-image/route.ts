@@ -8,6 +8,7 @@ import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 import {
   buildAssetImagePrompt,
+  buildPromptAnchoredFinalPrompt,
   categoryToAssetType,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
@@ -76,6 +77,8 @@ interface EditImagePayload {
     promptBuilder?: string;
     compilerInput?: unknown;
     compilerIR?: unknown;
+    sourcePrompt?: string;
+    providerPrompt?: string;
     compiledFinalPrompt?: string;
     validation?: unknown;
   };
@@ -141,6 +144,7 @@ export async function POST(
   const isVariantTarget = String(body.targetType || "").startsWith("variant");
   const assetType = categoryToAssetType(category);
   const effectiveFaceTemplate = resolveFaceTemplate(body.asset, category);
+  const authoritativePrompt = editPrompt || body.prompt || body.asset?.prompt || "";
   const builtPrompt = buildAssetImagePrompt({
     asset: {
       id: body.asset?.id || body.asset?.assetId || "",
@@ -148,6 +152,7 @@ export async function POST(
       name: body.asset?.name || body.targetName || "asset",
       role: body.asset?.role || "",
       category,
+      prompt: body.prompt || body.asset?.prompt || "",
       description: body.asset?.description || "",
       visualHint: body.asset?.visualHint || "",
       visualConstraints: body.asset?.visualConstraints || "",
@@ -176,6 +181,13 @@ export async function POST(
       ...(body.styleSpec || {}),
     },
   });
+  const anchoredPrompt = buildPromptAnchoredFinalPrompt({
+    sourcePrompt: authoritativePrompt,
+    compiledPrompt: builtPrompt.compiled_final_prompt,
+    category,
+    targetName: body.targetName || body.asset?.name || "asset",
+    mode: isVariantTarget ? "variant" : "edit",
+  });
   if (!builtPrompt.validation_report.passed) {
     return NextResponse.json({
       error: "Asset prompt validation failed",
@@ -187,9 +199,10 @@ export async function POST(
     isVariantTarget
       ? "Create a reusable asset variant from the source image, not a story scene."
       : "Edit this reusable asset image, not a story scene.",
-    "Preserve the same asset identity, facial features, body proportions, layout discipline, and clean asset-sheet purpose unless the variant explicitly changes a visual trait.",
+    "Preserve the same asset identity, facial features, body proportions, layout discipline, and clean asset-sheet purpose unless the authoritative prompt explicitly changes a visual trait.",
+    "The written prompt controls the target profession, world style, clothing, props, material state, and variant state; do not fall back to generic studio fashion or unrelated clean catalog imagery.",
     enforceCharacterIdentityPrompt(category, effectiveFaceTemplate),
-    builtPrompt.compiled_final_prompt,
+    anchoredPrompt,
   ].filter(Boolean).join("\n\n");
 
   const payload: EditImagePayload = {
@@ -211,6 +224,8 @@ export async function POST(
       promptBuilder: "asset_prompt_compiler_v2",
       compilerInput: builtPrompt.compiler_input,
       compilerIR: builtPrompt.compiler_ir,
+      sourcePrompt: authoritativePrompt,
+      providerPrompt: prompt,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
     },
@@ -334,7 +349,7 @@ function getImageKeyPool() {
 }
 
 function getEditImageModel() {
-  return process.env.JIMAPI_IMAGE_EDIT_MODEL || process.env.IMAGE_EDIT_MODEL || process.env.JIMAPI_IMAGE_MODEL || process.env.IMAGE2_MODEL || "gpt-image-2";
+  return "gpt-image-2";
 }
 
 async function buildMultipartPayload(payload: EditImagePayload) {

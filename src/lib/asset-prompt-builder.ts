@@ -42,6 +42,7 @@ export interface AssetPromptAsset {
   name: string;
   role?: string | null;
   category?: string | null;
+  prompt?: string | null;
   description?: string | null;
   visualHint?: string | null;
   visualConstraints?: string | null;
@@ -301,6 +302,71 @@ export function defaultAssetStyleSpec(): AssetStyleSpec {
     texture: "natural skin texture, fabric texture, realistic material detail",
     genre: "realistic Chinese short-drama asset reference",
   };
+}
+
+export function buildPromptAnchoredFinalPrompt(input: {
+  sourcePrompt?: string | null;
+  compiledPrompt: string;
+  category: string;
+  targetName?: string | null;
+  mode?: "main" | "variant" | "edit";
+}) {
+  const sourcePrompt = normalizeAuthoritativePrompt(input.sourcePrompt);
+  const compiledPrompt = clean(input.compiledPrompt);
+  const relationRules = promptRelationRules(input.category, input.mode);
+
+  if (!sourcePrompt) {
+    return [relationRules, compiledPrompt].filter(Boolean).join("\n\n");
+  }
+
+  return [
+    `AUTHORITATIVE USER IMAGE PROMPT FOR ${input.targetName || "ASSET"}:`,
+    "The following Chinese image prompt is the highest-priority source. The generated asset must strongly match it, not a generic studio portrait or default catalog item.",
+    sourcePrompt,
+    "PROMPT-IMAGE ALIGNMENT RULES:",
+    relationRules,
+    "SECONDARY STRUCTURAL GUARDRAILS:",
+    "Use the compiled guardrails only when they do not conflict with the authoritative user prompt.",
+    compiledPrompt,
+  ].filter(Boolean).join("\n\n");
+}
+
+function normalizeAuthoritativePrompt(prompt: unknown) {
+  const text = clean(prompt)
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text.length > 8000 ? `${text.slice(0, 8000).trim()}\n...` : text;
+}
+
+function promptRelationRules(category: string, mode?: "main" | "variant" | "edit") {
+  const base = [
+    "Follow every explicit visual fact in the authoritative prompt: overall aesthetic, era/world style, identity, profession, role profile, clothing, props, environment, layout, and exclusions.",
+    "If a profession, faction, survival state, medical role, engineer role, commander role, villain role, or scene function is mentioned, make it visibly readable through outfit, accessories, material wear, posture, color, and asset details.",
+    "Do not replace specified roles or styles with generic modern studio clothing, casual jeans, plain black shirts, business portraits, beauty-shot defaults, or unrelated clean catalog imagery unless the authoritative prompt explicitly asks for them.",
+  ];
+  if (category === "characters") {
+    return [
+      ...base,
+      "For character assets, the face/template identity lock is mandatory, but clothing, accessories, makeup intensity, and state must still reflect the character profile and the script's overall aesthetic.",
+      mode === "variant"
+        ? "For variants, preserve the same face and identity while making the variant state clearly visible."
+        : "",
+    ].filter(Boolean).join("\n");
+  }
+  if (category === "props" || category === "items") {
+    return [
+      ...base,
+      "For prop assets, the object must visibly reflect its script function, material, era, usage marks, and world style.",
+    ].join("\n");
+  }
+  if (category === "scenes") {
+    return [
+      ...base,
+      "For scene assets, architecture, set dressing, lighting, weathering, and scale must visibly match the script world style.",
+    ].join("\n");
+  }
+  return base.join("\n");
 }
 
 function buildCharacterCompilerIR(input: AssetCompilerInput): AssetCompilerIR {
@@ -749,6 +815,8 @@ function bindingsFor(assetType: AssetPromptType, asset: AssetPromptAsset, varian
 
 function stableVisualText(asset: AssetPromptAsset, variant?: AssetPromptVariant | null) {
   return [
+    asset.prompt,
+    asset.description,
     asset.visualConstraints,
     asset.visualHint,
     variant?.visualConstraints,
@@ -847,6 +915,7 @@ function inferEraConstraint(values: unknown[]) {
   const joined = values.map((value) => clean(value)).filter(Boolean).join(" ");
   const explicitYear = joined.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
   if (explicitYear) return `${explicitYear[1]} China`;
+  if (/末世|废土|末日|灾变|丧尸|避难所|重卡|荒凉/i.test(joined)) return "post-apocalyptic wasteland China";
   if (/八十年代|80年代|1980年代|1980s/i.test(joined)) return "1980s China";
   if (/七十年代|70年代|1970年代|1970s/i.test(joined)) return "1970s China";
   if (/九十年代|90年代|1990年代|1990s/i.test(joined)) return "1990s China";
@@ -872,6 +941,15 @@ function isLate20thCenturyChina(era: string) {
 }
 
 function eraDefaultClothing(era: string) {
+  if (/post-apocalyptic|wasteland|末世|废土/i.test(era)) {
+    return {
+      top: "post-apocalyptic survival workwear or tactical jacket, weathered fabric, practical layered clothing",
+      bottom: "post-apocalyptic cargo pants or durable work trousers with utility details",
+      shoes: "worn tactical boots or heavy-duty survival boots",
+      outerwear: "dusty survival jacket, tactical vest, or reinforced workwear outer layer if needed",
+      accessories: "survival utility belt, medical pouch, radio, gloves, or practical faction accessories only when fitting the role",
+    };
+  }
   if (/1983|1980|80s|八十年代/i.test(era)) {
     return {
       top: "1980s China plain civilian blouse or shirt, simple modern cut, cotton fabric",
@@ -909,6 +987,7 @@ function eraDefaultClothing(era: string) {
 }
 
 function eraDefaultHairstyle(era: string) {
+  if (/post-apocalyptic|wasteland|末世|废土/i.test(era)) return "practical post-apocalyptic hairstyle with realistic dust or fatigue when fitting the role";
   if (/1983|1980|80s|八十年代/i.test(era)) return "simple 1980s China everyday hairstyle";
   return "realistic everyday hairstyle consistent across all views";
 }
