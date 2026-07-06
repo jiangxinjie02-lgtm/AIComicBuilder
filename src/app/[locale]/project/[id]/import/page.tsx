@@ -730,6 +730,7 @@ export default function ImportPage({
   const saveDraftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestDraftPayloadRef = useRef<ImportDraftState | null>(null);
   const hasPendingDraftSaveRef = useRef(false);
+  const immediateDraftSaveRef = useRef(false);
 
   // Pipeline state
   const [currentStep, setCurrentStep] = useState<Step | 0>(0);
@@ -1008,9 +1009,15 @@ export default function ImportPage({
       skipNextDraftSaveRef.current = false;
       return;
     }
-    latestDraftPayloadRef.current = buildDraftPayload();
+    const draftPayload = buildDraftPayload();
+    latestDraftPayloadRef.current = draftPayload;
     hasPendingDraftSaveRef.current = true;
     if (saveDraftTimerRef.current) clearTimeout(saveDraftTimerRef.current);
+    if (immediateDraftSaveRef.current) {
+      immediateDraftSaveRef.current = false;
+      void saveDraft(draftPayload);
+      return;
+    }
     saveDraftTimerRef.current = setTimeout(() => {
       saveDraft(latestDraftPayloadRef.current ?? undefined);
     }, 1000);
@@ -1880,7 +1887,9 @@ export default function ImportPage({
     tab: AssetTab,
     assetIndex: number,
     patcher: (asset: WorkbenchAsset) => WorkbenchAsset,
+    options?: { persist?: boolean },
   ) {
+    if (options?.persist) immediateDraftSaveRef.current = true;
     const setter = getAssetSetter(tab);
     setter((prev) => prev.map((asset, index) => index === assetIndex ? patcher(asset) : asset));
   }
@@ -2048,13 +2057,13 @@ export default function ImportPage({
         return { ...current, variants };
       }
       return { ...current, imageUrl };
-    });
+    }, { persist: true });
     toast.success("已恢复历史图片");
   }
 
   function restoreHistoryAudio(tab: AssetTab, assetIndex: number, audioUrl: string) {
     if (!audioUrl || tab !== "voices") return;
-    patchWorkbenchAsset(tab, assetIndex, (current) => ({ ...current, audioUrl }));
+    patchWorkbenchAsset(tab, assetIndex, (current) => ({ ...current, audioUrl }), { persist: true });
     toast.success("已恢复历史音频");
   }
 
@@ -2140,7 +2149,7 @@ export default function ImportPage({
           imageUrl: result.imageUrl || "",
           history: [historyEntry, ...(current.history || [])],
         };
-      });
+      }, { persist: true });
 
       if (!options.quiet) toast.success(t("assetGenerateSuccess", { name: target.name || asset.name }));
       return true;
@@ -2167,7 +2176,7 @@ export default function ImportPage({
           ...current,
           history: [failedEntry, ...(current.history || [])],
         };
-      });
+      }, { persist: true });
       if (!options.quiet) toast.error(msg);
       return false;
     } finally {
@@ -2314,7 +2323,7 @@ export default function ImportPage({
           imageUrl: result.imageUrl || "",
           history: [historyEntry, ...(current.history || [])],
         };
-      });
+      }, { persist: true });
 
       toast.success(isVoice ? "音频已上传" : "图片已上传");
     } catch (err) {
@@ -2382,7 +2391,7 @@ export default function ImportPage({
           editInstruction: "",
           history: [historyEntry, ...(current.history || [])],
         };
-      });
+      }, { persist: true });
 
       toast.success("主图已改图");
     } catch (err) {
@@ -2457,7 +2466,7 @@ export default function ImportPage({
           history: [historyEntry, ...(currentVariant.history || [])],
         };
         return { ...current, variants };
-      });
+      }, { persist: true });
 
       toast.success("变体已改图");
     } catch (err) {

@@ -4,7 +4,12 @@ import { projects } from "@/lib/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
-import { patchStoryAsset } from "@/lib/story-assets";
+import {
+  patchStoryAsset,
+  upsertStoryAsset,
+  type ImportAssetDraft,
+  type StoryAssetType,
+} from "@/lib/story-assets";
 import {
   buildAssetImagePrompt,
   buildPromptAnchoredFinalPrompt,
@@ -28,17 +33,25 @@ interface GenerateImageAsset {
   id?: string;
   assetId?: string;
   name?: string;
+  aliases?: string[] | string;
+  frequency?: number;
   category?: string;
   role?: string;
   roleKey?: string;
+  scope?: "main" | "guest";
+  episodes?: string[];
   visualHint?: string;
   description?: string;
   visualConstraints?: string;
+  confirmed?: boolean;
   sceneAssetId?: string;
   visualSchema?: AssetVisualSchema;
   styleSpec?: AssetStyleSpec;
   prompt?: string;
   negativePrompt?: string;
+  variants?: unknown[];
+  history?: unknown[];
+  mainImageName?: string;
   tags?: string[];
   faceTemplate?: {
     label?: string;
@@ -232,28 +245,119 @@ export async function POST(
 
   const dbAssetId = body.asset?.id || body.asset?.assetId || "";
   if (dbAssetId && imageUrl && body.targetType !== "variant") {
-    await patchStoryAsset(projectId, dbAssetId, {
+    const generatedImageMetadata = {
+      provider: result.provider,
+      status: result.status,
+      targetName: payload.metadata.targetName,
+      category: payload.metadata.category,
+      promptBuilder: "asset_prompt_compiler_v2",
+      compilerInput: builtPrompt.compiler_input,
+      compilerIR: builtPrompt.compiler_ir,
+      sourcePrompt: authoritativePrompt,
+      providerPrompt,
+      compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      validation: builtPrompt.validation_report,
+      negativePrompt: builtPrompt.compiled_negative_prompt,
+      updatedAt: new Date().toISOString(),
+    };
+    const patchedAsset = await patchStoryAsset(projectId, dbAssetId, {
       referenceImage: imageUrl,
       metadata: {
-        generatedFromImportImage: {
-          provider: result.provider,
-          status: result.status,
-          targetName: payload.metadata.targetName,
-          category: payload.metadata.category,
-          promptBuilder: "asset_prompt_compiler_v2",
-          compilerInput: builtPrompt.compiler_input,
-          compilerIR: builtPrompt.compiler_ir,
-          sourcePrompt: authoritativePrompt,
-          providerPrompt,
-          compiledFinalPrompt: builtPrompt.compiled_final_prompt,
-          validation: builtPrompt.validation_report,
-          negativePrompt: builtPrompt.compiled_negative_prompt,
-          updatedAt: new Date().toISOString(),
-        },
+        generatedFromImportImage: generatedImageMetadata,
       },
     });
+    if (!patchedAsset) {
+      await upsertStoryAsset(projectId, toStoryAssetType(assetType), buildGeneratedAssetDraft({
+        asset: body.asset,
+        category,
+        targetName: body.targetName,
+        imageUrl,
+        prompt: authoritativePrompt,
+        negativePrompt: builtPrompt.compiled_negative_prompt || body.asset?.negativePrompt || body.negativePrompt || "",
+        faceTemplate: effectiveFaceTemplate,
+        promptMetadata: generatedImageMetadata,
+        styleSpec: {
+          ...defaultAssetStyleSpec(),
+          ...(body.asset?.styleSpec || {}),
+          ...(body.styleSpec || {}),
+        },
+      }));
+    }
+  } else if (imageUrl && body.targetType !== "variant") {
+    await upsertStoryAsset(projectId, toStoryAssetType(assetType), buildGeneratedAssetDraft({
+      asset: body.asset,
+      category,
+      targetName: body.targetName,
+      imageUrl,
+      prompt: authoritativePrompt,
+      negativePrompt: builtPrompt.compiled_negative_prompt || body.asset?.negativePrompt || body.negativePrompt || "",
+      faceTemplate: effectiveFaceTemplate,
+      promptMetadata: {
+        provider: result.provider,
+        status: result.status,
+        targetName: payload.metadata.targetName,
+        category: payload.metadata.category,
+        promptBuilder: "asset_prompt_compiler_v2",
+        compilerInput: builtPrompt.compiler_input,
+        compilerIR: builtPrompt.compiler_ir,
+        sourcePrompt: authoritativePrompt,
+        providerPrompt,
+        compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+        validation: builtPrompt.validation_report,
+        negativePrompt: builtPrompt.compiled_negative_prompt,
+        updatedAt: new Date().toISOString(),
+      },
+      styleSpec: {
+        ...defaultAssetStyleSpec(),
+        ...(body.asset?.styleSpec || {}),
+        ...(body.styleSpec || {}),
+      },
+    }));
   }
   return NextResponse.json(result);
+}
+
+function toStoryAssetType(assetType: "character" | "prop" | "scene"): StoryAssetType {
+  return assetType;
+}
+
+function buildGeneratedAssetDraft(input: {
+  asset?: GenerateImageAsset;
+  category: string;
+  targetName?: string;
+  imageUrl: string;
+  prompt: string;
+  negativePrompt: string;
+  faceTemplate: CharacterFaceTemplate | null;
+  promptMetadata: unknown;
+  styleSpec: AssetStyleSpec;
+}): ImportAssetDraft {
+  return {
+    name: input.asset?.name || input.targetName || "asset",
+    aliases: input.asset?.aliases,
+    frequency: input.asset?.frequency,
+    description: input.asset?.description || input.asset?.visualHint || input.targetName || "",
+    visualHint: input.asset?.visualHint || "",
+    visualConstraints: input.asset?.visualConstraints || input.prompt,
+    confirmed: input.asset?.confirmed ?? true,
+    assetId: input.asset?.assetId || input.asset?.id || "",
+    category: input.category,
+    role: input.asset?.role || "",
+    roleKey: input.asset?.roleKey || "",
+    scope: input.asset?.scope,
+    episodes: input.asset?.episodes || [],
+    prompt: input.prompt,
+    negativePrompt: input.negativePrompt,
+    variants: input.asset?.variants || [],
+    imageUrl: input.imageUrl,
+    history: input.asset?.history || [],
+    mainImageName: input.asset?.mainImageName || input.targetName || input.asset?.name || "",
+    tags: input.asset?.tags || [],
+    faceTemplate: input.faceTemplate,
+    promptMetadata: input.promptMetadata,
+    styleSpec: input.styleSpec,
+    visualSchema: input.asset?.visualSchema || null,
+  };
 }
 
 async function callImage2(payload: ProviderPayload) {
