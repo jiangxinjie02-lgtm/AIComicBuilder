@@ -4,7 +4,7 @@ import { db, ensureImportStatesTable } from "@/lib/db";
 import { assetVariants, assets, importStates } from "@/lib/db/schema";
 import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 import { getActiveProductionBible } from "@/lib/production-bible";
-import { compileStoryboardFrames } from "@/lib/storyboard-prompt-compiler";
+import { compileStoryboardFrames, type StoryboardProductionBibleInput } from "@/lib/storyboard";
 
 export const maxDuration = 60;
 
@@ -16,7 +16,6 @@ interface CompilePreviewBody {
   assetVariants?: unknown[];
   visualAssets?: unknown[];
   productionBible?: unknown;
-  generationParams?: Record<string, unknown>;
 }
 
 interface StoredShotReview {
@@ -120,15 +119,6 @@ function normalizeShotInput(body: CompilePreviewBody) {
   return null;
 }
 
-function normalizeGenerationParams(value: unknown) {
-  const record = toRecord(value);
-  return {
-    aspect_ratio: String(record.aspect_ratio || record.aspectRatio || "").trim() || undefined,
-    quality: String(record.quality || "").trim() || undefined,
-    seed_policy: String(record.seed_policy || record.seedPolicy || "").trim() || undefined,
-  };
-}
-
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
@@ -150,7 +140,7 @@ export async function POST(
   const projectAssets = await loadProjectAssetInputs(projectId);
   const productionBible =
     body.productionBible && typeof body.productionBible === "object"
-      ? body.productionBible
+      ? body.productionBible as StoryboardProductionBibleInput
       : await getActiveProductionBible(projectId, firstEpisodeId);
 
   const result = compileStoryboardFrames({
@@ -159,7 +149,6 @@ export async function POST(
     assetVariants: Array.isArray(body.assetVariants) ? body.assetVariants : projectAssets.variantRows,
     visualAssets: Array.isArray(body.visualAssets) ? body.visualAssets : projectAssets.visualAssets,
     productionBible,
-    generationParams: normalizeGenerationParams(body.generationParams),
   });
 
   return NextResponse.json(result);

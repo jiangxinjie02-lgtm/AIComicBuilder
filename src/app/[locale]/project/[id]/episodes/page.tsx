@@ -28,6 +28,7 @@ import { EpisodeDialog } from "@/components/editor/episode-dialog";
 import { useEpisodeStore, type Episode } from "@/stores/episode-store";
 import { useModelStore, type ModelRef } from "@/stores/model-store";
 import { apiFetch } from "@/lib/api-fetch";
+import { buildStoryboardPromptPreviewFromText, looksLikeRawStoryboardText } from "@/lib/storyboard";
 import Link from "next/link";
 
 function stripEpisodePrefix(title: string) {
@@ -208,89 +209,11 @@ function compactText(value: string | null | undefined, max = 180) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function looksLikeRawSceneScript(value: string | null | undefined) {
-  const text = String(value || "");
-  return /音效|约\s*\d+\s*秒|\d+\s*s\b|时长|注意|台词|对白|字幕|说道|喊道|尖叫|^\s*【?场景\s*\d+/im.test(text);
-}
-
-function stripScriptCues(value: string) {
-  return value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => !/^\s*[【\[]?\s*(音效|SFX|sound|音乐|配乐|旁白|注意|时长)[：:]/i.test(line))
-    .filter((line) => !/^\s*（?注意/.test(line))
-    .filter((line) => !/^[\u4e00-\u9fa5A-Za-z0-9_·]{1,12}(?:（[^）]+）|\([^)]*\))?[：:]/.test(line))
-    .join(" ");
-}
-
-function removeStoryboardNoise(value: string) {
-  return stripScriptCues(value)
-    .replace(/【?\s*场景\s*\d+\s*[：:]\s*([^】\n]+?)\s*】?/gi, "$1")
-    .replace(/（约\s*\d+\s*秒）|\(约\s*\d+\s*秒\)/g, "")
-    .replace(/\bDuration\s*:\s*\d+\s*s\.?/gi, "")
-    .replace(/\[[^\]]*(音效|SFX|sound)[^\]]*\]/gi, " ")
-    .replace(/【[^】]*(音效|SFX|sound)[^】]*】/gi, " ")
-    .replace(/[“"][^”"]{2,80}[”"]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function firstStaticVisualMoment(value: string) {
-  const clean = removeStoryboardNoise(value);
-  const segments = clean
-    .split(/然后|随后|接着|之后|最终|同时|，一辆|。一辆|扬长而去|\bthen\b|\bafterward\b|\bfinally\b|\band then\b/i)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  return segments[0] || clean;
-}
-
-function softenStoryboardViolence(value: string) {
-  if (!/撞|撞飞|碾|鲜血|血红|血肉|死亡|尸体|去死|垂下|blood|gore|dead|corpse/i.test(value)) {
-    return compactText(value, 280);
-  }
-  return "a tense non-graphic aftermath moment on a rain-soaked roadside, harsh vehicle headlights cutting through heavy rain, the character near muddy water with blurred vision and an oppressive dark red atmosphere, no visible gore";
-}
-
-function cleanSceneNameForPrompt(name: string) {
-  return name
-    .replace(/^\s*【?\s*场景\s*\d+\s*[：:]\s*/i, "")
-    .replace(/\s*】\s*$/g, "")
-    .replace(/（约\s*\d+\s*秒）|\(约\s*\d+\s*秒\)/g, "")
-    .trim();
-}
-
-function referenceLine(label: string, names: string[]) {
-  const refs = uniqueTextItems(names, 8);
-  return refs.length ? `${label}: ${refs.join(", ")}.` : "";
-}
-
-function buildStaticStoryboardPrompt(input: {
-  title: string;
-  sourceText: string;
-  characterNames?: string[];
-  sceneNames?: string[];
-  propNames?: string[];
-}) {
-  const title = cleanSceneNameForPrompt(input.title);
-  const moment = softenStoryboardViolence(firstStaticVisualMoment(input.sourceText || title));
-  return [
-    "Storyboard key frame image, one static still frame, not a video prompt.",
-    `Static frame: ${moment}.`,
-    `Composition: 16:9 horizontal frame, eye-level cinematic view, clear readable subject placement, one frozen key moment only${title ? `, scene context: ${title}` : ""}.`,
-    referenceLine("Character reference assets", input.characterNames ?? []),
-    referenceLine("Scene reference assets", input.sceneNames ?? []),
-    referenceLine("Prop reference assets", input.propNames ?? []),
-    "Style: realistic Chinese short-drama storyboard, period-accurate production design, natural lighting, cinematic rain atmosphere when applicable, consistent asset identity.",
-    "Exclude: subtitles, captions, dialogue text, sound effect text, duration labels, UI, logo, watermark, explicit gore, graphic injury, multiple sequential actions.",
-  ].filter(Boolean).join("\n");
-}
-
 function storyboardPromptFromShot(shot: EpisodeShot, sceneName?: string) {
   const source = shot.videoPrompt || shot.prompt || shot.videoScript || shot.motionScript || "";
   if (
     /Storyboard key frame image|Storyboard still|Static frame:/i.test(source) &&
-    !looksLikeRawSceneScript(source)
+    !looksLikeRawStoryboardText(source)
   ) {
     return source;
   }
@@ -303,7 +226,7 @@ function storyboardPromptFromShot(shot: EpisodeShot, sceneName?: string) {
     .map((asset) => asset.meta?.sceneName)
     .filter((name): name is string => Boolean(name));
 
-  return buildStaticStoryboardPrompt({
+  return buildStoryboardPromptPreviewFromText({
     title: sceneName || getSceneReferenceName(shot),
     sourceText: [shot.prompt, shot.motionScript, shot.videoPrompt, shot.videoScript].filter(Boolean).join(" "),
     characterNames,
@@ -487,7 +410,6 @@ function splitSceneNameParts(name: string) {
 
 function inferPropsFromText(text: string) {
   const candidates = [
-    "吉普车",
     "汽车",
     "车轮",
     "轮胎",
@@ -495,7 +417,6 @@ function inferPropsFromText(text: string) {
     "挡风玻璃",
     "玻璃",
     "水坑",
-    "泥水",
     "手机",
     "伞",
     "剑",
@@ -814,7 +735,7 @@ export default function EpisodesPage({
     setPromptDrafts((prev) => {
       const next = { ...prev };
       for (const shot of data.shots || []) {
-        if (!(shot.id in next) || looksLikeRawSceneScript(next[shot.id])) {
+        if (!(shot.id in next) || looksLikeRawStoryboardText(next[shot.id])) {
           next[shot.id] = storyboardPromptFromShot(shot);
         }
       }
@@ -1577,7 +1498,7 @@ export default function EpisodesPage({
                 className="min-h-[128px] w-full resize-y rounded-xl border border-black/30 bg-white/70 p-3 font-mono text-xs leading-relaxed text-black outline-none focus:border-primary"
               />
               <div className="mt-2 grid gap-1 text-[10px] text-black/60">
-                {shot.videoScript && <div className="line-clamp-2">后续视频脚本 metadata：{shot.videoScript}</div>}
+                {shot.videoScript && <div className="line-clamp-2">后续阶段脚本 metadata：{shot.videoScript}</div>}
                 {shot.motionScript && <div className="line-clamp-2">动作：{shot.motionScript}</div>}
               </div>
             </div>
@@ -1833,11 +1754,11 @@ export default function EpisodesPage({
   function storyboardPromptFromDraftScene(scene: DraftScene) {
     if (
       /Storyboard key frame image|Storyboard still|Static frame:/i.test(scene.prompt) &&
-      !looksLikeRawSceneScript(scene.prompt)
+      !looksLikeRawStoryboardText(scene.prompt)
     ) {
       return scene.prompt;
     }
-    return buildStaticStoryboardPrompt({
+    return buildStoryboardPromptPreviewFromText({
       title: scene.name,
       sourceText: scene.prompt || scene.name,
       characterNames: selectedAssetsForScene(scene, "characters").map((asset) => asset.name),
