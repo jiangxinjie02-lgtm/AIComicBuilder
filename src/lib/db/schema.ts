@@ -258,6 +258,7 @@ export const importStates = sqliteTable("import_states", {
   relationships: text("relationships", { mode: "json" }),
   episodes: text("episodes", { mode: "json" }),
   confirmedEpisodeIndexes: text("confirmed_episode_indexes", { mode: "json" }),
+  shotReview: text("shot_review", { mode: "json" }),
   updatedAt: integer("updated_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),

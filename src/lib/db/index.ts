@@ -171,10 +171,14 @@ export function ensureImportStatesTable() {
       "relationships" text,
       "episodes" text,
       "confirmed_episode_indexes" text,
+      "shot_review" text,
       "updated_at" integer NOT NULL,
       FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
     )
   `).run();
+  if (!columnExists(sqlite, "import_states", "shot_review")) {
+    sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "shot_review" text`).run();
+  }
 }
 
 export function ensureAssetLibraryTables() {

@@ -407,6 +407,13 @@
       "when": 1783238400000,
       "tag": "0057_add_asset_variants",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1783324800000,
+      "tag": "0058_add_shot_review_state",
+      "breakpoints": true
     }
   ]
 }
