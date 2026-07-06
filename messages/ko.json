@@ -403,6 +403,7 @@
     "agentCategory_scriptOutline": "스토리 개요",
     "agentCategory_scriptGenerate": "스크립트 생성",
     "agentCategory_scriptParse": "대본 분석",
+    "agentCategory_scriptVisualEnrichment": "Script Visual Enrichment",
     "agentCategory_characterExtract": "캐릭터 추출",
     "agentCategory_shotSplit": "샷 분할",
     "agentCategory_keyframePrompts": "Keyframe Prompts",

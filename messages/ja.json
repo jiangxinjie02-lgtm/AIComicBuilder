@@ -403,6 +403,7 @@
     "agentCategory_scriptOutline": "ストーリー概要",
     "agentCategory_scriptGenerate": "脚本生成",
     "agentCategory_scriptParse": "脚本解析",
+    "agentCategory_scriptVisualEnrichment": "Script Visual Enrichment",
     "agentCategory_characterExtract": "キャラクター抽出",
     "agentCategory_shotSplit": "ショット分割",
     "agentCategory_keyframePrompts": "Keyframe Prompts",

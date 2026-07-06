@@ -835,7 +835,7 @@ export const agents = sqliteTable("agents", {
   userId: text("user_id").notNull().default(""),
   name: text("name").notNull(),
   category: text("category", {
-    enum: ["script_outline", "script_generate", "script_parse", "character_extract", "shot_split", "keyframe_prompts", "video_prompts", "ref_image_prompts", "ref_video_prompts"],
+    enum: ["script_outline", "script_generate", "script_parse", "script_visual_enrichment", "character_extract", "shot_split", "keyframe_prompts", "video_prompts", "ref_image_prompts", "ref_video_prompts"],
   }).notNull(),
   platform: text("platform", {
     enum: ["bailian", "dify", "coze"],
@@ -857,7 +857,7 @@ export const agentBindings = sqliteTable("agent_bindings", {
     .notNull()
     .references(() => projects.id, { onDelete: "cascade" }),
   category: text("category", {
-    enum: ["script_outline", "script_generate", "script_parse", "character_extract", "shot_split", "keyframe_prompts", "video_prompts", "ref_image_prompts", "ref_video_prompts"],
+    enum: ["script_outline", "script_generate", "script_parse", "script_visual_enrichment", "character_extract", "shot_split", "keyframe_prompts", "video_prompts", "ref_image_prompts", "ref_video_prompts"],
   }).notNull(),
   agentId: text("agent_id").references(() => agents.id, { onDelete: "set null" }),
 });

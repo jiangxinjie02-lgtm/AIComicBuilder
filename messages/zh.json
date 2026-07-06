@@ -405,6 +405,7 @@
     "agentCategory_scriptOutline": "故事大纲",
     "agentCategory_scriptGenerate": "剧本生成",
     "agentCategory_scriptParse": "剧本解析",
+    "agentCategory_scriptVisualEnrichment": "剧本视觉细节补全",
     "agentCategory_characterExtract": "角色提取",
     "agentCategory_shotSplit": "分镜拆分",
     "agentCategory_keyframePrompts": "首尾帧提示词",

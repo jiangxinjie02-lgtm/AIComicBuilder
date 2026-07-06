@@ -403,6 +403,7 @@
     "agentCategory_scriptOutline": "Story Outline",
     "agentCategory_scriptGenerate": "Script Generate",
     "agentCategory_scriptParse": "Script Parse",
+    "agentCategory_scriptVisualEnrichment": "Script Visual Enrichment",
     "agentCategory_characterExtract": "Character Extract",
     "agentCategory_shotSplit": "Shot Split",
     "agentCategory_keyframePrompts": "Keyframe Prompts",

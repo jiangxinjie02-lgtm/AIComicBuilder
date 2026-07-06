@@ -801,9 +801,86 @@ interface StoryAssetAnalysis {
   };
 }
 
+interface ScriptEnrichmentPreview {
+  patches?: ScriptEnrichmentPatch[];
+  enrichedText?: string;
+  appliedPatchCount?: number;
+  skippedPatchCount?: number;
+  stats?: {
+    total_beats?: number;
+    enriched_beats?: number;
+    needs_review?: number;
+    invalid?: number;
+  };
+  validation?: {
+    status?: "valid" | "needs_review" | "invalid";
+    warnings?: string[];
+    errors?: string[];
+    accepted_patches?: ScriptEnrichmentPatch[];
+  };
+}
+
+interface ScriptEnrichmentPatch {
+  beat_id?: string;
+  original_text?: string;
+  enriched_text?: string;
+  added_visual_details?: Record<string, unknown>;
+  asset_candidates?: Array<{ name?: string; type?: string; importance?: string }>;
+  source_type?: string;
+  confidence?: number;
+}
+
+interface ReviewPreparation {
+  text: string;
+  visualEnrichment: {
+    patches: ScriptEnrichmentPatch[];
+    stats?: ScriptEnrichmentPreview["stats"];
+    validation?: ScriptEnrichmentPreview["validation"];
+  } | null;
+}
+
 type StoryAssetSectionKey = "characters" | "scenes" | "props";
 
 type Step = 1 | 2 | 3 | 4 | 5;
+type StepStatusValue = "idle" | "running" | "done" | "error";
+
+const STEP_IDLE_STATUS: Record<Step, StepStatusValue> = {
+  1: "idle",
+  2: "idle",
+  3: "idle",
+  4: "idle",
+  5: "idle",
+};
+
+const SCRIPT_ENRICHMENT_TIMEOUT_MS = 90_000;
+const SCRIPT_ENRICHMENT_BEAT_BATCH_SIZE = 10;
+
+function sanitizePersistedStepStatus(status?: Partial<Record<Step, StepStatusValue>>) {
+  const next = { ...STEP_IDLE_STATUS };
+  if (!status) return next;
+  for (const step of [1, 2, 3, 4, 5] as Step[]) {
+    const value = status[step];
+    if (!value) continue;
+    next[step] = value === "running" ? "idle" : value;
+  }
+  return next;
+}
+
+function sanitizeDraftPayload(payload: ImportDraftState): ImportDraftState {
+  const stepStatus = sanitizePersistedStepStatus(payload.stepStatus);
+  let currentStep = payload.currentStep;
+  if (typeof currentStep === "number") {
+    if (stepStatus[1] === "done" && currentStep < 2) currentStep = 2;
+    if (stepStatus[3] === "done" && currentStep < 3) currentStep = 3;
+    if (stepStatus[4] === "done" && currentStep < 4) currentStep = 4;
+    if (stepStatus[5] === "done" && currentStep < 5) currentStep = 5;
+  }
+  return {
+    ...payload,
+    currentStep,
+    stepStatus,
+  };
+}
 
 const STEPS = [
   { num: 1 as Step, icon: FileText, label: "importStep.parse" },
@@ -843,6 +920,10 @@ export default function ImportPage({
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const storyReviewedRef = useRef(false);
+  const enrichedTextRef = useRef("");
+  const visualEnrichmentRef = useRef<ReviewPreparation["visualEnrichment"]>(null);
+  const detailSupplementedRef = useRef(false);
+  const [detailSupplemented, setDetailSupplemented] = useState(false);
 
   // Step 0: Upload
   const [file, setFile] = useState<File | null>(null);
@@ -922,7 +1003,7 @@ export default function ImportPage({
 
   const buildDraftPayload = useCallback((): ImportDraftState => ({
     currentStep,
-    stepStatus,
+    stepStatus: sanitizePersistedStepStatus(stepStatus),
     fullText,
     reviewIssues,
     storyAnalysis,
@@ -950,10 +1031,11 @@ export default function ImportPage({
 
   const saveDraft = useCallback(async (payload?: ImportDraftState) => {
     try {
+      const draftPayload = sanitizeDraftPayload(payload ?? buildDraftPayload());
       await apiFetch(`/api/projects/${projectId}/import/state`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload ?? buildDraftPayload()),
+        body: JSON.stringify(draftPayload),
       });
       hasPendingDraftSaveRef.current = false;
     } catch (err) {
@@ -964,7 +1046,7 @@ export default function ImportPage({
   const flushDraft = useCallback(() => {
     const payload = latestDraftPayloadRef.current;
     if (!payload || !hasPendingDraftSaveRef.current) return;
-    const body = JSON.stringify(payload);
+    const body = JSON.stringify(sanitizeDraftPayload(payload));
     const headers: HeadersInit = { "Content-Type": "application/json" };
     const userId = typeof window !== "undefined" ? localStorage.getItem("ai_comic_uid") : null;
     if (userId) headers["x-user-id"] = userId;
@@ -982,7 +1064,7 @@ export default function ImportPage({
 
   const resetDraftPayload = useCallback((): ImportDraftState => ({
     currentStep: 0,
-    stepStatus: { 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+    stepStatus: sanitizePersistedStepStatus(),
     fullText: "",
     reviewIssues: [],
     storyAnalysis: null,
@@ -1056,19 +1138,35 @@ export default function ImportPage({
             const stepLogs = data.filter((l: LogEntry) => l.step === s);
             const latestStepLog = stepLogs[stepLogs.length - 1];
             if (latestStepLog) {
-              setStepStatus((prev) => ({ ...prev, [s]: latestStepLog.status }));
+              setStepStatus((prev) => ({
+                ...prev,
+                [s]: latestStepLog.status === "running" ? "idle" : latestStepLog.status,
+              }));
             }
           }
         }
 
         if (draft) {
+          const draftStepStatus = sanitizePersistedStepStatus(draft.stepStatus);
           if (typeof draft.currentStep === "number") {
-            setCurrentStep(Math.max(0, Math.min(5, draft.currentStep)) as Step | 0);
+            const draftCurrentStep = Math.max(0, Math.min(5, draft.currentStep)) as Step | 0;
+            setCurrentStep(draftCurrentStep as Step | 0);
+            if (draftCurrentStep < 5 || draftStepStatus[5] !== "done") {
+              setHistoryMode(false);
+              setSelectedStep(null);
+            }
           }
           if (draft.stepStatus) {
-            setStepStatus((prev) => ({ ...prev, ...draft.stepStatus }));
+            setStepStatus((prev) => ({ ...prev, ...draftStepStatus }));
           }
-          if (typeof draft.fullText === "string") setFullText(draft.fullText);
+          if (typeof draft.fullText === "string") {
+            setFullText(draft.fullText);
+            if (draftStepStatus[2] === "done" || draft.storyAnalysis?.assets) {
+              enrichedTextRef.current = draft.fullText;
+              detailSupplementedRef.current = true;
+              setDetailSupplemented(true);
+            }
+          }
           if (Array.isArray(draft.reviewIssues)) setReviewIssues(draft.reviewIssues);
           if (draft.storyAnalysis !== undefined) setStoryAnalysis(draft.storyAnalysis ?? null);
           const draftProjectStyleGuide = buildProjectStyleGuide(
@@ -1087,7 +1185,7 @@ export default function ImportPage({
           if (Array.isArray(draft.confirmedEpisodeIndexes)) {
             setConfirmedEpisodeIndexes(new Set(draft.confirmedEpisodeIndexes));
           }
-          storyReviewedRef.current = draft.stepStatus?.[2] === "done";
+          storyReviewedRef.current = draftStepStatus[2] === "done";
         }
       } catch {
         // No draft/logs, fresh import
@@ -1159,6 +1257,11 @@ export default function ImportPage({
     ]);
   }, []);
 
+  const setDetailSupplementReady = useCallback((ready: boolean) => {
+    detailSupplementedRef.current = ready;
+    setDetailSupplemented(ready);
+  }, []);
+
   const handleFile = useCallback((f: File) => {
     if (f.size > MAX_SIZE) {
       toast.error(t("fileTooLarge"));
@@ -1166,6 +1269,9 @@ export default function ImportPage({
     }
     setFile(f);
     storyReviewedRef.current = false;
+    enrichedTextRef.current = "";
+    visualEnrichmentRef.current = null;
+    setDetailSupplementReady(false);
     setHistoryMode(false);
     setSelectedStep(null);
     setCurrentStep(0);
@@ -1182,7 +1288,7 @@ export default function ImportPage({
     setConfirmedEpisodeIndexes(new Set());
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     void saveDraft(resetDraftPayload());
-  }, [resetDraftPayload, saveDraft, t]);
+  }, [resetDraftPayload, saveDraft, setDetailSupplementReady, t]);
 
   // ── Step 1: Parse, then stop for story review ──
   async function startPipeline() {
@@ -1204,6 +1310,9 @@ export default function ImportPage({
     setExpandedEpisodeIndexes(new Set());
     setConfirmedEpisodeIndexes(new Set());
     storyReviewedRef.current = false;
+    enrichedTextRef.current = "";
+    visualEnrichmentRef.current = null;
+    setDetailSupplementReady(false);
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     await saveDraft(resetDraftPayload());
 
@@ -1246,6 +1355,92 @@ export default function ImportPage({
   }
 
   // ── Step 2: AI story review, then human review gate ──
+  async function enrichScriptBeforeReview(sourceText: string): Promise<ReviewPreparation> {
+    if (detailSupplementedRef.current) {
+      return { text: sourceText, visualEnrichment: visualEnrichmentRef.current };
+    }
+
+    addLog(2, "running", "先进行 AI 细节补全，生成可人工检查的改写文本...");
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), SCRIPT_ENRICHMENT_TIMEOUT_MS);
+    let waitedSeconds = 0;
+    const heartbeatId = window.setInterval(() => {
+      waitedSeconds += 30;
+      addLog(2, "running", `AI 细节补全仍在运行，已等待 ${waitedSeconds} 秒...`);
+    }, 30_000);
+    let data: ScriptEnrichmentPreview;
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/script/enrich-preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          script: sourceText,
+          modelConfig: getModelConfig(),
+          useAI: true,
+          applyToText: true,
+          fallbackToLocal: false,
+          maxBeats: SCRIPT_ENRICHMENT_BEAT_BATCH_SIZE,
+        }),
+      });
+      data = await res.json() as ScriptEnrichmentPreview;
+    } catch (err) {
+      const isAbort = err instanceof DOMException && err.name === "AbortError";
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(
+        2,
+        "error",
+        isAbort
+          ? "AI 细节补全超时，未改写原文。请重试或检查文本模型配置。"
+          : `AI 细节补全失败，未改写原文：${msg}`
+      );
+      enrichedTextRef.current = sourceText;
+      visualEnrichmentRef.current = null;
+      setDetailSupplementReady(false);
+      return { text: sourceText, visualEnrichment: null };
+    } finally {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(heartbeatId);
+    }
+
+    const enrichedText = typeof data.enrichedText === "string" && data.enrichedText.trim()
+      ? data.enrichedText
+      : sourceText;
+    const appliedCount = data.appliedPatchCount ?? 0;
+    const acceptedPatches = data.validation?.accepted_patches?.length
+      ? data.validation.accepted_patches
+      : data.patches || [];
+    const totalBeats = data.stats?.total_beats ?? 0;
+    const warningCount = data.validation?.warnings?.length ?? 0;
+    const statusSuffix = data.validation?.status ? `，状态 ${data.validation.status}` : "";
+    const warningSuffix = warningCount > 0 ? `，${warningCount} 条需留意` : "";
+    const enrichmentMessage = appliedCount > 0
+      ? `AI 细节补全完成：已改写 ${appliedCount}/${totalBeats || appliedCount} 段${statusSuffix}${warningSuffix}`
+      : `AI 细节补全完成，但没有可安全写入的改写段${statusSuffix}${warningSuffix}`;
+    addLog(
+      2,
+      "running",
+      enrichmentMessage
+    );
+
+    enrichedTextRef.current = enrichedText;
+    if (enrichedText !== sourceText) {
+      setFullText(enrichedText);
+    }
+    visualEnrichmentRef.current = acceptedPatches.length > 0
+      ? {
+          patches: acceptedPatches,
+          stats: data.stats,
+          validation: data.validation,
+        }
+      : null;
+    if (acceptedPatches.length > 0) {
+      addLog(2, "running", `已准备 ${acceptedPatches.length} 段视觉补充资产上下文；请人工检查改写文本，确认后再次点击 AI 审阅`);
+    }
+    setDetailSupplementReady(true);
+    return { text: enrichedText, visualEnrichment: visualEnrichmentRef.current };
+  }
+
   async function runStoryReview(text: string = fullText) {
     if (!text.trim()) return;
     if (!textGuard()) return;
@@ -1253,15 +1448,37 @@ export default function ImportPage({
     setCurrentStep(2);
     setStepStatus((prev) => ({ ...prev, 2: "running" }));
     setReviewIssues([]);
-    addLog(2, "running", "开始 AI 剧情审阅...");
+    setStoryAnalysis(null);
+    addLog(2, "running", detailSupplementedRef.current ? "开始 AI 剧情审阅..." : "开始 AI 细节补全...");
 
     try {
       setSelectedIssueIndexes(new Set());
       setActiveIssueIndex(null);
+      const wasDetailSupplemented = detailSupplementedRef.current;
+      const preparedReview = await enrichScriptBeforeReview(text);
+      const reviewText = preparedReview.text;
+      if (!wasDetailSupplemented) {
+        setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+        await saveDraft({
+          ...buildDraftPayload(),
+          currentStep: 2,
+          stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
+          fullText: reviewText,
+          reviewIssues: [],
+          storyAnalysis: null,
+        });
+        return;
+      }
+
       const res = await apiFetch(`/api/projects/${projectId}/import/structure`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ modelConfig: getModelConfig(), concurrency: 2 }),
+        body: JSON.stringify({
+          text: reviewText,
+          visualEnrichment: preparedReview.visualEnrichment,
+          modelConfig: getModelConfig(),
+          concurrency: 2,
+        }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -1286,7 +1503,7 @@ export default function ImportPage({
         ...buildDraftPayload(),
         currentStep: 2,
         stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
-        fullText: text,
+        fullText: reviewText,
         reviewIssues: data.issues || [],
         storyAnalysis: data.storyAnalysis || null,
       });
@@ -2953,7 +3170,7 @@ export default function ImportPage({
                   className="rounded-xl"
                 >
                   {reviewRunning && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  {reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
+                  {!detailSupplemented ? "AI补全细节" : reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
                 </Button>
                 <Button onClick={confirmStoryReview} disabled={reviewRunning} className="rounded-xl">
                   {t("confirmStoryReview")}
@@ -4508,6 +4725,9 @@ export default function ImportPage({
                       setSelectedStep(null);
                       setCurrentStep(0);
                       storyReviewedRef.current = false;
+                      enrichedTextRef.current = "";
+                      visualEnrichmentRef.current = null;
+                      setDetailSupplementReady(false);
                       setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
                     }}
                   >

@@ -124,6 +124,8 @@ export async function POST(
     return NextResponse.json({ error: "No script text" }, { status: 400 });
   }
 
+  const scriptForAssetExtraction = text;
+
   await addImportLog(
     projectId,
     3,
@@ -135,7 +137,7 @@ export async function POST(
   try {
     assetProject = analyzeScriptAssets({
       title: project.title,
-      script: text,
+      script: scriptForAssetExtraction,
       storyAnalysis: body.storyAnalysis || null,
       aspectRatio: "16:9",
       targetSize: "1536x1024",
