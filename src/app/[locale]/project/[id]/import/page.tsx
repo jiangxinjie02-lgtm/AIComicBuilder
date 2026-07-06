@@ -772,6 +772,7 @@ interface ImportDraftState {
   relationships?: Array<{ characterA: string; characterB: string; relationType: string; description?: string }> | null;
   episodes?: SplitEpisode[] | null;
   confirmedEpisodeIndexes?: number[] | null;
+  enrichmentJobId?: string | null;
 }
 
 interface StoryReviewIssue {
@@ -839,6 +840,27 @@ interface ReviewPreparation {
   } | null;
 }
 
+interface ScriptEnrichmentJobStatus {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  progress: number;
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  skipped_tasks: number;
+  current_episode?: string;
+  current_scene?: string;
+  error_message?: string;
+  enrichedText?: string;
+  visualEnrichment?: ReviewPreparation["visualEnrichment"];
+  recent_logs?: Array<{
+    id: string;
+    level: "info" | "warn" | "error";
+    message: string;
+    created_at: string | number;
+  }>;
+}
+
 type StoryAssetSectionKey = "characters" | "scenes" | "props";
 
 type Step = 1 | 2 | 3 | 4 | 5;
@@ -852,8 +874,9 @@ const STEP_IDLE_STATUS: Record<Step, StepStatusValue> = {
   5: "idle",
 };
 
-const SCRIPT_ENRICHMENT_TIMEOUT_MS = 90_000;
-const SCRIPT_ENRICHMENT_BEAT_BATCH_SIZE = 10;
+const SCRIPT_ENRICHMENT_POLL_MS = 2500;
+const SCRIPT_ENRICHMENT_BEAT_GROUP_SIZE = 5;
+const SCRIPT_ENRICHMENT_MAX_BEATS_PER_CHUNK = 10;
 
 function sanitizePersistedStepStatus(status?: Partial<Record<Step, StepStatusValue>>) {
   const next = { ...STEP_IDLE_STATUS };
@@ -924,6 +947,11 @@ export default function ImportPage({
   const visualEnrichmentRef = useRef<ReviewPreparation["visualEnrichment"]>(null);
   const detailSupplementedRef = useRef(false);
   const [detailSupplemented, setDetailSupplemented] = useState(false);
+  const enrichmentJobIdRef = useRef<string | null>(null);
+  const enrichmentStatusRef = useRef<ScriptEnrichmentJobStatus | null>(null);
+  const lastEnrichmentTerminalLogRef = useRef<string | null>(null);
+  const [enrichmentJobId, setEnrichmentJobId] = useState<string | null>(null);
+  const [enrichmentJobStatus, setEnrichmentJobStatus] = useState<ScriptEnrichmentJobStatus | null>(null);
 
   // Step 0: Upload
   const [file, setFile] = useState<File | null>(null);
@@ -1014,6 +1042,7 @@ export default function ImportPage({
     relationships,
     episodes,
     confirmedEpisodeIndexes: Array.from(confirmedEpisodeIndexes),
+    enrichmentJobId,
   }), [
     currentStep,
     stepStatus,
@@ -1027,6 +1056,7 @@ export default function ImportPage({
     relationships,
     episodes,
     confirmedEpisodeIndexes,
+    enrichmentJobId,
   ]);
 
   const saveDraft = useCallback(async (payload?: ImportDraftState) => {
@@ -1075,6 +1105,7 @@ export default function ImportPage({
     relationships: [],
     episodes: [],
     confirmedEpisodeIndexes: [],
+    enrichmentJobId: null,
   }), []);
 
   if (draftHydratedRef.current) {
@@ -1185,6 +1216,10 @@ export default function ImportPage({
           if (Array.isArray(draft.confirmedEpisodeIndexes)) {
             setConfirmedEpisodeIndexes(new Set(draft.confirmedEpisodeIndexes));
           }
+          if (typeof draft.enrichmentJobId === "string" && draft.enrichmentJobId) {
+            enrichmentJobIdRef.current = draft.enrichmentJobId;
+            setEnrichmentJobId(draft.enrichmentJobId);
+          }
           storyReviewedRef.current = draftStepStatus[2] === "done";
         }
       } catch {
@@ -1262,6 +1297,136 @@ export default function ImportPage({
     setDetailSupplemented(ready);
   }, []);
 
+  const setCurrentEnrichmentJob = useCallback((jobId: string | null) => {
+    enrichmentJobIdRef.current = jobId;
+    setEnrichmentJobId(jobId);
+    if (!jobId) {
+      enrichmentStatusRef.current = null;
+      setEnrichmentJobStatus(null);
+      lastEnrichmentTerminalLogRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enrichmentJobId) return;
+    let active = true;
+    let polling = false;
+
+    const applyStatus = async (data: ScriptEnrichmentJobStatus) => {
+      if (!active) return;
+      enrichmentStatusRef.current = data;
+      setEnrichmentJobStatus(data);
+
+      const enrichedText = typeof data.enrichedText === "string" && data.enrichedText.trim()
+        ? data.enrichedText
+        : fullText;
+      if (enrichedText && enrichedText !== fullText) {
+        enrichedTextRef.current = enrichedText;
+        setFullText(enrichedText);
+      }
+      if (data.visualEnrichment?.patches?.length) {
+        visualEnrichmentRef.current = data.visualEnrichment;
+      } else if (data.status === "completed") {
+        visualEnrichmentRef.current = null;
+      }
+
+      if (data.status === "queued" || data.status === "running") {
+        setStepStatus((prev) => ({ ...prev, 2: "running" }));
+        return;
+      }
+
+      const terminalKey = `${data.job_id}:${data.status}:${data.completed_tasks}:${data.failed_tasks}:${data.skipped_tasks}`;
+      if (lastEnrichmentTerminalLogRef.current !== terminalKey) {
+        lastEnrichmentTerminalLogRef.current = terminalKey;
+        if (data.status === "completed") {
+          addLog(
+            2,
+            "running",
+            `AI 细节补全完成：成功 ${data.completed_tasks}，跳过 ${data.skipped_tasks}，失败 ${data.failed_tasks}`,
+          );
+        } else if (data.status === "cancelled") {
+          addLog(2, "error", "AI 细节补全已取消");
+        } else {
+          addLog(2, "error", `AI 细节补全失败：${data.error_message || "未知错误"}`);
+        }
+      }
+
+      if (data.status === "completed") {
+        setDetailSupplementReady(true);
+        setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+        await saveDraft({
+          ...buildDraftPayload(),
+          currentStep: 2,
+          stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+          fullText: enrichedText,
+          reviewIssues: [],
+          storyAnalysis: null,
+          enrichmentJobId: data.job_id,
+        });
+      } else {
+        setDetailSupplementReady(false);
+        setStepStatus((prev) => ({ ...prev, 2: data.status === "cancelled" ? "idle" : "error" }));
+      }
+    };
+
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const res = await apiFetch(`/api/projects/${projectId}/script/enrich/jobs/${enrichmentJobId}`);
+        const data = await res.json() as ScriptEnrichmentJobStatus;
+        await applyStatus(data);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        addLog(2, "error", `读取 AI 细节补全进度失败：${msg}`);
+      } finally {
+        polling = false;
+      }
+    };
+
+    void poll();
+    const intervalId = window.setInterval(() => void poll(), SCRIPT_ENRICHMENT_POLL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    addLog,
+    buildDraftPayload,
+    enrichmentJobId,
+    fullText,
+    projectId,
+    saveDraft,
+    setDetailSupplementReady,
+  ]);
+
+  async function cancelEnrichmentJob() {
+    const jobId = enrichmentJobIdRef.current;
+    if (!jobId) return;
+    const res = await apiFetch(`/api/projects/${projectId}/script/enrich/jobs/${jobId}/cancel`, {
+      method: "POST",
+    });
+    const data = await res.json() as ScriptEnrichmentJobStatus;
+    enrichmentStatusRef.current = data;
+    setEnrichmentJobStatus(data);
+    setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+    addLog(2, "error", "AI 细节补全已取消");
+  }
+
+  async function retryFailedEnrichmentJob() {
+    const jobId = enrichmentJobIdRef.current;
+    if (!jobId) return;
+    const res = await apiFetch(`/api/projects/${projectId}/script/enrich/jobs/${jobId}/retry-failed`, {
+      method: "POST",
+    });
+    const data = await res.json() as ScriptEnrichmentJobStatus;
+    enrichmentStatusRef.current = data;
+    setEnrichmentJobStatus(data);
+    setStepStatus((prev) => ({ ...prev, 2: "running" }));
+    setDetailSupplementReady(false);
+    addLog(2, "running", "AI 细节补全失败任务已重新排队");
+  }
+
   const handleFile = useCallback((f: File) => {
     if (f.size > MAX_SIZE) {
       toast.error(t("fileTooLarge"));
@@ -1272,6 +1437,7 @@ export default function ImportPage({
     enrichedTextRef.current = "";
     visualEnrichmentRef.current = null;
     setDetailSupplementReady(false);
+    setCurrentEnrichmentJob(null);
     setHistoryMode(false);
     setSelectedStep(null);
     setCurrentStep(0);
@@ -1288,7 +1454,7 @@ export default function ImportPage({
     setConfirmedEpisodeIndexes(new Set());
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     void saveDraft(resetDraftPayload());
-  }, [resetDraftPayload, saveDraft, setDetailSupplementReady, t]);
+  }, [resetDraftPayload, saveDraft, setCurrentEnrichmentJob, setDetailSupplementReady, t]);
 
   // ── Step 1: Parse, then stop for story review ──
   async function startPipeline() {
@@ -1313,6 +1479,7 @@ export default function ImportPage({
     enrichedTextRef.current = "";
     visualEnrichmentRef.current = null;
     setDetailSupplementReady(false);
+    setCurrentEnrichmentJob(null);
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     await saveDraft(resetDraftPayload());
 
@@ -1355,90 +1522,57 @@ export default function ImportPage({
   }
 
   // ── Step 2: AI story review, then human review gate ──
-  async function enrichScriptBeforeReview(sourceText: string): Promise<ReviewPreparation> {
-    if (detailSupplementedRef.current) {
-      return { text: sourceText, visualEnrichment: visualEnrichmentRef.current };
+  async function startScriptEnrichmentBeforeReview(sourceText: string) {
+    if (enrichmentJobStatus && (enrichmentJobStatus.status === "queued" || enrichmentJobStatus.status === "running")) {
+      addLog(2, "running", "AI 细节补全任务已经在运行，请看上方进度");
+      return;
     }
 
-    addLog(2, "running", "先进行 AI 细节补全，生成可人工检查的改写文本...");
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), SCRIPT_ENRICHMENT_TIMEOUT_MS);
-    let waitedSeconds = 0;
-    const heartbeatId = window.setInterval(() => {
-      waitedSeconds += 30;
-      addLog(2, "running", `AI 细节补全仍在运行，已等待 ${waitedSeconds} 秒...`);
-    }, 30_000);
-    let data: ScriptEnrichmentPreview;
-    try {
-      const res = await apiFetch(`/api/projects/${projectId}/script/enrich-preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          script: sourceText,
-          modelConfig: getModelConfig(),
-          useAI: true,
-          applyToText: true,
-          fallbackToLocal: false,
-          maxBeats: SCRIPT_ENRICHMENT_BEAT_BATCH_SIZE,
-        }),
-      });
-      data = await res.json() as ScriptEnrichmentPreview;
-    } catch (err) {
-      const isAbort = err instanceof DOMException && err.name === "AbortError";
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog(
-        2,
-        "error",
-        isAbort
-          ? "AI 细节补全超时，未改写原文。请重试或检查文本模型配置。"
-          : `AI 细节补全失败，未改写原文：${msg}`
-      );
-      enrichedTextRef.current = sourceText;
-      visualEnrichmentRef.current = null;
-      setDetailSupplementReady(false);
-      return { text: sourceText, visualEnrichment: null };
-    } finally {
-      window.clearTimeout(timeoutId);
-      window.clearInterval(heartbeatId);
-    }
-
-    const enrichedText = typeof data.enrichedText === "string" && data.enrichedText.trim()
-      ? data.enrichedText
-      : sourceText;
-    const appliedCount = data.appliedPatchCount ?? 0;
-    const acceptedPatches = data.validation?.accepted_patches?.length
-      ? data.validation.accepted_patches
-      : data.patches || [];
-    const totalBeats = data.stats?.total_beats ?? 0;
-    const warningCount = data.validation?.warnings?.length ?? 0;
-    const statusSuffix = data.validation?.status ? `，状态 ${data.validation.status}` : "";
-    const warningSuffix = warningCount > 0 ? `，${warningCount} 条需留意` : "";
-    const enrichmentMessage = appliedCount > 0
-      ? `AI 细节补全完成：已改写 ${appliedCount}/${totalBeats || appliedCount} 段${statusSuffix}${warningSuffix}`
-      : `AI 细节补全完成，但没有可安全写入的改写段${statusSuffix}${warningSuffix}`;
-    addLog(
-      2,
-      "running",
-      enrichmentMessage
-    );
-
-    enrichedTextRef.current = enrichedText;
-    if (enrichedText !== sourceText) {
-      setFullText(enrichedText);
-    }
-    visualEnrichmentRef.current = acceptedPatches.length > 0
-      ? {
-          patches: acceptedPatches,
-          stats: data.stats,
-          validation: data.validation,
-        }
-      : null;
-    if (acceptedPatches.length > 0) {
-      addLog(2, "running", `已准备 ${acceptedPatches.length} 段视觉补充资产上下文；请人工检查改写文本，确认后再次点击 AI 审阅`);
-    }
-    setDetailSupplementReady(true);
-    return { text: enrichedText, visualEnrichment: visualEnrichmentRef.current };
+    addLog(2, "running", "创建 AI 细节补全后台任务...");
+    visualEnrichmentRef.current = null;
+    enrichedTextRef.current = sourceText;
+    lastEnrichmentTerminalLogRef.current = null;
+    setDetailSupplementReady(false);
+    const res = await apiFetch(`/api/projects/${projectId}/script/enrich/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        script: sourceText,
+        modelConfig: getModelConfig(),
+        useAI: true,
+        fallbackToLocal: false,
+        concurrency: 2,
+        beatGroupSize: SCRIPT_ENRICHMENT_BEAT_GROUP_SIZE,
+        maxBeatsPerChunk: SCRIPT_ENRICHMENT_MAX_BEATS_PER_CHUNK,
+        maxRetries: 2,
+      }),
+    });
+    const data = await res.json() as { jobId?: string; job_id?: string; status?: string; totalTasks?: number; total_tasks?: number };
+    const jobId = data.jobId || data.job_id;
+    if (!jobId) throw new Error("AI 细节补全任务没有返回 jobId");
+    setCurrentEnrichmentJob(jobId);
+    setEnrichmentJobStatus({
+      job_id: jobId,
+      status: "queued",
+      progress: 0,
+      total_tasks: data.totalTasks || data.total_tasks || 0,
+      completed_tasks: 0,
+      failed_tasks: 0,
+      skipped_tasks: 0,
+      enrichedText: sourceText,
+      visualEnrichment: null,
+      recent_logs: [],
+    });
+    await saveDraft({
+      ...buildDraftPayload(),
+      currentStep: 2,
+      stepStatus: { 1: "done", 2: "running", 3: "idle", 4: "idle", 5: "idle" },
+      fullText: sourceText,
+      reviewIssues: [],
+      storyAnalysis: null,
+      enrichmentJobId: jobId,
+    });
+    addLog(2, "running", `AI 细节补全后台任务已创建：${data.totalTasks || data.total_tasks || 0} 个小任务`);
   }
 
   async function runStoryReview(text: string = fullText) {
@@ -1454,21 +1588,15 @@ export default function ImportPage({
     try {
       setSelectedIssueIndexes(new Set());
       setActiveIssueIndex(null);
-      const wasDetailSupplemented = detailSupplementedRef.current;
-      const preparedReview = await enrichScriptBeforeReview(text);
-      const reviewText = preparedReview.text;
-      if (!wasDetailSupplemented) {
-        setStepStatus((prev) => ({ ...prev, 2: "idle" }));
-        await saveDraft({
-          ...buildDraftPayload(),
-          currentStep: 2,
-          stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
-          fullText: reviewText,
-          reviewIssues: [],
-          storyAnalysis: null,
-        });
+      if (!detailSupplementedRef.current) {
+        await startScriptEnrichmentBeforeReview(text);
         return;
       }
+      const preparedReview: ReviewPreparation = {
+        text,
+        visualEnrichment: visualEnrichmentRef.current,
+      };
+      const reviewText = preparedReview.text;
 
       const res = await apiFetch(`/api/projects/${projectId}/import/structure`, {
         method: "POST",
@@ -1509,7 +1637,7 @@ export default function ImportPage({
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Review failed";
-      addLog(2, "error", `AI 剧情审阅失败: ${msg}`);
+      addLog(2, "error", detailSupplementedRef.current ? `AI 剧情审阅失败: ${msg}` : `AI 细节补全启动失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 2: "error" }));
     }
   }
@@ -2085,7 +2213,9 @@ export default function ImportPage({
   const showEpReview = stepStatus[4] === "done" && stepStatus[5] === "idle" && !historyMode;
   const hideParseStep = stepStatus[2] === "done" || currentStep >= 3;
   const visibleSteps = hideParseStep ? STEPS.filter(({ num }) => num !== 1) : STEPS;
-  const reviewRunning = stepStatus[2] === "running";
+  const enrichmentRunning = Boolean(enrichmentJobStatus && (enrichmentJobStatus.status === "queued" || enrichmentJobStatus.status === "running"));
+  const reviewRunning = stepStatus[2] === "running" && !enrichmentRunning && detailSupplemented;
+  const stepTwoBusy = enrichmentRunning || reviewRunning;
   const unappliedIssueCount = reviewIssues.filter((issue) => !issue.applied).length;
   const selectableIssueIndexes = reviewIssues
     .map((issue, index) => ({ issue, index }))
@@ -3166,17 +3296,67 @@ export default function ImportPage({
                 <Button
                   variant="outline"
                   onClick={() => runStoryReview()}
-                  disabled={reviewRunning || !fullText.trim()}
+                  disabled={stepTwoBusy || !fullText.trim()}
                   className="rounded-xl"
                 >
-                  {reviewRunning && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  {!detailSupplemented ? "AI补全细节" : reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
+                  {stepTwoBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                  {enrichmentRunning ? "AI补全中" : !detailSupplemented ? "AI补全细节" : reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
                 </Button>
-                <Button onClick={confirmStoryReview} disabled={reviewRunning} className="rounded-xl">
+                <Button onClick={confirmStoryReview} disabled={stepTwoBusy || !detailSupplemented} className="rounded-xl">
                   {t("confirmStoryReview")}
                 </Button>
               </div>
             </div>
+
+            {enrichmentJobStatus && !detailSupplemented && (
+              <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[--text-primary]">AI 细节补全</div>
+                    <div className="text-xs text-[--text-muted]">
+                      {enrichmentJobStatus.current_episode || "准备中"}
+                      {enrichmentJobStatus.current_scene ? ` / ${enrichmentJobStatus.current_scene}` : ""}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {enrichmentJobStatus.failed_tasks > 0 && (
+                      <Button variant="outline" size="sm" onClick={retryFailedEnrichmentJob} disabled={enrichmentRunning}>
+                        重试失败
+                      </Button>
+                    )}
+                    {enrichmentRunning && (
+                      <Button variant="outline" size="sm" onClick={cancelEnrichmentJob}>
+                        取消
+                      </Button>
+                    )}
+                    <span className="rounded-lg bg-[--surface] px-2 py-1 text-xs font-semibold text-[--text-secondary]">
+                      {enrichmentJobStatus.status}
+                    </span>
+                  </div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-[--surface]">
+                  <div
+                    className="h-full rounded-full bg-primary transition-all"
+                    style={{ width: `${Math.max(0, Math.min(100, enrichmentJobStatus.progress || 0))}%` }}
+                  />
+                </div>
+                <div className="mt-3 grid grid-cols-4 gap-2 text-xs text-[--text-muted]">
+                  <div>总任务 {enrichmentJobStatus.total_tasks}</div>
+                  <div>完成 {enrichmentJobStatus.completed_tasks}</div>
+                  <div>跳过 {enrichmentJobStatus.skipped_tasks}</div>
+                  <div>失败 {enrichmentJobStatus.failed_tasks}</div>
+                </div>
+                {enrichmentJobStatus.recent_logs && enrichmentJobStatus.recent_logs.length > 0 && (
+                  <div className="mt-3 max-h-24 space-y-1 overflow-y-auto rounded-lg bg-[--surface] p-2 text-xs text-[--text-muted]">
+                    {enrichmentJobStatus.recent_logs.slice(-4).map((log) => (
+                      <div key={log.id} className={log.level === "error" ? "text-red-500" : log.level === "warn" ? "text-amber-600" : ""}>
+                        {log.message}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="grid min-h-0 flex-1 grid-cols-[minmax(520px,1fr)_300px_360px] gap-4">
               <div className="flex min-h-0 flex-col rounded-xl border border-[--border-subtle] bg-white">
@@ -4728,6 +4908,7 @@ export default function ImportPage({
                       enrichedTextRef.current = "";
                       visualEnrichmentRef.current = null;
                       setDetailSupplementReady(false);
+                      setCurrentEnrichmentJob(null);
                       setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
                     }}
                   >

@@ -259,6 +259,7 @@ export const importStates = sqliteTable("import_states", {
   episodes: text("episodes", { mode: "json" }),
   confirmedEpisodeIndexes: text("confirmed_episode_indexes", { mode: "json" }),
   shotReview: text("shot_review", { mode: "json" }),
+  enrichmentJobId: text("enrichment_job_id"),
   updatedAt: integer("updated_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -325,6 +326,92 @@ export const scriptChunks = sqliteTable("script_chunks", {
     .notNull()
     .$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const scriptEnrichmentJobs = sqliteTable("script_enrichment_jobs", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "set null",
+  }),
+  status: text("status", {
+    enum: ["queued", "running", "completed", "failed", "cancelled"],
+  }).notNull().default("queued"),
+  totalTasks: integer("total_tasks").notNull().default(0),
+  completedTasks: integer("completed_tasks").notNull().default(0),
+  failedTasks: integer("failed_tasks").notNull().default(0),
+  skippedTasks: integer("skipped_tasks").notNull().default(0),
+  currentEpisode: text("current_episode").default(""),
+  currentScene: text("current_scene").default(""),
+  progress: integer("progress").notNull().default(0),
+  baseTextHash: text("base_text_hash").default(""),
+  options: text("options", { mode: "json" }),
+  errorMessage: text("error_message"),
+  startedAt: integer("started_at", { mode: "timestamp" }),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const scriptEnrichmentTasks = sqliteTable("script_enrichment_tasks", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => scriptEnrichmentJobs.id, { onDelete: "cascade" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "set null",
+  }),
+  chunkId: text("chunk_id").references(() => scriptChunks.id, {
+    onDelete: "set null",
+  }),
+  episodeId: text("episode_id"),
+  sceneId: text("scene_id"),
+  beatId: text("beat_id").default(""),
+  sequence: integer("sequence").notNull().default(0),
+  status: text("status", {
+    enum: ["pending", "running", "completed", "failed", "skipped"],
+  }).notNull().default("pending"),
+  inputHash: text("input_hash").notNull().default(""),
+  inputJson: text("input_json", { mode: "json" }),
+  retryCount: integer("retry_count").notNull().default(0),
+  maxRetries: integer("max_retries").notNull().default(2),
+  resultJson: text("result_json", { mode: "json" }),
+  errorMessage: text("error_message"),
+  startedAt: integer("started_at", { mode: "timestamp" }),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const scriptEnrichmentLogs = sqliteTable("script_enrichment_logs", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => scriptEnrichmentJobs.id, { onDelete: "cascade" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  level: text("level", { enum: ["info", "warn", "error"] })
+    .notNull()
+    .default("info"),
+  message: text("message").notNull().default(""),
+  metaJson: text("meta_json", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
 });
@@ -809,6 +896,7 @@ export const tasks = sqliteTable("tasks", {
       "frame_generate",
       "video_generate",
       "video_assemble",
+      "script_visual_enrichment",
     ],
   }).notNull(),
   status: text("status", {

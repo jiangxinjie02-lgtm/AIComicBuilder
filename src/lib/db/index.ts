@@ -172,6 +172,7 @@ export function ensureImportStatesTable() {
       "episodes" text,
       "confirmed_episode_indexes" text,
       "shot_review" text,
+      "enrichment_job_id" text,
       "updated_at" integer NOT NULL,
       FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
     )
@@ -179,6 +180,84 @@ export function ensureImportStatesTable() {
   if (!columnExists(sqlite, "import_states", "shot_review")) {
     sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "shot_review" text`).run();
   }
+  if (!columnExists(sqlite, "import_states", "enrichment_job_id")) {
+    sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "enrichment_job_id" text`).run();
+  }
+}
+
+export function ensureScriptEnrichmentTables() {
+  const sqlite = getSqlite();
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "script_enrichment_jobs" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "script_id" text,
+      "status" text DEFAULT 'queued' NOT NULL,
+      "total_tasks" integer DEFAULT 0 NOT NULL,
+      "completed_tasks" integer DEFAULT 0 NOT NULL,
+      "failed_tasks" integer DEFAULT 0 NOT NULL,
+      "skipped_tasks" integer DEFAULT 0 NOT NULL,
+      "current_episode" text DEFAULT '',
+      "current_scene" text DEFAULT '',
+      "progress" integer DEFAULT 0 NOT NULL,
+      "base_text_hash" text DEFAULT '',
+      "options" text,
+      "error_message" text,
+      "started_at" integer,
+      "finished_at" integer,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("script_id") REFERENCES "scripts"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_script_enrichment_jobs_project" ON "script_enrichment_jobs" ("project_id", "status")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "script_enrichment_tasks" (
+      "id" text PRIMARY KEY NOT NULL,
+      "job_id" text NOT NULL,
+      "project_id" text NOT NULL,
+      "script_id" text,
+      "chunk_id" text,
+      "episode_id" text,
+      "scene_id" text,
+      "beat_id" text DEFAULT '',
+      "sequence" integer DEFAULT 0 NOT NULL,
+      "status" text DEFAULT 'pending' NOT NULL,
+      "input_hash" text DEFAULT '' NOT NULL,
+      "input_json" text,
+      "retry_count" integer DEFAULT 0 NOT NULL,
+      "max_retries" integer DEFAULT 2 NOT NULL,
+      "result_json" text,
+      "error_message" text,
+      "started_at" integer,
+      "finished_at" integer,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("job_id") REFERENCES "script_enrichment_jobs"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("script_id") REFERENCES "scripts"("id") ON UPDATE no action ON DELETE set null,
+      FOREIGN KEY ("chunk_id") REFERENCES "script_chunks"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_script_enrichment_tasks_job_status" ON "script_enrichment_tasks" ("job_id", "status", "sequence")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_script_enrichment_tasks_project" ON "script_enrichment_tasks" ("project_id", "job_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "script_enrichment_logs" (
+      "id" text PRIMARY KEY NOT NULL,
+      "job_id" text NOT NULL,
+      "project_id" text NOT NULL,
+      "level" text DEFAULT 'info' NOT NULL,
+      "message" text DEFAULT '' NOT NULL,
+      "meta_json" text,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("job_id") REFERENCES "script_enrichment_jobs"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_script_enrichment_logs_job" ON "script_enrichment_logs" ("job_id", "created_at")`).run();
 }
 
 export function ensureAssetLibraryTables() {
@@ -551,6 +630,7 @@ export function runMigrations() {
     ensureAssetLibraryTables();
     ensureProductionBibleTable();
     ensureStoryPipelineTables();
+    ensureScriptEnrichmentTables();
     return;
   }
 
@@ -561,6 +641,7 @@ export function runMigrations() {
   ensureAssetLibraryTables();
   ensureProductionBibleTable();
   ensureStoryPipelineTables();
+  ensureScriptEnrichmentTables();
 }
 
 // Proxy preserves the `db` export API — lazy-inits on first property access

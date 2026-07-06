@@ -18,6 +18,7 @@ type ImportDraftState = {
   episodes?: unknown;
   confirmedEpisodeIndexes?: unknown;
   shotReview?: unknown;
+  enrichmentJobId?: unknown;
 };
 
 async function assertProject(request: Request, projectId: string) {
@@ -80,6 +81,7 @@ export async function PATCH(
       confirmedEpisodeIndexes: body.confirmedEpisodeIndexes,
     }),
     ...(body.shotReview !== undefined && { shotReview: body.shotReview }),
+    ...(typeof body.enrichmentJobId === "string" && { enrichmentJobId: body.enrichmentJobId }),
     updatedAt: new Date(),
   };
 
