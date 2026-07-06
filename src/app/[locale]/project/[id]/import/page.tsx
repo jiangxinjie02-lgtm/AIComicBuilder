@@ -23,6 +23,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { apiFetch } from "@/lib/api-fetch";
+import {
+  buildAssetImagePrompt,
+  defaultAssetStyleSpec,
+  defaultAssetVisualSpec,
+  type AssetPromptType,
+  type AssetStyleSpec,
+  type AssetVisualSchema,
+} from "@/lib/asset-prompt-builder";
 import { useModelStore } from "@/stores/model-store";
 import { useModelGuard } from "@/hooks/use-model-guard";
 import { toast } from "sonner";
@@ -53,6 +61,8 @@ interface ExtractedCharacter {
   editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
+  visualSchema?: AssetVisualSchema | null;
+  styleSpec?: AssetStyleSpec | null;
 }
 
 interface AssetVariant {
@@ -70,6 +80,8 @@ interface ExtractedAsset {
   frequency: number;
   description: string;
   visualHint?: string;
+  visualConstraints?: string;
+  background?: string;
   confirmed?: boolean;
   assetId?: string;
   category?: string;
@@ -86,6 +98,8 @@ interface ExtractedAsset {
   editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
+  visualSchema?: AssetVisualSchema | null;
+  styleSpec?: AssetStyleSpec | null;
 }
 
 type AssetTab = "characters" | "items" | "environments" | "voices";
@@ -129,16 +143,20 @@ function normalizeImportedEnvironments(environments: ExtractedAsset[], projectSt
 }
 
 function normalizeImportedItem(item: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
+  const compiledPrompt = compileImportAssetPrompt("prop", item, projectStyleGuide);
   return {
     ...item,
-    prompt: buildItemPromptTemplate(item, projectStyleGuide),
+    prompt: compiledPrompt.prompt,
+    negativePrompt: compiledPrompt.negativePrompt || item.negativePrompt,
   };
 }
 
 function normalizeImportedEnvironment(environment: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
+  const compiledPrompt = compileImportAssetPrompt("scene", environment, projectStyleGuide);
   return {
     ...environment,
-    prompt: buildEnvironmentPromptTemplate(environment, projectStyleGuide),
+    prompt: compiledPrompt.prompt,
+    negativePrompt: compiledPrompt.negativePrompt || environment.negativePrompt,
   };
 }
 
@@ -149,7 +167,11 @@ function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleG
   const background = buildCharacterBackground(character, profile);
   const variants = buildExpectedCharacterVariants(character, faceTemplate, profile);
   const visualConstraints = ensureCharacterVisualConstraints(character, faceTemplate, roleKey);
-  const prompt = ensureCharacterPrompt(character, faceTemplate, visualConstraints, profile, background, projectStyleGuide);
+  const compiledPrompt = compileImportAssetPrompt(
+    "character",
+    { ...character, description: profile, background, visualConstraints, roleKey, faceTemplate },
+    projectStyleGuide,
+  );
 
   return {
     ...character,
@@ -158,9 +180,116 @@ function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleG
     roleKey,
     faceTemplate,
     visualConstraints,
-    prompt,
+    prompt: compiledPrompt.prompt,
+    negativePrompt: compiledPrompt.negativePrompt || character.negativePrompt,
     variants,
   };
+}
+
+function compileImportAssetPrompt(
+  assetType: AssetPromptType,
+  asset: WorkbenchAsset,
+  projectStyleGuide = "",
+) {
+  const existingPrompt = String(asset.prompt || "").trim();
+  if (isCompiledEnglishAssetPrompt(existingPrompt)) {
+    return {
+      prompt: existingPrompt,
+      negativePrompt: asset.negativePrompt || defaultAssetNegativePrompt(assetType, asset, projectStyleGuide),
+    };
+  }
+
+  const styleSpec = buildImportAssetStyleSpec(asset, projectStyleGuide);
+  const built = buildAssetImagePrompt({
+    asset: {
+      id: asset.assetId || asset.name || "",
+      type: assetType,
+      name: asset.name || "asset",
+      role: asset.role || asset.category || asset.scope || "",
+      category: asset.category || (assetType === "character" ? "characters" : assetType === "prop" ? "items" : "environments"),
+      prompt: isLegacyAssetPrompt(existingPrompt) ? "" : existingPrompt,
+      description: asset.description || "",
+      visualHint: asset.visualHint || "",
+      visualConstraints: asset.visualConstraints || "",
+      negativeConstraints: asset.negativePrompt || "",
+      tags: [
+        ...(asset.tags || []),
+        asset.role || "",
+        asset.roleKey || "",
+        asset.scope || "",
+      ].filter(Boolean),
+      faceTemplate: asset.faceTemplate || null,
+      visualSchema: asset.visualSchema || null,
+    },
+    variant: null,
+    visualSpec: defaultAssetVisualSpec(assetType, assetType === "character" ? "1536x1024" : "1536x1024"),
+    styleSpec,
+  });
+
+  return {
+    prompt: built.compiled_final_prompt || existingPrompt,
+    negativePrompt: built.compiled_negative_prompt || asset.negativePrompt || "",
+  };
+}
+
+function isCompiledEnglishAssetPrompt(prompt: string) {
+  return /Asset reference sheet|Reusable prop asset reference|Reusable empty scene environment reference/i.test(prompt)
+    && !isLegacyAssetPrompt(prompt);
+}
+
+function isLegacyAssetPrompt(prompt: string) {
+  return /【整体美学】|【画面规格】|【角色档案】|【职业与画风锚点】|【模板锁定】|【排除项】/.test(prompt);
+}
+
+function defaultAssetNegativePrompt(assetType: AssetPromptType, asset: WorkbenchAsset, projectStyleGuide = "") {
+  const built = buildAssetImagePrompt({
+    asset: {
+      id: asset.assetId || asset.name || "",
+      type: assetType,
+      name: asset.name || "asset",
+      role: asset.role || asset.category || asset.scope || "",
+      category: asset.category || "",
+      description: asset.description || "",
+      visualHint: asset.visualHint || "",
+      visualConstraints: asset.visualConstraints || "",
+      negativeConstraints: asset.negativePrompt || "",
+      tags: asset.tags || [],
+      faceTemplate: asset.faceTemplate || null,
+      visualSchema: asset.visualSchema || null,
+    },
+    variant: null,
+    visualSpec: defaultAssetVisualSpec(assetType, "1536x1024"),
+    styleSpec: buildImportAssetStyleSpec(asset, projectStyleGuide),
+  });
+  return built.compiled_negative_prompt || "";
+}
+
+function buildImportAssetStyleSpec(asset: WorkbenchAsset, projectStyleGuide = ""): AssetStyleSpec {
+  const era = detectEraConstraint([
+    projectStyleGuide,
+    asset.description,
+    asset.visualHint,
+    asset.visualConstraints,
+    asset.background,
+    asset.prompt,
+    ...(asset.tags || []),
+  ]);
+  return {
+    ...defaultAssetStyleSpec(),
+    ...(era ? { era, eraConstraint: era } : {}),
+  };
+}
+
+function detectEraConstraint(values: unknown[]) {
+  const text = values.map((value) => String(value || "")).join(" ");
+  const explicitYear = text.match(/(19[0-9]{2}|20[0-9]{2})\s*(?:年|s)?/i);
+  if (explicitYear) return `${explicitYear[1]} China`;
+  if (/八十年代|八零年代|80年代|1980s|1980年代/i.test(text)) return "1980s China";
+  if (/七十年代|70年代|1970s|1970年代/i.test(text)) return "1970s China";
+  if (/九十年代|90年代|1990s|1990年代/i.test(text)) return "1990s China";
+  if (/民国|军阀|谍战|抗战/.test(text)) return "Republican-era China";
+  if (/古代|古装|仙侠|武侠|宫廷|汉服/.test(text)) return "historical China";
+  return "";
 }
 
 function inferCharacterRoleKey(character: ExtractedCharacter) {
@@ -194,56 +323,6 @@ function ensureCharacterVisualConstraints(
   ].filter(Boolean).join("；");
 }
 
-function ensureCharacterPrompt(
-  character: ExtractedCharacter,
-  faceTemplate: ExtractedCharacter["faceTemplate"],
-  visualConstraints: string,
-  profile: string,
-  background: string,
-  projectStyleGuide: string,
-) {
-  const templateLock = faceTemplate
-    ? `参考${faceTemplate.label}（${faceTemplate.url}），脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须与模板一致。`
-    : "同一角色身份锁定，脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须保持一致。";
-  const genderConstraint = inferCharacterGenderConstraint(character, inferCharacterRoleKey(character));
-  const supportConstraint = faceTemplate ? genderConstraint : [genderConstraint, visualConstraints].filter(Boolean).join("；");
-  return joinPromptSections([
-    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
-    ["画面规格", [
-      `角色设定图，“${character.name || "角色"}”，16:9 横版，纯白背景，平视视角。`,
-      "左 40%：3/4 面部近景；右 60%：正面、侧面、背面全身三视图。",
-      "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
-    ]],
-    ["角色档案", buildCharacterProfileSummary(character, profile, background)],
-    ["职业与画风锚点", buildCharacterVisualAnchors(character, profile, background, projectStyleGuide)],
-    ["模板锁定", [
-      `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
-      supportConstraint ? `身份约束：${supportConstraint}` : "",
-    ]],
-    ["排除项", "无字幕、文字、Logo、水印、UI；无其他人物；不复制身体或同脸分身；禁止漫画风、二次元、插画风。"],
-  ]);
-}
-
-function joinPromptSections(sections: Array<[string, string | string[]]>) {
-  return sections
-    .map(([title, content]) => {
-      const body = (Array.isArray(content) ? content : [content])
-        .map((line) => String(line || "").trim())
-        .filter(Boolean)
-        .join("\n");
-      return body ? `【${title}】\n${body}` : "";
-    })
-    .filter(Boolean)
-    .join("\n\n");
-}
-
-function buildOverallAesthetic(projectStyleGuide = "") {
-  return [
-    PROMPT_OVERALL_AESTHETIC,
-    projectStyleGuide,
-  ].filter(Boolean);
-}
-
 function buildProjectStyleGuide(storyAnalysis?: StoryAssetAnalysis | null, sourceText = "") {
   const meta = storyAnalysis?.storyMeta;
   const seed = [
@@ -272,6 +351,26 @@ function buildProjectStyleGuide(storyAnalysis?: StoryAssetAnalysis | null, sourc
   return "整体画风：真人短剧写实画风，角色、场景、物品保持同一剧本世界观和视觉风格。";
 }
 
+function joinPromptSections(sections: Array<[string, string | string[]]>) {
+  return sections
+    .map(([title, content]) => {
+      const body = (Array.isArray(content) ? content : [content])
+        .map((line) => String(line || "").trim())
+        .filter(Boolean)
+        .join("\n");
+      return body ? `【${title}】\n${body}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildOverallAesthetic(projectStyleGuide = "") {
+  return [
+    PROMPT_OVERALL_AESTHETIC,
+    projectStyleGuide,
+  ].filter(Boolean);
+}
+
 function extractCharacterSubject(prompt: string) {
   const raw = extractPromptSection(prompt || "", "【角色档案】");
   const subjectLine = raw
@@ -295,6 +394,7 @@ function buildCharacterBackground(character: ExtractedCharacter, profile: string
   return normalizeTwoLineBackground(source, character.name || "角色");
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildCharacterProfileSummary(character: ExtractedCharacter, profile: string, background: string) {
   const name = character.name || "角色";
   const role = character.role || "角色";
@@ -340,6 +440,7 @@ function shortenPromptLine(text: string, maxLength: number) {
   return ensureChineseSentence(compact);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildCharacterVisualAnchors(
   character: ExtractedCharacter,
   profile: string,
@@ -397,6 +498,7 @@ function assetPromptDescription(asset: ExtractedAsset, fallback: string) {
   );
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildItemPromptTemplate(item: ExtractedAsset, projectStyleGuide = "") {
   const name = item.name || "物品";
   const type = assetTypeLabel(item, "剧情道具");
@@ -413,6 +515,7 @@ function buildItemPromptTemplate(item: ExtractedAsset, projectStyleGuide = "") {
   ]);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildEnvironmentPromptTemplate(environment: ExtractedAsset, projectStyleGuide = "") {
   const name = environment.name || "环境";
   const type = assetTypeLabel(environment, "剧情场景");
