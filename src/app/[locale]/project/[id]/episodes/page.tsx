@@ -145,8 +145,26 @@ interface ImportAssetLike {
   role?: string;
   scope?: string;
   imageUrl?: string;
-  variants?: Array<{ imageUrl?: string; name?: string }>;
+  referenceImage?: string | null;
+  variants?: Array<{ imageUrl?: string; referenceImage?: string | null; name?: string; state?: string; visualConstraints?: string }>;
   faceTemplate?: { url?: string | null } | null;
+}
+
+interface StoryLibraryAssetLike {
+  id: string;
+  type: "character" | "scene" | "prop";
+  name: string;
+  description?: string | null;
+  visualConstraints?: string | null;
+  referenceImage?: string | null;
+  variants?: Array<{
+    id: string;
+    name: string;
+    state?: string | null;
+    visualConstraints?: string | null;
+    referenceImage?: string | null;
+  }>;
+  detail?: Record<string, unknown> | null;
 }
 
 type SceneAssetSelections = Record<string, Partial<Record<AssetCategory, string[]>>>;
@@ -219,17 +237,34 @@ function uniqueTextItems(items: string[], max = 8) {
 }
 
 function uniqueLibraryAssets(assets: LibraryAsset[]) {
-  const seen = new Set<string>();
-  return assets.filter((asset) => {
+  const byKey = new Map<string, LibraryAsset>();
+  for (const asset of assets) {
     const key = `${asset.category}:${asset.name}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, asset);
+      continue;
+    }
+
+    // Prefer the newest/library-backed item when it has an image. This keeps
+    // generated asset images visible even if project characters still lack
+    // referenceImage.
+    const shouldReplace =
+      (!existing.imageUrl && Boolean(asset.imageUrl)) ||
+      (!existing.description && Boolean(asset.description)) ||
+      (!existing.visualHint && Boolean(asset.visualHint));
+    if (shouldReplace) byKey.set(key, { ...existing, ...asset });
+  }
+  return Array.from(byKey.values());
 }
 
 function assetImageUrl(asset: ImportAssetLike) {
-  return asset.imageUrl || asset.faceTemplate?.url || asset.variants?.find((variant) => variant.imageUrl)?.imageUrl || null;
+  return asset.imageUrl ||
+    asset.referenceImage ||
+    asset.faceTemplate?.url ||
+    asset.variants?.find((variant) => variant.imageUrl || variant.referenceImage)?.imageUrl ||
+    asset.variants?.find((variant) => variant.imageUrl || variant.referenceImage)?.referenceImage ||
+    null;
 }
 
 function importAssetsToLibraryAssets(
@@ -249,6 +284,26 @@ function importAssetsToLibraryAssets(
         description: asset.description,
         visualHint: asset.visualHint,
       }))
+  );
+}
+
+function storyAssetsToLibraryAssets(assets: StoryLibraryAssetLike[] | undefined) {
+  return uniqueLibraryAssets(
+    (Array.isArray(assets) ? assets : []).map((asset) => {
+      const variantImage = asset.variants?.find((variant) => variant.referenceImage)?.referenceImage;
+      const variantText = asset.variants?.find((variant) => variant.state || variant.visualConstraints);
+      const category: AssetCategory =
+        asset.type === "character" ? "characters" : asset.type === "scene" ? "environments" : "items";
+      return {
+        id: `${category}:${asset.id}`,
+        name: asset.name,
+        category,
+        subtitle: asset.type === "character" ? "资产库角色" : asset.type === "scene" ? "资产库场景" : "资产库物品",
+        imageUrl: asset.referenceImage || variantImage || null,
+        description: asset.description || variantText?.state || null,
+        visualHint: asset.visualConstraints || variantText?.visualConstraints || null,
+      };
+    })
   );
 }
 
@@ -699,9 +754,14 @@ export default function EpisodesPage({
 
   useEffect(() => {
     let cancelled = false;
-    apiFetch(`/api/projects/${projectId}/import/logs`)
-      .then((res) => res.json())
-      .then((logs: Array<{ step: number; status: string; metadata?: unknown }>) => {
+    Promise.all([
+      apiFetch(`/api/projects/${projectId}/import/logs`).then((res) => res.json()),
+      apiFetch(`/api/projects/${projectId}/assets`).then((res) => res.json()),
+    ])
+      .then(([logs, assetData]: [
+        Array<{ step: number; status: string; metadata?: unknown }>,
+        { assets?: StoryLibraryAssetLike[] },
+      ]) => {
         if (cancelled) return;
         const assetLog = [...(Array.isArray(logs) ? logs : [])]
           .reverse()
@@ -713,9 +773,19 @@ export default function EpisodesPage({
               items?: ImportAssetLike[];
             }
           | undefined;
-        setImportCharacterAssets(importAssetsToLibraryAssets("characters", metadata?.characters, "导入角色"));
-        setEnvironmentAssets(importAssetsToLibraryAssets("environments", metadata?.environments, "场景"));
-        setItemAssets(importAssetsToLibraryAssets("items", metadata?.items, "物品"));
+        const storyAssets = Array.isArray(assetData?.assets) ? storyAssetsToLibraryAssets(assetData.assets) : [];
+        setImportCharacterAssets(uniqueLibraryAssets([
+          ...importAssetsToLibraryAssets("characters", metadata?.characters, "导入角色"),
+          ...storyAssets.filter((asset) => asset.category === "characters"),
+        ]));
+        setEnvironmentAssets(uniqueLibraryAssets([
+          ...importAssetsToLibraryAssets("environments", metadata?.environments, "场景"),
+          ...storyAssets.filter((asset) => asset.category === "environments"),
+        ]));
+        setItemAssets(uniqueLibraryAssets([
+          ...importAssetsToLibraryAssets("items", metadata?.items, "物品"),
+          ...storyAssets.filter((asset) => asset.category === "items"),
+        ]));
       })
       .catch((err) => {
         if (!cancelled) {
