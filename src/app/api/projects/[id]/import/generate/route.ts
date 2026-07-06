@@ -6,6 +6,7 @@ import { id as genId } from "@/lib/id";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
 import { findCharacterIdByName, syncImportAssets } from "@/lib/story-assets";
+import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
 
 export const maxDuration = 60;
 
@@ -85,6 +86,7 @@ export async function POST(
     items?: AssetData[];
     environments?: AssetData[];
     voices?: AssetData[];
+    confirmedScriptVersionId?: string;
     relationships?: Array<{
       characterA: string;
       characterB: string;
@@ -93,9 +95,23 @@ export async function POST(
     }>;
   };
 
+  let confirmedVersion: Awaited<ReturnType<typeof requireConfirmedScriptVersion>>;
+  try {
+    confirmedVersion = await requireConfirmedScriptVersion(projectId, body.confirmedScriptVersionId);
+  } catch (error) {
+    if (error instanceof Error && error.name === "ConfirmedScriptVersionRequiredError") {
+      return NextResponse.json({
+        error: "Import generation requires a confirmed_script_version",
+        code: "needs_confirmed_script_version",
+      }, { status: 409 });
+    }
+    throw error;
+  }
+
   await addImportLog(
     projectId, 5, "running",
-    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境、${body.voices?.length || 0} 个音色`
+    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境、${body.voices?.length || 0} 个音色`,
+    { confirmedScriptVersionId: confirmedVersion.id }
   );
 
   // 1. Create all characters (main + guest), build name→id map
@@ -210,6 +226,7 @@ export async function POST(
       environmentCount: body.environments?.length || 0,
       voiceCount: body.voices?.length || 0,
       assetCount: persistedAssetRows.length,
+      confirmedScriptVersionId: confirmedVersion.id,
       items: body.items || [],
       environments: body.environments || [],
       voices: body.voices || [],
@@ -228,6 +245,7 @@ export async function POST(
     environmentCount: body.environments?.length || 0,
     voiceCount: body.voices?.length || 0,
     assetCount: persistedAssetRows.length,
+    confirmedScriptVersionId: confirmedVersion.id,
   }, { status: 201 });
 }
 

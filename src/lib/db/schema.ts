@@ -265,6 +265,83 @@ export const importStates = sqliteTable("import_states", {
     .$defaultFn(() => new Date()),
 });
 
+export const intakeJobs = sqliteTable("intake_jobs", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "set null",
+  }),
+  sourceFilename: text("source_filename").notNull().default(""),
+  sourceType: text("source_type").notNull().default(""),
+  sourcePath: text("source_path").notNull().default(""),
+  status: text("status", {
+    enum: ["queued", "running", "awaiting_review", "confirmed", "failed", "cancelled"],
+  }).notNull().default("queued"),
+  currentStage: text("current_stage").notNull().default("upload_document"),
+  progress: integer("progress").notNull().default(0),
+  options: text("options", { mode: "json" }),
+  issueSummary: text("issue_summary", { mode: "json" }),
+  errorMessage: text("error_message"),
+  confirmedScriptVersionId: text("confirmed_script_version_id"),
+  startedAt: integer("started_at", { mode: "timestamp" }),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const intakeJobStages = sqliteTable("intake_job_stages", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => intakeJobs.id, { onDelete: "cascade" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  stage: text("stage").notNull(),
+  sequence: integer("sequence").notNull().default(0),
+  status: text("status", {
+    enum: ["pending", "running", "completed", "failed", "skipped"],
+  }).notNull().default("pending"),
+  inputHash: text("input_hash").notNull().default(""),
+  resultJson: text("result_json", { mode: "json" }),
+  issuesJson: text("issues_json", { mode: "json" }),
+  logsJson: text("logs_json", { mode: "json" }),
+  errorMessage: text("error_message"),
+  startedAt: integer("started_at", { mode: "timestamp" }),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const intakeJobLogs = sqliteTable("intake_job_logs", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => intakeJobs.id, { onDelete: "cascade" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  stage: text("stage").notNull().default(""),
+  level: text("level", { enum: ["info", "warn", "error"] })
+    .notNull()
+    .default("info"),
+  message: text("message").notNull().default(""),
+  metaJson: text("meta_json", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const scripts = sqliteTable("scripts", {
   id: text("id").primaryKey(),
   projectId: text("project_id")
@@ -326,6 +403,33 @@ export const scriptChunks = sqliteTable("script_chunks", {
     .notNull()
     .$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const confirmedScriptVersions = sqliteTable("confirmed_script_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  scriptId: text("script_id").references(() => scripts.id, {
+    onDelete: "set null",
+  }),
+  intakeJobId: text("intake_job_id").references(() => intakeJobs.id, {
+    onDelete: "set null",
+  }),
+  versionNum: integer("version_num").notNull().default(1),
+  title: text("title").notNull().default(""),
+  language: text("language").notNull().default(""),
+  contentHash: text("content_hash").notNull().default(""),
+  content: text("content").notNull().default(""),
+  structureJson: text("structure_json", { mode: "json" }),
+  reviewSummary: text("review_summary", { mode: "json" }),
+  confirmedBy: text("confirmed_by").notNull().default(""),
+  status: text("status", { enum: ["active", "archived"] })
+    .notNull()
+    .default("active"),
+  createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
 });
@@ -769,6 +873,305 @@ export const storyboardFrames = sqliteTable("storyboard_frames", {
     .$defaultFn(() => new Date()),
 });
 
+export const pipelineJobs = sqliteTable("pipeline_jobs", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  type: text("type", {
+    enum: [
+      "asset_library",
+      "visual_asset",
+      "shot",
+      "storyboard",
+      "video_clip",
+      "quality_check",
+      "final_export",
+    ],
+  }).notNull(),
+  status: text("status", {
+    enum: ["queued", "running", "waiting_review", "completed", "failed", "cancelled"],
+  }).notNull().default("queued"),
+  currentStage: text("current_stage").notNull().default(""),
+  progress: integer("progress").notNull().default(0),
+  inputJson: text("input_json", { mode: "json" }),
+  resultJson: text("result_json", { mode: "json" }),
+  errorMessage: text("error_message"),
+  startedAt: integer("started_at", { mode: "timestamp" }),
+  finishedAt: integer("finished_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const pipelineTasks = sqliteTable("pipeline_tasks", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => pipelineJobs.id, { onDelete: "cascade" }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  stage: text("stage").notNull(),
+  status: text("status", {
+    enum: ["pending", "running", "completed", "failed", "skipped"],
+  }).notNull().default("pending"),
+  inputHash: text("input_hash").notNull().default(""),
+  retryCount: integer("retry_count").notNull().default(0),
+  resultJson: text("result_json", { mode: "json" }),
+  errorMessage: text("error_message"),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const pipelineLogs = sqliteTable("pipeline_logs", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").references(() => pipelineJobs.id, {
+    onDelete: "cascade",
+  }),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  stage: text("stage").notNull().default(""),
+  level: text("level", { enum: ["info", "warn", "error"] })
+    .notNull()
+    .default("info"),
+  message: text("message").notNull().default(""),
+  metaJson: text("meta_json", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const pipelineIssues = sqliteTable("pipeline_issues", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  stage: text("stage").notNull(),
+  issueType: text("issue_type").notNull(),
+  severity: text("severity", {
+    enum: ["low", "medium", "high", "critical"],
+  }).notNull().default("low"),
+  sourceVersionType: text("source_version_type").notNull().default(""),
+  sourceVersionId: text("source_version_id").notNull().default(""),
+  sourceObjectType: text("source_object_type").notNull().default(""),
+  sourceObjectId: text("source_object_id").notNull().default(""),
+  sourceRangeJson: text("source_range_json", { mode: "json" }),
+  sourceText: text("source_text").notNull().default(""),
+  message: text("message").notNull().default(""),
+  suggestedAction: text("suggested_action").notNull().default("human_review"),
+  status: text("status", {
+    enum: ["open", "in_review", "resolved", "ignored"],
+  }).notNull().default("open"),
+  resolution: text("resolution").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const costLedger = sqliteTable("cost_ledger", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  stage: text("stage").notNull(),
+  objectType: text("object_type").notNull().default(""),
+  objectId: text("object_id").notNull().default(""),
+  provider: text("provider").notNull().default(""),
+  modelId: text("model_id").notNull().default(""),
+  costCents: integer("cost_cents").notNull().default(0),
+  currency: text("currency").notNull().default("USD"),
+  usageJson: text("usage_json", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const assetLibraryVersions = sqliteTable("asset_library_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  confirmedScriptVersionId: text("confirmed_script_version_id")
+    .notNull()
+    .references(() => confirmedScriptVersions.id, { onDelete: "cascade" }),
+  versionNum: integer("version_num").notNull().default(1),
+  status: text("status", {
+    enum: ["draft", "locked", "archived"],
+  }).notNull().default("draft"),
+  assetsJson: text("assets_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  variantsJson: text("variants_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  reviewSummary: text("review_summary", { mode: "json" }),
+  lockedBy: text("locked_by").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const visualAssetVersions = sqliteTable("visual_asset_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  assetLibraryVersionId: text("asset_library_version_id")
+    .notNull()
+    .references(() => assetLibraryVersions.id, { onDelete: "cascade" }),
+  versionNum: integer("version_num").notNull().default(1),
+  status: text("status", {
+    enum: ["draft", "generating", "waiting_review", "locked", "archived", "failed"],
+  }).notNull().default("draft"),
+  itemsJson: text("items_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  validationJson: text("validation_json", { mode: "json" }),
+  lockedBy: text("locked_by").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const visualAssets = sqliteTable("visual_assets", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  visualAssetVersionId: text("visual_asset_version_id")
+    .notNull()
+    .references(() => visualAssetVersions.id, { onDelete: "cascade" }),
+  assetId: text("asset_id")
+    .notNull()
+    .references(() => assets.id, { onDelete: "cascade" }),
+  variantId: text("variant_id").references(() => assetVariants.id, {
+    onDelete: "set null",
+  }),
+  assetType: text("asset_type", {
+    enum: ["character", "scene", "prop"],
+  }).notNull(),
+  prompt: text("prompt").notNull().default(""),
+  negativePrompt: text("negative_prompt").notNull().default(""),
+  resultUrl: text("result_url"),
+  provider: text("provider").notNull().default(""),
+  modelId: text("model_id").notNull().default(""),
+  costCents: integer("cost_cents").notNull().default(0),
+  status: text("status", {
+    enum: ["queued", "generating", "generated", "reviewing", "locked", "rejected", "failed"],
+  }).notNull().default("queued"),
+  reviewJson: text("review_json", { mode: "json" }),
+  metadata: text("metadata", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const shotVersions = sqliteTable("shot_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  confirmedScriptVersionId: text("confirmed_script_version_id")
+    .notNull()
+    .references(() => confirmedScriptVersions.id, { onDelete: "cascade" }),
+  assetLibraryVersionId: text("asset_library_version_id")
+    .notNull()
+    .references(() => assetLibraryVersions.id, { onDelete: "cascade" }),
+  versionNum: integer("version_num").notNull().default(1),
+  status: text("status", {
+    enum: ["draft", "waiting_review", "locked", "archived", "failed"],
+  }).notNull().default("draft"),
+  shotsJson: text("shots_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  validationJson: text("validation_json", { mode: "json" }),
+  lockedBy: text("locked_by").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const storyboardPipelineVersions = sqliteTable("storyboard_pipeline_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  shotVersionId: text("shot_version_id")
+    .notNull()
+    .references(() => shotVersions.id, { onDelete: "cascade" }),
+  visualAssetVersionId: text("visual_asset_version_id").references(
+    () => visualAssetVersions.id,
+    { onDelete: "set null" },
+  ),
+  versionNum: integer("version_num").notNull().default(1),
+  status: text("status", {
+    enum: ["draft", "generating", "waiting_review", "locked", "archived", "failed"],
+  }).notNull().default("draft"),
+  framesJson: text("frames_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  validationJson: text("validation_json", { mode: "json" }),
+  lockedBy: text("locked_by").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const videoClipVersions = sqliteTable("video_clip_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  storyboardVersionId: text("storyboard_version_id")
+    .notNull()
+    .references(() => storyboardPipelineVersions.id, { onDelete: "cascade" }),
+  versionNum: integer("version_num").notNull().default(1),
+  status: text("status", {
+    enum: ["draft", "generating", "waiting_qc", "approved", "needs_review", "failed", "archived"],
+  }).notNull().default("draft"),
+  clipsJson: text("clips_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  qualityJson: text("quality_json", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const finalExportVersions = sqliteTable("final_export_versions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  videoClipVersionId: text("video_clip_version_id")
+    .notNull()
+    .references(() => videoClipVersions.id, { onDelete: "cascade" }),
+  versionNum: integer("version_num").notNull().default(1),
+  status: text("status", {
+    enum: ["draft", "exporting", "completed", "failed", "archived"],
+  }).notNull().default("draft"),
+  exportsJson: text("exports_json", { mode: "json" }).notNull().$defaultFn(() => []),
+  timelineJson: text("timeline_json", { mode: "json" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const promptTemplates = sqliteTable("prompt_templates", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
@@ -897,6 +1300,7 @@ export const tasks = sqliteTable("tasks", {
       "video_generate",
       "video_assemble",
       "script_visual_enrichment",
+      "script_intake",
     ],
   }).notNull(),
   status: text("status", {

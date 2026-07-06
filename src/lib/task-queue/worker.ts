@@ -1,4 +1,4 @@
-import { dequeueTask, completeTask, failTask } from "./queue";
+import { dequeueTask, completeTask, failTask, recoverRunningTasks } from "./queue";
 import type { TaskHandlerMap, Task } from "./types";
 
 const POLL_INTERVAL_MS = 2000;
@@ -77,7 +77,13 @@ export function startWorker() {
     "ms with concurrency",
     getWorkerConcurrency(),
   );
-  poll();
+  void recoverRunningTasks()
+    .catch((err) => {
+      console.error("[TaskWorker] Recover running tasks error:", err);
+    })
+    .finally(() => {
+      poll();
+    });
 }
 
 export function stopWorker() {

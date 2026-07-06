@@ -362,6 +362,11 @@
     "upload": "アップロードして分割",
     "processing": "処理中...",
     "success": "{count}エピソードを作成しました",
+    "queued": "脚本を標準化キューに追加しました",
+    "reviewReady": "脚本の標準化が完了しました。本文を確認してください",
+    "confirmed": "confirmed_script_version を作成しました",
+    "confirm": "脚本を確認",
+    "confirming": "確認中...",
     "fileTooLarge": "ファイルが大きすぎます — 最大20MB"
   },
   "settings": {

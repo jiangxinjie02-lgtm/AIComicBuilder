@@ -4,6 +4,7 @@ import { projects } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
+import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
 import {
   analyzeScriptAssets,
   type AssetAgentAsset,
@@ -117,14 +118,27 @@ export async function POST(
   const body = (await request.json()) as {
     text?: string;
     storyAnalysis?: StoryAssetAnalysis | null;
+    confirmedScriptVersionId?: string;
   };
-  const text = String(body.text || "").trim();
 
-  if (!text) {
-    return NextResponse.json({ error: "No script text" }, { status: 400 });
+  let confirmedVersion: Awaited<ReturnType<typeof requireConfirmedScriptVersion>>;
+  try {
+    confirmedVersion = await requireConfirmedScriptVersion(projectId, body.confirmedScriptVersionId);
+  } catch (error) {
+    if (error instanceof Error && error.name === "ConfirmedScriptVersionRequiredError") {
+      return NextResponse.json({
+        error: "Asset extraction requires a confirmed_script_version",
+        code: "needs_confirmed_script_version",
+      }, { status: 409 });
+    }
+    throw error;
   }
 
-  const scriptForAssetExtraction = text;
+  const scriptForAssetExtraction = confirmedVersion.content.trim();
+
+  if (!scriptForAssetExtraction) {
+    return NextResponse.json({ error: "Confirmed script text is empty" }, { status: 400 });
+  }
 
   await addImportLog(
     projectId,
@@ -172,6 +186,7 @@ export async function POST(
       items,
       environments,
       voices,
+      confirmedScriptVersionId: confirmedVersion.id,
       assetAgent: {
         id: assetProject.id,
         settings: assetProject.settings,
@@ -187,6 +202,7 @@ export async function POST(
     items,
     environments,
     voices,
+    confirmedScriptVersionId: confirmedVersion.id,
     assetAgent: {
       id: assetProject.id,
       settings: assetProject.settings,

@@ -102,6 +102,15 @@ interface ExtractedAsset {
   styleSpec?: AssetStyleSpec | null;
 }
 
+interface IntakeJobStatus {
+  status: "queued" | "running" | "awaiting_review" | "confirmed" | "failed" | "cancelled";
+  progress: number;
+  current_stage: string;
+  candidate_text?: string;
+  error_message?: string;
+  confirmed_script_version_id?: string;
+}
+
 type AssetTab = "characters" | "items" | "environments" | "voices";
 type WorkbenchAsset = ExtractedAsset & { scope?: "main" | "guest" };
 type StepStatus = Record<Step, "idle" | "running" | "done" | "error">;
@@ -773,6 +782,8 @@ interface ImportDraftState {
   episodes?: SplitEpisode[] | null;
   confirmedEpisodeIndexes?: number[] | null;
   enrichmentJobId?: string | null;
+  intakeJobId?: string | null;
+  confirmedScriptVersionId?: string | null;
 }
 
 interface StoryReviewIssue {
@@ -952,6 +963,10 @@ export default function ImportPage({
   const lastEnrichmentTerminalLogRef = useRef<string | null>(null);
   const [enrichmentJobId, setEnrichmentJobId] = useState<string | null>(null);
   const [enrichmentJobStatus, setEnrichmentJobStatus] = useState<ScriptEnrichmentJobStatus | null>(null);
+  const [intakeJobId, setIntakeJobId] = useState<string | null>(null);
+  const [intakeJobStatus, setIntakeJobStatus] = useState<IntakeJobStatus | null>(null);
+  const [confirmedScriptVersionId, setConfirmedScriptVersionId] = useState<string | null>(null);
+  const intakePollingRef = useRef(false);
 
   // Step 0: Upload
   const [file, setFile] = useState<File | null>(null);
@@ -1043,6 +1058,8 @@ export default function ImportPage({
     episodes,
     confirmedEpisodeIndexes: Array.from(confirmedEpisodeIndexes),
     enrichmentJobId,
+    intakeJobId,
+    confirmedScriptVersionId,
   }), [
     currentStep,
     stepStatus,
@@ -1057,6 +1074,8 @@ export default function ImportPage({
     episodes,
     confirmedEpisodeIndexes,
     enrichmentJobId,
+    intakeJobId,
+    confirmedScriptVersionId,
   ]);
 
   const saveDraft = useCallback(async (payload?: ImportDraftState) => {
@@ -1106,6 +1125,8 @@ export default function ImportPage({
     episodes: [],
     confirmedEpisodeIndexes: [],
     enrichmentJobId: null,
+    intakeJobId: null,
+    confirmedScriptVersionId: null,
   }), []);
 
   if (draftHydratedRef.current) {
@@ -1219,6 +1240,12 @@ export default function ImportPage({
           if (typeof draft.enrichmentJobId === "string" && draft.enrichmentJobId) {
             enrichmentJobIdRef.current = draft.enrichmentJobId;
             setEnrichmentJobId(draft.enrichmentJobId);
+          }
+          if (typeof draft.intakeJobId === "string" && draft.intakeJobId) {
+            setIntakeJobId(draft.intakeJobId);
+          }
+          if (typeof draft.confirmedScriptVersionId === "string" && draft.confirmedScriptVersionId) {
+            setConfirmedScriptVersionId(draft.confirmedScriptVersionId);
           }
           storyReviewedRef.current = draftStepStatus[2] === "done";
         }
@@ -1438,6 +1465,10 @@ export default function ImportPage({
     visualEnrichmentRef.current = null;
     setDetailSupplementReady(false);
     setCurrentEnrichmentJob(null);
+    setIntakeJobId(null);
+    setIntakeJobStatus(null);
+    setConfirmedScriptVersionId(null);
+    intakePollingRef.current = false;
     setHistoryMode(false);
     setSelectedStep(null);
     setCurrentStep(0);
@@ -1456,7 +1487,86 @@ export default function ImportPage({
     void saveDraft(resetDraftPayload());
   }, [resetDraftPayload, saveDraft, setCurrentEnrichmentJob, setDetailSupplementReady, t]);
 
-  // ── Step 1: Parse, then stop for story review ──
+  // ── Step 1: Script intake, then stop for human review ──
+  async function runScriptIntakePipeline(uploadFile: File) {
+    const form = new FormData();
+    form.append("file", uploadFile);
+    form.append("modelConfig", JSON.stringify(getModelConfig()));
+    form.append("allowAiOverwrite", "true");
+
+    const startRes = await apiFetch(`/api/projects/${projectId}/script/intake/start`, {
+      method: "POST",
+      body: form,
+    });
+    if (!startRes.ok) {
+      const errData = await startRes.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${startRes.status}`);
+    }
+
+    const startData = await startRes.json() as { jobId?: string; job_id?: string };
+    const jobId = startData.jobId || startData.job_id;
+    if (!jobId) throw new Error("Script intake job did not return job_id");
+
+    setIntakeJobId(jobId);
+    setConfirmedScriptVersionId(null);
+    intakePollingRef.current = true;
+    addLog(1, "running", `Script intake job queued: ${jobId}`);
+    await saveDraft({
+      ...resetDraftPayload(),
+      currentStep: 1,
+      stepStatus: { 1: "running", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+      intakeJobId: jobId,
+      confirmedScriptVersionId: null,
+    });
+
+    let lastStage = "";
+    while (intakePollingRef.current) {
+      const statusRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${jobId}`);
+      if (!statusRes.ok) {
+        const errData = await statusRes.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${statusRes.status}`);
+      }
+
+      const status = await statusRes.json() as IntakeJobStatus;
+      setIntakeJobStatus(status);
+      if (status.current_stage && status.current_stage !== lastStage) {
+        lastStage = status.current_stage;
+        addLog(1, "running", `Intake stage: ${status.current_stage} (${Math.round(status.progress || 0)}%)`);
+      }
+
+      if (status.status === "failed" || status.status === "cancelled") {
+        throw new Error(status.error_message || `Script intake ${status.status}`);
+      }
+
+      if (status.status === "awaiting_review" || status.status === "confirmed") {
+        const candidateText = status.candidate_text || "";
+        if (!candidateText.trim()) throw new Error("Script intake finished without candidate text");
+
+        setFullText(candidateText);
+        enrichedTextRef.current = candidateText;
+        visualEnrichmentRef.current = null;
+        setDetailSupplementReady(true);
+        setCurrentStep(2);
+        setStepStatus((prev) => ({ ...prev, 1: "done", 2: "idle" }));
+        if (status.confirmed_script_version_id) {
+          setConfirmedScriptVersionId(status.confirmed_script_version_id);
+        }
+        addLog(1, "done", `Script intake ready for review: ${candidateText.length} chars`);
+        await saveDraft({
+          ...resetDraftPayload(),
+          currentStep: 2,
+          stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+          fullText: candidateText,
+          intakeJobId: jobId,
+          confirmedScriptVersionId: status.confirmed_script_version_id || null,
+        });
+        return;
+      }
+
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+    }
+  }
+
   async function startPipeline() {
     if (!file) return;
     if (!textGuard()) return;
@@ -1480,42 +1590,26 @@ export default function ImportPage({
     visualEnrichmentRef.current = null;
     setDetailSupplementReady(false);
     setCurrentEnrichmentJob(null);
+    setIntakeJobId(null);
+    setIntakeJobStatus(null);
+    setConfirmedScriptVersionId(null);
+    intakePollingRef.current = false;
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     await saveDraft(resetDraftPayload());
 
     // Clear old logs
     await apiFetch(`/api/projects/${projectId}/import/logs`, { method: "DELETE" });
 
-    // Step 1: Parse
+    // Step 1: Script intake
     setCurrentStep(1);
     setStepStatus((prev) => ({ ...prev, 1: "running" }));
-    addLog(1, "running", `解析文件: ${file.name}`);
+    addLog(1, "running", `创建剧本标准化任务: ${file.name}`);
 
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await apiFetch(`/api/projects/${projectId}/import/parse`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      setFullText(data.text);
-      addLog(1, "done", `解析完成，共 ${data.charCount} 字`);
-      setStepStatus((prev) => ({ ...prev, 1: "done" }));
-      setCurrentStep(2);
-      await saveDraft({
-        ...resetDraftPayload(),
-        currentStep: 2,
-        stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
-        fullText: data.text,
-      });
+      await runScriptIntakePipeline(file);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Parse failed";
-      addLog(1, "error", `文件解析失败: ${msg}`);
+      const msg = err instanceof Error ? err.message : "Script intake failed";
+      addLog(1, "error", `剧本标准化失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 1: "error" }));
       return;
     }
@@ -1806,8 +1900,56 @@ export default function ImportPage({
     setSelectedIssueIndexes(allSelected ? new Set() : new Set(selectableIndexes));
   }
 
+  async function ensureConfirmedScriptVersion() {
+    if (confirmedScriptVersionId) return confirmedScriptVersionId;
+    if (!intakeJobId) {
+      throw new Error("请先完成剧本标准化，再确认正文");
+    }
+
+    addLog(2, "running", "正在生成人工确认剧本版本...");
+    const res = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: fullText,
+        reviewNotes: {
+          reviewIssues,
+          storyAnalysis,
+        },
+      }),
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${res.status}`);
+    }
+
+    const data = await res.json() as { confirmed_script_version_id?: string };
+    const versionId = data.confirmed_script_version_id;
+    if (!versionId) throw new Error("确认接口没有返回 confirmed_script_version_id");
+
+    setConfirmedScriptVersionId(versionId);
+    setIntakeJobStatus((prev) => prev ? { ...prev, status: "confirmed", confirmed_script_version_id: versionId } : prev);
+    addLog(2, "done", `已生成确认剧本版本: ${versionId}`);
+    await saveDraft({
+      ...buildDraftPayload(),
+      fullText,
+      intakeJobId,
+      confirmedScriptVersionId: versionId,
+    });
+    return versionId;
+  }
+
   async function confirmStoryReview() {
     if (!fullText.trim()) return;
+    let activeConfirmedScriptVersionId: string;
+    try {
+      activeConfirmedScriptVersionId = await ensureConfirmedScriptVersion();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "确认失败";
+      addLog(2, "error", `确认剧本版本失败: ${msg}`);
+      toast.error(msg);
+      return;
+    }
     storyReviewedRef.current = true;
     await apiFetch(`/api/projects/${projectId}/import/logs`, {
       method: "POST",
@@ -1830,7 +1972,7 @@ export default function ImportPage({
       reviewIssues,
       storyAnalysis,
     });
-    await runCharacterExtract();
+    await runCharacterExtract(activeConfirmedScriptVersionId);
   }
 
   function ensureEditableStoryAnalysis(): StoryAssetAnalysis {
@@ -1904,8 +2046,13 @@ export default function ImportPage({
   }
 
   // ── Step 3: Asset setting foundation - character extraction ──
-  async function runCharacterExtract() {
+  async function runCharacterExtract(versionId = confirmedScriptVersionId) {
     if (!fullText) return;
+    if (!versionId) {
+      toast.error("请先确认剧本正文，再提取资产");
+      setStepStatus((prev) => ({ ...prev, 3: "error" }));
+      return;
+    }
     if (!storyReviewedRef.current && stepStatus[2] !== "done") {
       setCurrentStep(2);
       setStepStatus((prev) => ({ ...prev, 2: "idle", 3: "idle" }));
@@ -1919,7 +2066,7 @@ export default function ImportPage({
       const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: fullText, storyAnalysis }),
+        body: JSON.stringify({ confirmedScriptVersionId: versionId, storyAnalysis }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -2022,6 +2169,10 @@ export default function ImportPage({
       toast.error(t("confirmAllEpisodesRequired"));
       return;
     }
+    if (!confirmedScriptVersionId) {
+      toast.error("请先确认剧本正文，再生成项目内容");
+      return;
+    }
 
     setCurrentStep(5);
     setStepStatus((prev) => ({ ...prev, 5: "running" }));
@@ -2038,6 +2189,7 @@ export default function ImportPage({
           environments,
           voices,
           relationships,
+          confirmedScriptVersionId,
         }),
       });
       if (!res.ok) {
@@ -3277,6 +3429,31 @@ export default function ImportPage({
           </div>
         )}
 
+        {currentStep === 1 && !historyMode && intakeJobStatus && (
+          <div className="mx-auto w-full max-w-2xl rounded-xl border border-[--border-subtle] bg-white p-5">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-[--text-primary]">剧本标准化</div>
+                <div className="truncate text-xs text-[--text-muted]">
+                  {intakeJobStatus.current_stage || intakeJobStatus.status}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2 text-xs font-semibold text-[--text-secondary]">
+                {(intakeJobStatus.status === "queued" || intakeJobStatus.status === "running") && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                {Math.round(intakeJobStatus.progress || 0)}%
+              </div>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-[--surface]">
+              <div
+                className="h-full rounded-full bg-primary transition-all"
+                style={{ width: `${Math.max(0, Math.min(100, intakeJobStatus.progress || 0))}%` }}
+              />
+            </div>
+          </div>
+        )}
+
         {/* Story review gate (AI review, then human approval) */}
         {showStoryReview && (
           <div className="mx-auto flex w-full max-w-[1500px] flex-1 flex-col gap-4">
@@ -3393,7 +3570,10 @@ export default function ImportPage({
                 <Textarea
                   ref={reviewTextRef}
                   value={fullText}
-                  onChange={(e) => setFullText(e.target.value)}
+                  onChange={(e) => {
+                    setFullText(e.target.value);
+                    setConfirmedScriptVersionId(null);
+                  }}
                   className="h-[60vh] resize-none border-0 bg-transparent font-mono text-sm leading-relaxed shadow-none focus-visible:ring-0"
                 />
                 </div>
@@ -4923,4 +5103,3 @@ export default function ImportPage({
     </div>
   );
 }
-

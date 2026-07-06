@@ -364,6 +364,11 @@
     "upload": "上传并分集",
     "processing": "解析中...",
     "success": "成功创建 {count} 集",
+    "queued": "剧本已进入标准化队列",
+    "reviewReady": "剧本标准化完成，请确认正文",
+    "confirmed": "confirmed_script_version 已生成",
+    "confirm": "确认剧本",
+    "confirming": "确认中...",
     "fileTooLarge": "文件太大，最大支持 20MB"
   },
   "settings": {

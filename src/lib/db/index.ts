@@ -260,6 +260,101 @@ export function ensureScriptEnrichmentTables() {
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_script_enrichment_logs_job" ON "script_enrichment_logs" ("job_id", "created_at")`).run();
 }
 
+export function ensureScriptIntakeTables() {
+  const sqlite = getSqlite();
+  ensureStoryPipelineTables();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "intake_jobs" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "script_id" text,
+      "source_filename" text DEFAULT '' NOT NULL,
+      "source_type" text DEFAULT '' NOT NULL,
+      "source_path" text DEFAULT '' NOT NULL,
+      "status" text DEFAULT 'queued' NOT NULL,
+      "current_stage" text DEFAULT 'upload_document' NOT NULL,
+      "progress" integer DEFAULT 0 NOT NULL,
+      "options" text,
+      "issue_summary" text,
+      "error_message" text,
+      "confirmed_script_version_id" text,
+      "started_at" integer,
+      "finished_at" integer,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("script_id") REFERENCES "scripts"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_intake_jobs_project_status" ON "intake_jobs" ("project_id", "status", "created_at")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_intake_jobs_script" ON "intake_jobs" ("script_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "intake_job_stages" (
+      "id" text PRIMARY KEY NOT NULL,
+      "job_id" text NOT NULL,
+      "project_id" text NOT NULL,
+      "stage" text NOT NULL,
+      "sequence" integer DEFAULT 0 NOT NULL,
+      "status" text DEFAULT 'pending' NOT NULL,
+      "input_hash" text DEFAULT '' NOT NULL,
+      "result_json" text,
+      "issues_json" text,
+      "logs_json" text,
+      "error_message" text,
+      "started_at" integer,
+      "finished_at" integer,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("job_id") REFERENCES "intake_jobs"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS "idx_intake_job_stages_job_stage" ON "intake_job_stages" ("job_id", "stage")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_intake_job_stages_status" ON "intake_job_stages" ("job_id", "status", "sequence")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "intake_job_logs" (
+      "id" text PRIMARY KEY NOT NULL,
+      "job_id" text NOT NULL,
+      "project_id" text NOT NULL,
+      "stage" text DEFAULT '' NOT NULL,
+      "level" text DEFAULT 'info' NOT NULL,
+      "message" text DEFAULT '' NOT NULL,
+      "meta_json" text,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("job_id") REFERENCES "intake_jobs"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_intake_job_logs_job" ON "intake_job_logs" ("job_id", "created_at")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "confirmed_script_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "script_id" text,
+      "intake_job_id" text,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "title" text DEFAULT '' NOT NULL,
+      "language" text DEFAULT '' NOT NULL,
+      "content_hash" text DEFAULT '' NOT NULL,
+      "content" text DEFAULT '' NOT NULL,
+      "structure_json" text,
+      "review_summary" text,
+      "confirmed_by" text DEFAULT '' NOT NULL,
+      "status" text DEFAULT 'active' NOT NULL,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("script_id") REFERENCES "scripts"("id") ON UPDATE no action ON DELETE set null,
+      FOREIGN KEY ("intake_job_id") REFERENCES "intake_jobs"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_confirmed_script_versions_project" ON "confirmed_script_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_confirmed_script_versions_job" ON "confirmed_script_versions" ("intake_job_id")`).run();
+}
+
 export function ensureAssetLibraryTables() {
   const sqlite = getSqlite();
   sqlite.prepare(`
@@ -616,6 +711,255 @@ export function ensureStoryPipelineTables() {
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_storyboard_frames_spec" ON "storyboard_frames" ("shot_spec_id")`).run();
 }
 
+export function ensureProductionPipelineTables() {
+  const sqlite = getSqlite();
+  ensureScriptIntakeTables();
+  ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "pipeline_jobs" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "type" text NOT NULL,
+      "status" text DEFAULT 'queued' NOT NULL,
+      "current_stage" text DEFAULT '' NOT NULL,
+      "progress" integer DEFAULT 0 NOT NULL,
+      "input_json" text,
+      "result_json" text,
+      "error_message" text,
+      "started_at" integer,
+      "finished_at" integer,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_pipeline_jobs_project" ON "pipeline_jobs" ("project_id", "type", "status", "created_at")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "pipeline_tasks" (
+      "id" text PRIMARY KEY NOT NULL,
+      "job_id" text NOT NULL,
+      "project_id" text NOT NULL,
+      "stage" text NOT NULL,
+      "status" text DEFAULT 'pending' NOT NULL,
+      "input_hash" text DEFAULT '' NOT NULL,
+      "retry_count" integer DEFAULT 0 NOT NULL,
+      "result_json" text,
+      "error_message" text,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("job_id") REFERENCES "pipeline_jobs"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_pipeline_tasks_job" ON "pipeline_tasks" ("job_id", "status", "stage")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "pipeline_logs" (
+      "id" text PRIMARY KEY NOT NULL,
+      "job_id" text,
+      "project_id" text NOT NULL,
+      "stage" text DEFAULT '' NOT NULL,
+      "level" text DEFAULT 'info' NOT NULL,
+      "message" text DEFAULT '' NOT NULL,
+      "meta_json" text,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("job_id") REFERENCES "pipeline_jobs"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_pipeline_logs_project" ON "pipeline_logs" ("project_id", "created_at")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_pipeline_logs_job" ON "pipeline_logs" ("job_id", "created_at")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "pipeline_issues" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "stage" text NOT NULL,
+      "issue_type" text NOT NULL,
+      "severity" text DEFAULT 'low' NOT NULL,
+      "source_version_type" text DEFAULT '' NOT NULL,
+      "source_version_id" text DEFAULT '' NOT NULL,
+      "source_object_type" text DEFAULT '' NOT NULL,
+      "source_object_id" text DEFAULT '' NOT NULL,
+      "source_range_json" text,
+      "source_text" text DEFAULT '' NOT NULL,
+      "message" text DEFAULT '' NOT NULL,
+      "suggested_action" text DEFAULT 'human_review' NOT NULL,
+      "status" text DEFAULT 'open' NOT NULL,
+      "resolution" text DEFAULT '' NOT NULL,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_pipeline_issues_project" ON "pipeline_issues" ("project_id", "stage", "status", "severity")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_pipeline_issues_source" ON "pipeline_issues" ("source_version_type", "source_version_id", "source_object_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "cost_ledger" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "stage" text NOT NULL,
+      "object_type" text DEFAULT '' NOT NULL,
+      "object_id" text DEFAULT '' NOT NULL,
+      "provider" text DEFAULT '' NOT NULL,
+      "model_id" text DEFAULT '' NOT NULL,
+      "cost_cents" integer DEFAULT 0 NOT NULL,
+      "currency" text DEFAULT 'USD' NOT NULL,
+      "usage_json" text,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_cost_ledger_project_stage" ON "cost_ledger" ("project_id", "stage", "created_at")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "asset_library_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "confirmed_script_version_id" text NOT NULL,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "assets_json" text NOT NULL,
+      "variants_json" text NOT NULL,
+      "review_summary" text,
+      "locked_by" text DEFAULT '' NOT NULL,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("confirmed_script_version_id") REFERENCES "confirmed_script_versions"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_library_versions_project" ON "asset_library_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_asset_library_versions_script" ON "asset_library_versions" ("confirmed_script_version_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "visual_asset_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "asset_library_version_id" text NOT NULL,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "items_json" text NOT NULL,
+      "validation_json" text,
+      "locked_by" text DEFAULT '' NOT NULL,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("asset_library_version_id") REFERENCES "asset_library_versions"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_visual_asset_versions_project" ON "visual_asset_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_visual_asset_versions_library" ON "visual_asset_versions" ("asset_library_version_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "visual_assets" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "visual_asset_version_id" text NOT NULL,
+      "asset_id" text NOT NULL,
+      "variant_id" text,
+      "asset_type" text NOT NULL,
+      "prompt" text DEFAULT '' NOT NULL,
+      "negative_prompt" text DEFAULT '' NOT NULL,
+      "result_url" text,
+      "provider" text DEFAULT '' NOT NULL,
+      "model_id" text DEFAULT '' NOT NULL,
+      "cost_cents" integer DEFAULT 0 NOT NULL,
+      "status" text DEFAULT 'queued' NOT NULL,
+      "review_json" text,
+      "metadata" text,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("visual_asset_version_id") REFERENCES "visual_asset_versions"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("asset_id") REFERENCES "assets"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("variant_id") REFERENCES "asset_variants"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_visual_assets_version" ON "visual_assets" ("visual_asset_version_id", "status")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_visual_assets_asset" ON "visual_assets" ("asset_id", "variant_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "shot_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "confirmed_script_version_id" text NOT NULL,
+      "asset_library_version_id" text NOT NULL,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "shots_json" text NOT NULL,
+      "validation_json" text,
+      "locked_by" text DEFAULT '' NOT NULL,
+      "created_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("confirmed_script_version_id") REFERENCES "confirmed_script_versions"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("asset_library_version_id") REFERENCES "asset_library_versions"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_shot_versions_project" ON "shot_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_shot_versions_asset_library" ON "shot_versions" ("asset_library_version_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "storyboard_pipeline_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "shot_version_id" text NOT NULL,
+      "visual_asset_version_id" text,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "frames_json" text NOT NULL,
+      "validation_json" text,
+      "locked_by" text DEFAULT '' NOT NULL,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("shot_version_id") REFERENCES "shot_versions"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("visual_asset_version_id") REFERENCES "visual_asset_versions"("id") ON UPDATE no action ON DELETE set null
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_storyboard_pipeline_versions_project" ON "storyboard_pipeline_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_storyboard_pipeline_versions_shot" ON "storyboard_pipeline_versions" ("shot_version_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "video_clip_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "storyboard_version_id" text NOT NULL,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "clips_json" text NOT NULL,
+      "quality_json" text,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("storyboard_version_id") REFERENCES "storyboard_pipeline_versions"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_video_clip_versions_project" ON "video_clip_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_video_clip_versions_storyboard" ON "video_clip_versions" ("storyboard_version_id")`).run();
+
+  sqlite.prepare(`
+    CREATE TABLE IF NOT EXISTS "final_export_versions" (
+      "id" text PRIMARY KEY NOT NULL,
+      "project_id" text NOT NULL,
+      "video_clip_version_id" text NOT NULL,
+      "version_num" integer DEFAULT 1 NOT NULL,
+      "status" text DEFAULT 'draft' NOT NULL,
+      "exports_json" text NOT NULL,
+      "timeline_json" text,
+      "created_at" integer NOT NULL,
+      "updated_at" integer NOT NULL,
+      FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+      FOREIGN KEY ("video_clip_version_id") REFERENCES "video_clip_versions"("id") ON UPDATE no action ON DELETE cascade
+    )
+  `).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_final_export_versions_project" ON "final_export_versions" ("project_id", "status", "version_num")`).run();
+  sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_final_export_versions_clips" ON "final_export_versions" ("video_clip_version_id")`).run();
+}
+
 export function runMigrations() {
   const sqlite = getSqlite();
   const migrationsFolder = path.resolve("drizzle");
@@ -631,6 +975,8 @@ export function runMigrations() {
     ensureProductionBibleTable();
     ensureStoryPipelineTables();
     ensureScriptEnrichmentTables();
+    ensureScriptIntakeTables();
+    ensureProductionPipelineTables();
     return;
   }
 
@@ -642,6 +988,8 @@ export function runMigrations() {
   ensureProductionBibleTable();
   ensureStoryPipelineTables();
   ensureScriptEnrichmentTables();
+  ensureScriptIntakeTables();
+  ensureProductionPipelineTables();
 }
 
 // Proxy preserves the `db` export API — lazy-inits on first property access
