@@ -4,6 +4,7 @@ import { projects } from "@/lib/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
+import { getImage2Model } from "@/lib/image2-generation";
 import {
   patchStoryAsset,
   upsertStoryAsset,
@@ -467,7 +468,7 @@ function getImageKeyPool() {
 }
 
 function getImageModel() {
-  return "gpt-image-2";
+  return getImage2Model();
 }
 
 function stripMetadataForProvider(payload: ProviderPayload) {

@@ -692,6 +692,8 @@ export default function EpisodesPage({
   const [draftSceneMenuOpen, setDraftSceneMenuOpen] = useState<string | null>(null);
   const [storyboardSceneMenuOpen, setStoryboardSceneMenuOpen] = useState<string | null>(null);
   const [storyboardSceneActionId, setStoryboardSceneActionId] = useState<string | null>(null);
+  const [generatingStoryboardSceneId, setGeneratingStoryboardSceneId] = useState<string | null>(null);
+  const [generatingStoryboardShotId, setGeneratingStoryboardShotId] = useState<string | null>(null);
 
   const activeEpisode = useMemo(
     () => episodes.find((episode) => episode.id === activeEpisodeId) || episodes[0],
@@ -872,6 +874,8 @@ export default function EpisodesPage({
     setDraftSceneMenuOpen(null);
     setStoryboardSceneMenuOpen(null);
     setStoryboardSceneActionId(null);
+    setGeneratingStoryboardSceneId(null);
+    setGeneratingStoryboardShotId(null);
   }, [activeEpisodeId]);
 
   useEffect(() => {
@@ -1016,6 +1020,63 @@ export default function EpisodesPage({
     if (!activeEpisodeId) return;
     const data = await loadEpisodeDetail(activeEpisodeId);
     applyEpisodeDetail(data);
+  }
+
+  async function generateStoryboardImagesForScene(scene: StoryboardScene) {
+    if (scene.shots.length === 0) return;
+    setGeneratingStoryboardSceneId(scene.id);
+    try {
+      const items = scene.shots.map((shot) => ({
+        shotId: shot.id,
+        prompt: promptDrafts[shot.id] ?? storyboardPromptFromShot(shot, scene.name),
+      }));
+      const res = await apiFetch(`/api/projects/${projectId}/storyboard/generate-image`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items, overwrite: false }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "生成故事板图失败");
+      await refreshActiveEpisodeDetail();
+      const stats = data.stats || {};
+      const failed = Number(stats.failed || 0);
+      const succeeded = Number(stats.succeeded || 0);
+      const skipped = Number(stats.skipped || 0);
+      if (failed > 0) {
+        toast.warning(`故事板图生成完成：成功 ${succeeded}，跳过 ${skipped}，失败 ${failed}`);
+      } else {
+        toast.success(`故事板图生成完成：成功 ${succeeded}，跳过 ${skipped}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "生成故事板图失败");
+    } finally {
+      setGeneratingStoryboardSceneId(null);
+    }
+  }
+
+  async function regenerateStoryboardImageForShot(shot: EpisodeShot, sceneName: string) {
+    setGeneratingStoryboardShotId(shot.id);
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/storyboard/generate-image`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shotId: shot.id,
+          prompt: promptDrafts[shot.id] ?? storyboardPromptFromShot(shot, sceneName),
+          overwrite: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "生成故事板图失败");
+      const first = Array.isArray(data.results) ? data.results[0] : null;
+      if (first?.status === "error") throw new Error(first.error || "生成故事板图失败");
+      await refreshActiveEpisodeDetail();
+      toast.success(`镜头 ${shot.sequence} 故事板图已生成`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "生成故事板图失败");
+    } finally {
+      setGeneratingStoryboardShotId(null);
+    }
   }
 
   async function duplicateStoryboardScene(scene: StoryboardScene) {
@@ -1475,7 +1536,7 @@ export default function EpisodesPage({
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="font-mono text-xs font-bold text-black">镜头 {shot.sequence}</div>
                 <div className="flex items-center gap-2">
-                  <span className="rounded bg-black/70 px-2 py-0.5 text-[10px] text-white">{shot.duration || 0}s</span>
+                  <span className="rounded bg-black/70 px-2 py-0.5 text-[10px] text-white">静态故事板帧</span>
                   <Button
                     type="button"
                     size="sm"
@@ -1527,7 +1588,7 @@ export default function EpisodesPage({
       <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-black/80 p-2 text-[10px] text-white">
         <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1 font-semibold">故事板图提示词</span>
         <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1">静态关键帧</span>
-        <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1">16:9</span>
+        <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1">图片比例 16:9</span>
       </div>
     );
   }
@@ -2032,6 +2093,10 @@ export default function EpisodesPage({
                   {storyboardScenes.map((scene, sceneIndex) => {
                     const expanded = expandedSceneIds.has(scene.id);
                     const sceneActionBusy = storyboardSceneActionId === scene.id || storyboardSceneActionId === "new";
+                    const sceneGenerating = generatingStoryboardSceneId === scene.id;
+                    const sceneFrameAssets = scene.shots
+                      .map((shot) => ({ shot, asset: getActiveAsset(shot, "first_frame") }))
+                      .filter((item) => item.asset?.fileUrl);
                     return (
                       <article key={scene.id} className="overflow-hidden rounded-xl bg-[#e8e8e6] p-4">
                         <div className="mb-3 flex items-center justify-between gap-3">
@@ -2138,12 +2203,53 @@ export default function EpisodesPage({
                           {renderResizeHandle("right", "拖动调整提示词和故事板图宽度")}
 
                           <section className="min-w-0 bg-[#d2d2d0] p-4">
-                            <div className="flex min-h-[238px] items-center justify-center rounded-xl border border-[--border-subtle] bg-white p-3">
-                              <div className="flex flex-col items-center gap-3 text-center text-sm text-[--text-muted]">
-                                <ImageIcon className="h-8 w-8 text-[--text-muted]" />
-                                <span>{scene.name}</span>
-                                <span className="text-xs">等待生成故事板图</span>
+                            <div className="min-h-[238px] rounded-xl border border-[--border-subtle] bg-white p-3">
+                              <div className="mb-3 flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="truncate text-xs font-semibold text-[--text-primary]">故事板图</div>
+                                  <div className="text-[10px] text-[--text-muted]">
+                                    {sceneFrameAssets.length}/{scene.shots.length} 已生成
+                                  </div>
+                                </div>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  onClick={() => generateStoryboardImagesForScene(scene)}
+                                  disabled={sceneGenerating}
+                                  className="h-8 rounded-full px-3 text-[11px]"
+                                >
+                                  {sceneGenerating ? (
+                                    <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                  ) : (
+                                    <ImageIcon className="mr-1 h-3 w-3" />
+                                  )}
+                                  生成故事板图
+                                </Button>
                               </div>
+                              {sceneFrameAssets.length > 0 ? (
+                                <div className="grid grid-cols-2 gap-2">
+                                  {sceneFrameAssets.map(({ shot, asset }) => (
+                                    <div key={asset!.id} className="overflow-hidden rounded-lg border border-[--border-subtle] bg-[--surface]">
+                                      <div className="aspect-video bg-black/5">
+                                        <img
+                                          src={uploadUrl(asset!.fileUrl || "")}
+                                          alt={`镜头 ${shot.sequence} 故事板图`}
+                                          className="h-full w-full object-cover"
+                                        />
+                                      </div>
+                                      <div className="px-2 py-1 text-[10px] font-semibold text-[--text-secondary]">
+                                        镜头 {shot.sequence}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <div className="flex min-h-[176px] flex-col items-center justify-center gap-3 text-center text-sm text-[--text-muted]">
+                                  <ImageIcon className="h-8 w-8 text-[--text-muted]" />
+                                  <span>{scene.name}</span>
+                                  <span className="text-xs">等待生成故事板图</span>
+                                </div>
+                              )}
                             </div>
                           </section>
                         </div>
@@ -2158,7 +2264,7 @@ export default function EpisodesPage({
                               return (
                                 <div
                                   key={shot.id}
-                                  className="grid gap-3 rounded-lg border border-[--border-subtle] bg-[--surface]/40 p-3 md:grid-cols-[72px_minmax(0,1fr)_120px]"
+                                  className="grid gap-3 rounded-lg border border-[--border-subtle] bg-[--surface]/40 p-3 md:grid-cols-[72px_minmax(0,1fr)_168px]"
                                 >
                                   <div className="flex h-12 w-full items-center justify-center overflow-hidden rounded-md bg-white">
                                     {thumb ? (
@@ -2173,7 +2279,7 @@ export default function EpisodesPage({
                                       {compactText(storyboardPromptFromShot(shot, scene.name), 220) || "暂无提示词"}
                                     </div>
                                   </div>
-                                  <div className="flex items-center justify-end">
+                                  <div className="flex flex-col items-end justify-center gap-2">
                                     <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${
                                       thumb
                                         ? "bg-emerald-50 text-emerald-700"
@@ -2181,6 +2287,21 @@ export default function EpisodesPage({
                                     }`}>
                                       {thumb ? "已有故事板图" : "待生成故事板图"}
                                     </span>
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant={thumb ? "outline" : "default"}
+                                      disabled={generatingStoryboardShotId === shot.id}
+                                      onClick={() => regenerateStoryboardImageForShot(shot, scene.name)}
+                                      className="h-7 rounded-full px-3 text-[10px]"
+                                    >
+                                      {generatingStoryboardShotId === shot.id ? (
+                                        <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                      ) : (
+                                        <ImageIcon className="mr-1 h-3 w-3" />
+                                      )}
+                                      {thumb ? "重生成" : "生成"}
+                                    </Button>
                                   </div>
                                 </div>
                               );
