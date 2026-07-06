@@ -19,7 +19,6 @@ import {
   Trash2,
   Upload,
   Users,
-  VideoIcon,
   X,
 } from "lucide-react";
 import { uploadUrl } from "@/lib/utils/upload-url";
@@ -179,10 +178,6 @@ function getActiveAssets(shot: EpisodeShot, type: ShotAssetType) {
   return (shot.assets || [])
     .filter((asset) => asset.isActive === 1 && asset.type === type)
     .sort((a, b) => a.sequenceInType - b.sequenceInType);
-}
-
-function getShotVideoUrl(shot: EpisodeShot, mode: "keyframe" | "reference") {
-  return getActiveAsset(shot, mode === "reference" ? "reference_video" : "keyframe_video")?.fileUrl || null;
 }
 
 function getSceneReferenceName(shot: EpisodeShot) {
@@ -1198,7 +1193,7 @@ export default function EpisodesPage({
             {
               id: "draft-scene-empty",
               name: "场景草稿",
-              prompt: "请在这里填写本集第一组分镜的视频提示词。可以包含剧情动作、角色调度、镜头运动、环境氛围和画面风格。",
+              prompt: "请在这里填写本集第一组故事板镜头描述。只保留静态画面、构图、环境氛围和资产参考。",
               environment: [],
               props: [],
             },
@@ -1298,11 +1293,14 @@ export default function EpisodesPage({
     });
   }, [assetPools, fallbackDraftScenes]);
 
-  const generationMode = episodeDetail?.generationMode || "keyframe";
   const totalShots = episodeDetail?.shots.length || 0;
   const visibleSceneCount = storyboardScenes.length || fallbackDraftScenes.length;
-  const shotsWithVideos =
-    episodeDetail?.shots.filter((shot) => getShotVideoUrl(shot, generationMode)).length || 0;
+  const shotsWithStoryboardFrames =
+    episodeDetail?.shots.filter((shot) =>
+      getActiveAsset(shot, "first_frame")?.fileUrl ||
+      getActiveAssets(shot, "reference")[0]?.fileUrl ||
+      getActiveAsset(shot, "last_frame")?.fileUrl
+    ).length || 0;
 
   function startColumnResize(side: "left" | "right", event: ReactPointerEvent<HTMLButtonElement>) {
     const startX = event.clientX;
@@ -1471,11 +1469,11 @@ export default function EpisodesPage({
                 onChange={(event) =>
                   setPromptDrafts((prev) => ({ ...prev, [shot.id]: event.target.value }))
                 }
-                placeholder="这里编辑该镜头的视频提示词，可根据剧情、动作和镜头要求人工微调。"
+                placeholder="这里编辑该镜头的故事板图提示词，只保留静态画面、构图和资产参考。"
                 className="min-h-[128px] w-full resize-y rounded-xl border border-black/30 bg-white/70 p-3 font-mono text-xs leading-relaxed text-black outline-none focus:border-primary"
               />
               <div className="mt-2 grid gap-1 text-[10px] text-black/60">
-                {shot.videoScript && <div className="line-clamp-2">视频脚本：{shot.videoScript}</div>}
+                {shot.videoScript && <div className="line-clamp-2">后续视频脚本 metadata：{shot.videoScript}</div>}
                 {shot.motionScript && <div className="line-clamp-2">动作：{shot.motionScript}</div>}
               </div>
             </div>
@@ -1499,61 +1497,12 @@ export default function EpisodesPage({
   }
 
   function renderVideoSettingsBar(sceneDuration?: number) {
-    const durationOptions =
-      sceneDuration && !videoDurationOptions.includes(sceneDuration)
-        ? [...videoDurationOptions, sceneDuration].sort((a, b) => a - b)
-        : videoDurationOptions;
+    void sceneDuration;
     return (
       <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-black/80 p-2 text-[10px] text-white">
-        <label className="flex items-center gap-1.5">
-          <span className="font-semibold">模型</span>
-          <select
-            value={modelRefKey(selectedVideoModel)}
-            onChange={(event) => {
-              const option = videoModelOptions.find((item) => item.key === event.target.value);
-              setSelectedVideoModel(option ? { providerId: option.providerId, modelId: option.modelId } : null);
-            }}
-            className="h-7 max-w-[180px] rounded-md border border-white/20 bg-white px-2 text-xs font-semibold text-black outline-none"
-          >
-            {videoModelOptions.length === 0 ? (
-              <option value="">未配置视频模型</option>
-            ) : (
-              videoModelOptions.map((option) => (
-                <option key={option.key} value={option.key}>
-                  {option.label}
-                </option>
-              ))
-            )}
-          </select>
-        </label>
-        <label className="flex items-center gap-1.5">
-          <span className="font-semibold">分辨率</span>
-          <select
-            value={selectedVideoResolution}
-            onChange={(event) => setSelectedVideoResolution(event.target.value)}
-            className="h-7 rounded-md border border-white/20 bg-white px-2 text-xs font-semibold text-black outline-none"
-          >
-            {videoResolutionOptions.map((resolution) => (
-              <option key={resolution} value={resolution}>
-                {resolution}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="flex items-center gap-1.5">
-          <span className="font-semibold">时长</span>
-          <select
-            value={sceneDuration || selectedVideoDuration}
-            onChange={(event) => setSelectedVideoDuration(Number(event.target.value))}
-            className="h-7 rounded-md border border-white/20 bg-white px-2 text-xs font-semibold text-black outline-none"
-          >
-            {durationOptions.map((duration) => (
-              <option key={duration} value={duration}>
-                {duration}s
-              </option>
-            ))}
-          </select>
-        </label>
+        <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1 font-semibold">故事板图提示词</span>
+        <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1">静态关键帧</span>
+        <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1">16:9</span>
       </div>
     );
   }
@@ -1854,10 +1803,10 @@ export default function EpisodesPage({
             />
             {renderVideoSettingsBar()}
           </section>
-          {renderResizeHandle("right", "拖动调整提示词和视频宽度")}
+          {renderResizeHandle("right", "拖动调整提示词和故事板图宽度")}
           <section className="min-w-0 bg-[#d2d2d0] p-4">
             <div className="flex min-h-[200px] items-center justify-center text-sm font-semibold text-black/50">
-              等待生成视频
+              等待生成故事板图
             </div>
           </section>
         </div>
@@ -2020,7 +1969,7 @@ export default function EpisodesPage({
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="rounded-full bg-black/[0.04] px-3 py-1 text-xs font-semibold text-[--text-muted]">
-                    已生成视频 {shotsWithVideos}/{totalShots}
+                    已有故事板图 {shotsWithStoryboardFrames}/{totalShots}
                   </span>
                 </div>
               </div>
@@ -2040,10 +1989,6 @@ export default function EpisodesPage({
                 <div className="max-h-[calc(100vh-220px)] space-y-5 overflow-y-auto bg-white p-3">
                   {storyboardScenes.map((scene, sceneIndex) => {
                     const expanded = expandedSceneIds.has(scene.id);
-                    const videoShot = scene.shots.find((shot) =>
-                      getShotVideoUrl(shot, episodeDetail.generationMode)
-                    );
-                    const videoUrl = videoShot ? getShotVideoUrl(videoShot, episodeDetail.generationMode) : null;
                     const sceneActionBusy = storyboardSceneActionId === scene.id || storyboardSceneActionId === "new";
                     return (
                       <article key={scene.id} className="overflow-hidden rounded-xl bg-[#e8e8e6] p-4">
@@ -2148,19 +2093,15 @@ export default function EpisodesPage({
                             {renderVideoSettingsBar(scene.shots.reduce((sum, shot) => sum + (shot.duration || 0), 0))}
                           </section>
 
-                          {renderResizeHandle("right", "拖动调整提示词和视频宽度")}
+                          {renderResizeHandle("right", "拖动调整提示词和故事板图宽度")}
 
                           <section className="min-w-0 bg-[#d2d2d0] p-4">
                             <div className="flex min-h-[238px] items-center justify-center rounded-xl border border-[--border-subtle] bg-white p-3">
-                              {videoUrl ? (
-                                <video src={uploadUrl(videoUrl)} controls className="max-h-[260px] w-full rounded-lg bg-black object-contain" />
-                              ) : (
-                                <div className="flex flex-col items-center gap-3 text-center text-sm text-[--text-muted]">
-                                  <VideoIcon className="h-8 w-8 text-[--text-muted]" />
-                                  <span>{scene.name}</span>
-                                  <span className="text-xs">等待生成视频</span>
-                                </div>
-                              )}
+                              <div className="flex flex-col items-center gap-3 text-center text-sm text-[--text-muted]">
+                                <ImageIcon className="h-8 w-8 text-[--text-muted]" />
+                                <span>{scene.name}</span>
+                                <span className="text-xs">等待生成故事板图</span>
+                              </div>
                             </div>
                           </section>
                         </div>
@@ -2172,7 +2113,6 @@ export default function EpisodesPage({
                                 getActiveAsset(shot, "first_frame")?.fileUrl ||
                                 getActiveAssets(shot, "reference")[0]?.fileUrl ||
                                 getActiveAsset(shot, "last_frame")?.fileUrl;
-                              const shotVideo = getShotVideoUrl(shot, episodeDetail.generationMode);
                               return (
                                 <div
                                   key={shot.id}
@@ -2193,11 +2133,11 @@ export default function EpisodesPage({
                                   </div>
                                   <div className="flex items-center justify-end">
                                     <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${
-                                      shotVideo
+                                      thumb
                                         ? "bg-emerald-50 text-emerald-700"
                                         : "bg-black/[0.04] text-[--text-muted]"
                                     }`}>
-                                      {shotVideo ? "已生成" : "未生成"}
+                                      {thumb ? "已有故事板图" : "待生成故事板图"}
                                     </span>
                                   </div>
                                 </div>
