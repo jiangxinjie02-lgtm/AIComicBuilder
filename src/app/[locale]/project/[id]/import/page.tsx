@@ -875,7 +875,7 @@ const STEP_IDLE_STATUS: Record<Step, StepStatusValue> = {
 };
 
 const SCRIPT_ENRICHMENT_POLL_MS = 2500;
-const SCRIPT_ENRICHMENT_BEAT_GROUP_SIZE = 5;
+const SCRIPT_ENRICHMENT_BEAT_GROUP_SIZE = 3;
 const SCRIPT_ENRICHMENT_MAX_BEATS_PER_CHUNK = 10;
 
 function sanitizePersistedStepStatus(status?: Partial<Record<Step, StepStatusValue>>) {

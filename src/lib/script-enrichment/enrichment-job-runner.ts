@@ -30,7 +30,7 @@ import { scoreDetailSufficiency } from "./detail-sufficiency-scorer";
 
 const DEFAULT_CONCURRENCY = 2;
 const MAX_CONCURRENCY = 5;
-const DEFAULT_BEAT_GROUP_SIZE = 5;
+const DEFAULT_BEAT_GROUP_SIZE = 3;
 const DEFAULT_MAX_BEATS_PER_CHUNK = 10;
 const DEFAULT_MAX_RETRIES = 2;
 

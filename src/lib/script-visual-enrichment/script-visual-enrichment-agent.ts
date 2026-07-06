@@ -27,6 +27,9 @@ const MAX_LOCAL_BEATS = 120;
 const AI_ENRICHMENT_TIMEOUT_MS = 60_000;
 const MAX_PROMPT_SCENES = 10;
 const MAX_PROMPT_ASSETS = 60;
+const MIN_AI_OUTPUT_TOKENS = 3200;
+const AI_OUTPUT_TOKENS_PER_BEAT = 900;
+const MAX_AI_OUTPUT_TOKENS = 8000;
 
 const SYSTEM_PROMPT = `You are the Script Visual Enrichment Agent in a short-drama production pipeline.
 
@@ -674,7 +677,13 @@ function normalizePatch(value: unknown, context: EnrichmentContext, index: numbe
 }
 
 function patchesFromAiText(text: string, context: EnrichmentContext) {
-  const parsed = JSON.parse(extractJSON(text)) as unknown;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extractJSON(text)) as unknown;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`AI returned invalid or truncated JSON: ${message}`);
+  }
   const record = toRecord(parsed);
   const rawPatches = Array.isArray(parsed) ? parsed : readArray(record.patches);
   return rawPatches
@@ -701,6 +710,7 @@ function buildAgentPrompt(context: EnrichmentContext) {
   return [
     "Enrich the following parsed script beats. Output JSON only.",
     "Only return patches for the listed Beats. Keep enriched_text concise: preserve original_text and add no more than 1-2 visual sentences.",
+    "Return compact JSON in a single object with a patches array. Do not pretty print. Keep each added visual detail under 30 Chinese characters when possible.",
     "",
     "Production bible:",
     JSON.stringify({
@@ -760,7 +770,10 @@ async function buildAiPatches(context: EnrichmentContext, input: ScriptVisualEnr
   if (configs.length === 0) throw new Error("No text model configured for script visual enrichment");
   const prompt = buildAgentPrompt(context);
   const errors: string[] = [];
-  const maxOutputTokens = Math.min(6000, Math.max(1800, context.beats.length * 350));
+  const maxOutputTokens = Math.min(
+    MAX_AI_OUTPUT_TOKENS,
+    Math.max(MIN_AI_OUTPUT_TOKENS, context.beats.length * AI_OUTPUT_TOKENS_PER_BEAT),
+  );
 
   for (const config of configs) {
     try {
