@@ -346,9 +346,12 @@ function getSceneAssetOptions(
 
 function inferDefaultAssetIds(scene: DraftScene, assets: LibraryAsset[], category: AssetCategory) {
   const text = `${scene.name} ${scene.prompt}`;
-  const matched = assets.filter((asset) => text.includes(asset.name));
+  const rankedAssets = category === "characters"
+    ? [...assets].sort((a, b) => Number(Boolean(b.imageUrl)) - Number(Boolean(a.imageUrl)))
+    : assets;
+  const matched = rankedAssets.filter((asset) => text.includes(asset.name));
   if (matched.length) return matched.slice(0, 8).map((asset) => asset.id);
-  if (category === "characters") return assets.slice(0, 6).map((asset) => asset.id);
+  if (category === "characters") return rankedAssets.slice(0, 6).map((asset) => asset.id);
   return [];
 }
 
@@ -845,6 +848,7 @@ export default function EpisodesPage({
   useEffect(() => {
     setExpandedSceneIds(new Set());
     setPromptDrafts({});
+    setSceneAssetSelections({});
     setDraftSceneMenuOpen(null);
     setStoryboardSceneMenuOpen(null);
     setStoryboardSceneActionId(null);
@@ -1274,7 +1278,13 @@ export default function EpisodesPage({
         const patched = { ...current };
         let sceneChanged = false;
         (["characters", "environments", "items"] as AssetCategory[]).forEach((category) => {
-          if (patched[category] === undefined && defaults[category].length > 0) {
+          const optionIds = new Set(
+            getSceneAssetOptions(scene, category, assetPools).map((asset) => asset.id)
+          );
+          const currentSelection = patched[category];
+          const hasValidSelection = Array.isArray(currentSelection)
+            && currentSelection.some((assetId) => optionIds.has(assetId));
+          if ((!hasValidSelection || patched[category] === undefined) && defaults[category].length > 0) {
             patched[category] = defaults[category];
             sceneChanged = true;
           }
@@ -1592,7 +1602,11 @@ export default function EpisodesPage({
     const selectedIds = sceneAssetSelections[scene.id]?.[category];
     const defaultIds = selectedIds ?? inferDefaultAssetIds(scene, options, category);
     const byId = new Map(options.map((asset) => [asset.id, asset]));
-    return defaultIds.map((id) => byId.get(id)).filter(Boolean) as LibraryAsset[];
+    const selectedAssets = defaultIds.map((id) => byId.get(id)).filter(Boolean) as LibraryAsset[];
+    if (selectedAssets.length > 0 || selectedIds === undefined) return selectedAssets;
+    return inferDefaultAssetIds(scene, options, category)
+      .map((id) => byId.get(id))
+      .filter(Boolean) as LibraryAsset[];
   }
 
   function renderAssetPicker(scene: DraftScene, category: AssetCategory, options: LibraryAsset[]) {
