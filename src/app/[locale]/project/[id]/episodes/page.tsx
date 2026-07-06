@@ -757,10 +757,16 @@ export default function EpisodesPage({
     Promise.all([
       apiFetch(`/api/projects/${projectId}/import/logs`).then((res) => res.json()),
       apiFetch(`/api/projects/${projectId}/assets`).then((res) => res.json()),
+      apiFetch(`/api/projects/${projectId}/import/state`).then((res) => res.json()),
     ])
-      .then(([logs, assetData]: [
+      .then(([logs, assetData, importState]: [
         Array<{ step: number; status: string; metadata?: unknown }>,
         { assets?: StoryLibraryAssetLike[] },
+        {
+          characters?: ImportAssetLike[] | null;
+          environments?: ImportAssetLike[] | null;
+          items?: ImportAssetLike[] | null;
+        } | null,
       ]) => {
         if (cancelled) return;
         const assetLog = [...(Array.isArray(logs) ? logs : [])]
@@ -777,14 +783,17 @@ export default function EpisodesPage({
         setImportCharacterAssets(uniqueLibraryAssets([
           ...importAssetsToLibraryAssets("characters", metadata?.characters, "导入角色"),
           ...storyAssets.filter((asset) => asset.category === "characters"),
+          ...importAssetsToLibraryAssets("characters", importState?.characters || undefined, "导入角色"),
         ]));
         setEnvironmentAssets(uniqueLibraryAssets([
           ...importAssetsToLibraryAssets("environments", metadata?.environments, "场景"),
           ...storyAssets.filter((asset) => asset.category === "environments"),
+          ...importAssetsToLibraryAssets("environments", importState?.environments || undefined, "场景"),
         ]));
         setItemAssets(uniqueLibraryAssets([
           ...importAssetsToLibraryAssets("items", metadata?.items, "物品"),
           ...storyAssets.filter((asset) => asset.category === "items"),
+          ...importAssetsToLibraryAssets("items", importState?.items || undefined, "物品"),
         ]));
       })
       .catch((err) => {
