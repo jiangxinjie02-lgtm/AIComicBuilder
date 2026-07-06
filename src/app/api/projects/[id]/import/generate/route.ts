@@ -7,6 +7,7 @@ import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
 import { findCharacterIdByName, syncImportAssets } from "@/lib/story-assets";
 import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
+import { lockAssetLibraryVersion } from "@/lib/industrial-pipeline";
 
 export const maxDuration = 60;
 
@@ -172,6 +173,39 @@ export async function POST(
     `已写入资产库：人物 ${body.characters.length}、道具 ${body.items?.length || 0}、场景 ${body.environments?.length || 0}`
   );
 
+  let assetLibraryVersion: Awaited<ReturnType<typeof lockAssetLibraryVersion>>;
+  try {
+    assetLibraryVersion = await lockAssetLibraryVersion({
+      projectId,
+      confirmedScriptVersionId: confirmedVersion.id,
+      reviewSummary: {
+        source: "import_generate",
+        assetCount: persistedAssetRows.length,
+        characterCount: body.characters.length,
+        itemCount: body.items?.length || 0,
+        environmentCount: body.environments?.length || 0,
+        voiceCount: body.voices?.length || 0,
+      },
+      userId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to lock asset library";
+    await addImportLog(projectId, 5, "error", `资产库锁定失败：${message}`, {
+      confirmedScriptVersionId: confirmedVersion.id,
+      assetCount: persistedAssetRows.length,
+    });
+    return NextResponse.json({ error: message }, { status: 409 });
+  }
+
+  await addImportLog(
+    projectId, 5, "running",
+    `已锁定资产库版本：${assetLibraryVersion.id}`,
+    {
+      assetLibraryVersionId: assetLibraryVersion.id,
+      confirmedScriptVersionId: confirmedVersion.id,
+    }
+  );
+
   // 2. Create episodes
   const [seqResult] = await db
     .select({ maxSeq: max(episodes.sequence) })
@@ -227,6 +261,7 @@ export async function POST(
       voiceCount: body.voices?.length || 0,
       assetCount: persistedAssetRows.length,
       confirmedScriptVersionId: confirmedVersion.id,
+      assetLibraryVersionId: assetLibraryVersion.id,
       items: body.items || [],
       environments: body.environments || [],
       voices: body.voices || [],
@@ -246,6 +281,8 @@ export async function POST(
     voiceCount: body.voices?.length || 0,
     assetCount: persistedAssetRows.length,
     confirmedScriptVersionId: confirmedVersion.id,
+    assetLibraryVersionId: assetLibraryVersion.id,
+    assetLibraryVersion,
   }, { status: 201 });
 }
 

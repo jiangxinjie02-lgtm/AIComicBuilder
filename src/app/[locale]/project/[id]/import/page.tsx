@@ -784,6 +784,7 @@ interface ImportDraftState {
   enrichmentJobId?: string | null;
   intakeJobId?: string | null;
   confirmedScriptVersionId?: string | null;
+  assetLibraryVersionId?: string | null;
 }
 
 interface StoryReviewIssue {
@@ -966,6 +967,7 @@ export default function ImportPage({
   const [intakeJobId, setIntakeJobId] = useState<string | null>(null);
   const [intakeJobStatus, setIntakeJobStatus] = useState<IntakeJobStatus | null>(null);
   const [confirmedScriptVersionId, setConfirmedScriptVersionId] = useState<string | null>(null);
+  const [assetLibraryVersionId, setAssetLibraryVersionId] = useState<string | null>(null);
   const intakePollingRef = useRef(false);
 
   // Step 0: Upload
@@ -1060,6 +1062,7 @@ export default function ImportPage({
     enrichmentJobId,
     intakeJobId,
     confirmedScriptVersionId,
+    assetLibraryVersionId,
   }), [
     currentStep,
     stepStatus,
@@ -1076,6 +1079,7 @@ export default function ImportPage({
     enrichmentJobId,
     intakeJobId,
     confirmedScriptVersionId,
+    assetLibraryVersionId,
   ]);
 
   const saveDraft = useCallback(async (payload?: ImportDraftState) => {
@@ -1127,6 +1131,7 @@ export default function ImportPage({
     enrichmentJobId: null,
     intakeJobId: null,
     confirmedScriptVersionId: null,
+    assetLibraryVersionId: null,
   }), []);
 
   if (draftHydratedRef.current) {
@@ -1246,6 +1251,9 @@ export default function ImportPage({
           }
           if (typeof draft.confirmedScriptVersionId === "string" && draft.confirmedScriptVersionId) {
             setConfirmedScriptVersionId(draft.confirmedScriptVersionId);
+          }
+          if (typeof draft.assetLibraryVersionId === "string" && draft.assetLibraryVersionId) {
+            setAssetLibraryVersionId(draft.assetLibraryVersionId);
           }
           storyReviewedRef.current = draftStepStatus[2] === "done";
         }
@@ -1468,6 +1476,7 @@ export default function ImportPage({
     setIntakeJobId(null);
     setIntakeJobStatus(null);
     setConfirmedScriptVersionId(null);
+    setAssetLibraryVersionId(null);
     intakePollingRef.current = false;
     setHistoryMode(false);
     setSelectedStep(null);
@@ -1509,6 +1518,7 @@ export default function ImportPage({
 
     setIntakeJobId(jobId);
     setConfirmedScriptVersionId(null);
+    setAssetLibraryVersionId(null);
     intakePollingRef.current = true;
     addLog(1, "running", `Script intake job queued: ${jobId}`);
     await saveDraft({
@@ -1517,6 +1527,7 @@ export default function ImportPage({
       stepStatus: { 1: "running", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
       intakeJobId: jobId,
       confirmedScriptVersionId: null,
+      assetLibraryVersionId: null,
     });
 
     let lastStage = "";
@@ -1559,6 +1570,7 @@ export default function ImportPage({
           fullText: candidateText,
           intakeJobId: jobId,
           confirmedScriptVersionId: status.confirmed_script_version_id || null,
+          assetLibraryVersionId: null,
         });
         return;
       }
@@ -1928,6 +1940,7 @@ export default function ImportPage({
     if (!versionId) throw new Error("确认接口没有返回 confirmed_script_version_id");
 
     setConfirmedScriptVersionId(versionId);
+    setAssetLibraryVersionId(null);
     setIntakeJobStatus((prev) => prev ? { ...prev, status: "confirmed", confirmed_script_version_id: versionId } : prev);
     addLog(2, "done", `已生成确认剧本版本: ${versionId}`);
     await saveDraft({
@@ -1935,6 +1948,7 @@ export default function ImportPage({
       fullText,
       intakeJobId,
       confirmedScriptVersionId: versionId,
+      assetLibraryVersionId: null,
     });
     return versionId;
   }
@@ -2060,6 +2074,7 @@ export default function ImportPage({
     }
     setCurrentStep(3);
     setStepStatus((prev) => ({ ...prev, 3: "running" }));
+    setAssetLibraryVersionId(null);
     addLog(3, "running", "开始资产设定：提取角色、物品、场景和音色...");
 
     try {
@@ -2095,6 +2110,7 @@ export default function ImportPage({
         environments: normalizedEnvironments,
         voices: data.voices || [],
         relationships: data.relationships || [],
+        assetLibraryVersionId: null,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Extract failed";
@@ -2176,7 +2192,7 @@ export default function ImportPage({
 
     setCurrentStep(5);
     setStepStatus((prev) => ({ ...prev, 5: "running" }));
-    addLog(5, "running", `创建 ${episodes.length} 集和角色...`);
+    addLog(5, "running", `创建 ${episodes.length} 集、角色并锁定资产库...`);
 
     try {
       const res = await apiFetch(`/api/projects/${projectId}/import/generate`, {
@@ -2196,9 +2212,27 @@ export default function ImportPage({
         const err = await res.json();
         throw new Error(err.error || `HTTP ${res.status}`);
       }
-      const data = await res.json();
-      addLog(5, "done", `导入完成！创建了 ${data.characterCount} 个角色、${data.itemCount || 0} 个物品、${data.environmentCount || 0} 个环境、${data.voiceCount || 0} 个音色和 ${data.episodes.length} 集`);
+      const data = await res.json() as {
+        episodes: Array<{ id: string }>;
+        characterCount: number;
+        itemCount?: number;
+        environmentCount?: number;
+        voiceCount?: number;
+        assetLibraryVersionId?: string;
+      };
+      const lockedAssetLibraryVersionId = data.assetLibraryVersionId || null;
+      if (!lockedAssetLibraryVersionId) {
+        throw new Error("导入接口没有返回 assetLibraryVersionId");
+      }
+      setAssetLibraryVersionId(lockedAssetLibraryVersionId);
+      addLog(5, "done", `导入完成！创建了 ${data.characterCount} 个角色、${data.itemCount || 0} 个物品、${data.environmentCount || 0} 个环境、${data.voiceCount || 0} 个音色和 ${data.episodes.length} 集，已锁定资产库版本 ${lockedAssetLibraryVersionId}`);
       setStepStatus((prev) => ({ ...prev, 5: "done" }));
+      await saveDraft({
+        ...buildDraftPayload(),
+        currentStep: 5,
+        stepStatus: { ...stepStatus, 5: "done" },
+        assetLibraryVersionId: lockedAssetLibraryVersionId,
+      });
       toast.success(t("complete"));
       setTimeout(() => {
         router.push(`/${locale}/project/${projectId}/episodes`);
