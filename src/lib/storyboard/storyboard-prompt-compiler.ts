@@ -9,10 +9,11 @@ import type {
 import { activeAssetCount, buildStoryboardLookup, normalizeStoryboardShot } from "./active-asset-selector";
 import { buildStoryboardFrame } from "./storyboard-frame-builder";
 import { compactText, sanitizePromptText, unique } from "./prompt-sanitizer";
-import { normalizeStaticFrameDescription } from "./static-frame-normalizer";
+import { normalizeStaticFrameDescription, splitIntoStaticFrameCandidates } from "./static-frame-normalizer";
 import { rewriteUnsafeVisuals } from "./safety-rewriter";
 import { resolveLightingStyle } from "./lighting-style-resolver";
 import { validateStoryboardPrompt } from "./storyboard-prompt-validator";
+import { planStoryboardFramesForShot } from "./storyboard-frame-planner";
 
 const NEGATIVE_TERMS = [
   "subtitles",
@@ -122,23 +123,30 @@ export function compileStoryboardFrames(input: StoryboardCompilerInput): Storybo
     .map((shot, index) => normalizeStoryboardShot(shot, index, lookup))
     .filter((shot) => !shot.lock_status || shot.lock_status === "locked");
 
-  const storyboardFrames = shots.map((shot, index): StoryboardFrameSpec => {
-    const frameBase = buildStoryboardFrame({
-      shot,
-      shotIndex: index,
-      lookup,
-      productionBible: input.productionBible,
+  const storyboardFrames = shots.flatMap((shot, shotIndex): StoryboardFrameSpec[] => {
+    const framePlans = planStoryboardFramesForShot(shot);
+    return framePlans.map((framePlan): StoryboardFrameSpec => {
+      const frameBase = buildStoryboardFrame({
+        shot,
+        shotIndex,
+        framePlan,
+        lookup,
+        productionBible: input.productionBible,
+      });
+      const withPrompts: StoryboardFrameSpec = {
+        ...frameBase,
+        positive_prompt: "",
+        negative_prompt: "",
+        validation: { status: "valid", errors: [], warnings: [] },
+      };
+      withPrompts.positive_prompt = compilePositivePrompt(withPrompts, lookup);
+      withPrompts.negative_prompt = compileNegativePrompt(withPrompts, input.productionBible);
+      withPrompts.validation = {
+        ...validateStoryboardPrompt(withPrompts, { allAssetIds }),
+        split_suggestions: framePlan.splitSuggestions,
+      };
+      return withPrompts;
     });
-    const withPrompts: StoryboardFrameSpec = {
-      ...frameBase,
-      positive_prompt: "",
-      negative_prompt: "",
-      validation: { status: "valid", errors: [], warnings: [] },
-    };
-    withPrompts.positive_prompt = compilePositivePrompt(withPrompts, lookup);
-    withPrompts.negative_prompt = compileNegativePrompt(withPrompts, input.productionBible);
-    withPrompts.validation = validateStoryboardPrompt(withPrompts, { allAssetIds });
-    return withPrompts;
   });
 
   const stats = buildStats(storyboardFrames);
@@ -173,7 +181,7 @@ export function buildStoryboardPromptPreviewFromText(input: {
   productionBible?: StoryboardProductionBibleInput | null;
 }) {
   const staticText = normalizeStaticFrameDescription({
-    text: input.sourceText,
+    text: splitIntoStaticFrameCandidates(input.sourceText)[0]?.text || input.sourceText,
     fallback: input.title,
   });
   const safety = rewriteUnsafeVisuals(staticText);

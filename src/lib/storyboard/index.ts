@@ -4,6 +4,7 @@ export * from "./static-frame-normalizer";
 export * from "./safety-rewriter";
 export * from "./lighting-style-resolver";
 export * from "./active-asset-selector";
+export * from "./storyboard-frame-planner";
 export * from "./storyboard-frame-builder";
 export * from "./storyboard-prompt-validator";
 export * from "./storyboard-prompt-compiler";

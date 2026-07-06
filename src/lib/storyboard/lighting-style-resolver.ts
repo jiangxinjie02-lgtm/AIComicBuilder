@@ -6,12 +6,25 @@ function bibleMetadataValue(bible: StoryboardProductionBibleInput | null | undef
 }
 
 function detectEra(bible?: StoryboardProductionBibleInput | null) {
-  return compactText(
-    bibleMetadataValue(bible, ["era", "period", "time", "year"]) ||
-    bible?.eraConstraints ||
-    "production-bible era rules",
-    180,
-  );
+  const evidence = [
+    bibleMetadataValue(bible, ["era", "period", "time", "year"]),
+    bible?.eraConstraints,
+    bible?.worldSetting,
+    bible?.locationRules,
+    bible?.sceneRules,
+    bible?.visualStyle,
+  ].filter(Boolean).join(" ");
+  const year = evidence.match(/\b(18\d{2}|19\d{2}|20\d{2})\b/)?.[1];
+  const decade = evidence.match(/\b(18|19|20)(\d)0s\b/i);
+  const chineseDecade = evidence.match(/([一二三四五六七八九零〇\d]{2})年代|(\d{2})年代/);
+  const china = /中国|Chinese|China/i.test(evidence) ? "China" : "";
+  if (year) return [year, china].filter(Boolean).join(" ");
+  if (decade) return [`${decade[1]}${decade[2]}0s`, china].filter(Boolean).join(" ");
+  if (chineseDecade && /80|八十/.test(chineseDecade[0])) return ["1980s", china || "China"].join(" ");
+  if (/八十年代|80年代|1980年代|1980s/i.test(evidence)) return ["1980s", china || "China"].join(" ");
+  const clean = compactText(evidence, 180);
+  if (clean && !/production-bible|asset_bound|constraint_default|placeholder/i.test(clean)) return clean;
+  return "realistic short-drama period setting";
 }
 
 function detectVisualStyle(bible?: StoryboardProductionBibleInput | null) {

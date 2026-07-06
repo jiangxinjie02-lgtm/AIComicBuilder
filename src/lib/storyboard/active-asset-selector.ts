@@ -15,8 +15,10 @@ import { compactText, parseStringArray, readString, sanitizePromptText, toRecord
 
 const DETAIL_TERMS = /特写|近景|细节|手部|脸部|close-up|detail|insert|macro/i;
 const REACTION_TERMS = /反应|表情|脸|眼神|reaction|face|expression/i;
-const VEHICLE_TERMS = /车|汽车|卡车|巴士|摩托|自行车|船|飞机|vehicle|car|truck|bus|motorcycle|bike|boat|plane/i;
+const VEHICLE_TERMS = /车|汽车|卡车|巴士|摩托|自行车|船|飞机|车灯|远光灯|前照灯|vehicle|car|truck|bus|motorcycle|bike|boat|plane|headlight/i;
 const COMPONENT_TERMS = /轮胎|车轮|雨刷|玻璃|门把|按钮|屏幕|把手|车窗|窗户|手指|眼睛|tire|wheel|wiper|glass|handle|button|screen|window|finger|eye/i;
+const BODY_DETAIL_TERMS = /手指|手部|手掌|眼睛|脸|肩|背影|finger|hand|eye|face|shoulder/i;
+const PERSON_TERMS = /人物|角色|男人|女人|老人|孩子|少年|少女|他|她|其|主角|配角|person|man|woman|boy|girl|character/i;
 
 export function buildStoryboardLookup(input: {
   assets?: unknown[];
@@ -141,7 +143,7 @@ export function normalizeStoryboardShot(rawShot: unknown, index: number, lookup:
   const record = toRecord(rawShot);
   const camera = normalizeCamera(record.camera, record);
   const action = readString(record, ["action", "motionScript", "motion_script"]);
-  const frameDescription = readString(record, ["frame_description", "frameDescription", "startFrame", "prompt", "source_text", "sourceText"]);
+  const frameDescription = readString(record, ["frame_description", "frameDescription", "startFrame", "prompt", "videoPrompt", "source_text", "sourceText"]);
   const characterLegacyIds = parseStringArray(record.character_asset_ids ?? record.characterAssetIds ?? record.character_ids ?? record.characterIds);
   const propLegacyIds = parseStringArray(record.prop_asset_ids ?? record.propAssetIds ?? record.prop_ids ?? record.propIds);
   const sceneAsset = normalizeShotRef(record.scene_asset ?? record.sceneAsset, lookup)
@@ -159,6 +161,9 @@ export function normalizeStoryboardShot(rawShot: unknown, index: number, lookup:
   const sourceText = [
     frameDescription,
     action,
+    readString(record, ["videoPrompt", "video_prompt"]),
+    readString(record, ["videoScript", "video_script"]),
+    readString(record, ["motionScript", "motion_script"]),
     readString(record, ["emotion", "focalPoint"]),
     camera.framing,
     camera.movement,
@@ -281,14 +286,27 @@ export function selectActiveAssets(input: {
   frameDescription: string;
   lookup: StoryboardLookup;
 }) {
-  const frameText = sanitizePromptText(`${input.frameDescription} ${input.shot.action} ${input.shot.composition} ${input.shot.camera.framing}`);
+  const frameText = sanitizePromptText(`${input.frameDescription} ${input.shot.composition} ${input.shot.camera.framing}`);
   const isDetailShot = DETAIL_TERMS.test(`${input.shot.shot_type} ${input.shot.camera.shot_type} ${frameText}`);
   const isReactionShot = REACTION_TERMS.test(`${input.shot.shot_type} ${frameText}`);
+  const isVehicleOrComponentFrame = VEHICLE_TERMS.test(frameText) || COMPONENT_TERMS.test(frameText);
+  const isBodyDetailFrame = BODY_DETAIL_TERMS.test(frameText);
+  const isPersonFrame = PERSON_TERMS.test(frameText);
 
-  const boundCharacters = input.shot.characters
+  const mentionedCharacters = input.shot.characters
     .map((ref, index) => bindAsset(ref, "character", index === 0 ? "subject" : isReactionShot ? "reaction" : "background", input.lookup))
     .filter((asset): asset is StoryboardBoundAsset => Boolean(asset))
-    .filter((asset) => textMentionsAsset(frameText, input.lookup.assetsById.get(asset.asset_id)!) || input.shot.characters.some((ref) => ref.asset_id === asset.asset_id))
+    .filter((asset) => characterVisibleInFrame(asset, frameText, input.lookup));
+  const fallbackCharacters =
+    mentionedCharacters.length === 0 &&
+    (!isVehicleOrComponentFrame || isBodyDetailFrame) &&
+    (isPersonFrame || isBodyDetailFrame || input.shot.characters.length === 1)
+      ? input.shot.characters
+          .map((ref) => bindAsset(ref, "character", "subject", input.lookup))
+          .filter((asset): asset is StoryboardBoundAsset => Boolean(asset))
+          .slice(0, 1)
+      : [];
+  const boundCharacters = uniqueBoundAssets([...mentionedCharacters, ...fallbackCharacters])
     .slice(0, 2);
 
   const explicitScene = input.shot.scene_asset ? bindAsset(input.shot.scene_asset, "scene", "background", input.lookup) : null;
@@ -298,15 +316,27 @@ export function selectActiveAssets(input: {
 
   const explicitProps = input.shot.props
     .map((ref) => bindAsset(ref, "prop", "supporting", input.lookup))
-    .filter((asset): asset is StoryboardBoundAsset => Boolean(asset));
+    .filter((asset): asset is StoryboardBoundAsset => Boolean(asset))
+    .filter((asset) => propVisibleInFrame(asset, frameText, isVehicleOrComponentFrame));
   const mentionedProps = Array.from(input.lookup.assetsById.values())
     .filter((asset) => asset.type === "prop" && textMentionsAsset(frameText, asset))
     .map((asset) => bindAsset({ asset_id: asset.id, variant_id: chooseBaseVariant(asset.id, input.lookup)?.id ?? "" }, "prop", "supporting", input.lookup))
     .filter((asset): asset is StoryboardBoundAsset => Boolean(asset));
-  const props = uniqueBoundAssets([...explicitProps, ...mentionedProps])
+  const fallbackProps =
+    explicitProps.length === 0 &&
+    mentionedProps.length === 0 &&
+    isVehicleOrComponentFrame &&
+    !isBodyDetailFrame
+      ? input.shot.props
+          .map((ref) => bindAsset(ref, "prop", "supporting", input.lookup))
+          .filter((asset): asset is StoryboardBoundAsset => Boolean(asset))
+          .filter((asset) => VEHICLE_TERMS.test(`${asset.name} ${asset.description}`) && !COMPONENT_TERMS.test(`${asset.name} ${asset.description}`))
+          .slice(0, 1)
+      : [];
+  const props = uniqueBoundAssets([...explicitProps, ...mentionedProps, ...fallbackProps])
     .map((prop) => ({ ...prop, role_in_frame: derivePropRole(prop, frameText, isDetailShot) }))
     .sort((a, b) => scoreProp(b, frameText, isDetailShot) - scoreProp(a, frameText, isDetailShot))
-    .slice(0, 3);
+    .slice(0, isDetailShot || isVehicleOrComponentFrame ? 2 : 3);
 
   const subject = deriveSubject({
     characters: boundCharacters,
@@ -348,6 +378,20 @@ export function selectActiveAssets(input: {
   };
 }
 
+function characterVisibleInFrame(asset: StoryboardBoundAsset, frameText: string, lookup: StoryboardLookup) {
+  const source = lookup.assetsById.get(asset.asset_id);
+  if (!source) return false;
+  return textMentionsAsset(frameText, source);
+}
+
+function propVisibleInFrame(asset: StoryboardBoundAsset, frameText: string, isVehicleOrComponentFrame: boolean) {
+  if (frameText.includes(asset.name) || frameText.includes(asset.asset_id)) return true;
+  const text = `${asset.name} ${asset.description}`;
+  const isBroadVehicleAsset = VEHICLE_TERMS.test(text) && !COMPONENT_TERMS.test(text);
+  if (isVehicleOrComponentFrame && isBroadVehicleAsset && VEHICLE_TERMS.test(frameText)) return true;
+  return false;
+}
+
 function uniqueBoundAssets(assets: StoryboardBoundAsset[]) {
   const seen = new Set<string>();
   return assets.filter((asset) => {
@@ -384,7 +428,7 @@ function deriveSubject(input: {
   const subjectCharacter = input.characters[0];
   if (subjectCharacter) {
     return {
-      type: input.isReactionShot ? "reaction" : "character",
+      type: input.isReactionShot ? "reaction" : BODY_DETAIL_TERMS.test(input.frameText) || input.isDetailShot ? "detail" : "character",
       asset_id: subjectCharacter.asset_id,
       description: `${subjectCharacter.name} as the main visible subject`,
     };

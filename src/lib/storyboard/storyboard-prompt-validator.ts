@@ -11,6 +11,7 @@ import {
   hasPattern,
 } from "./prompt-sanitizer";
 import { EXPLICIT_GORE_PATTERNS } from "./safety-rewriter";
+import { detectActionNodes, hasMultipleActionNodes, splitSuggestionsFor } from "./static-frame-normalizer";
 
 function issue(
   severity: "error" | "warning",
@@ -61,6 +62,26 @@ function lightingMismatch(frame: StoryboardFrameSpec) {
   return "";
 }
 
+function subjectMatchesActiveAssets(frame: StoryboardFrameSpec) {
+  const subjectId = frame.subject.asset_id;
+  if (!subjectId) return false;
+  if (frame.subject.type === "character" || frame.subject.type === "reaction") {
+    return frame.active_assets.characters.some((asset) => asset.asset_id === subjectId);
+  }
+  if (frame.subject.type === "prop" || frame.subject.type === "vehicle" || frame.subject.type === "detail") {
+    return frame.active_assets.props.some((asset) => asset.asset_id === subjectId) ||
+      frame.active_assets.characters.some((asset) => asset.asset_id === subjectId);
+  }
+  if (frame.subject.type === "environment") {
+    return frame.active_assets.scene?.asset_id === subjectId;
+  }
+  return activeIds(frame).has(subjectId);
+}
+
+function containsPlaceholder(text: string) {
+  return /\b(production-bible era rules|asset_bound|constraint_default|placeholder)\b/i.test(text);
+}
+
 export function validateStoryboardPrompt(
   frame: StoryboardFrameSpec,
   context?: { allAssetIds?: string[] },
@@ -72,6 +93,9 @@ export function validateStoryboardPrompt(
 
   if (!frame.subject.description || !frame.subject.asset_id) {
     errors.push(issue("error", "missing_subject", "Frame subject is missing or unclear.", "subject", "Bind a visible subject asset before storyboard generation."));
+  }
+  if (frame.subject.asset_id && !subjectMatchesActiveAssets(frame)) {
+    errors.push(issue("error", "subject_asset_mismatch", "Frame subject does not match active asset bindings.", "subject", "Keep only the visible subject asset and matching supporting assets in this frame."));
   }
   if (!frame.frame_description || frame.frame_description.length < 6) {
     errors.push(issue("error", "missing_frame_description", "frame_description is missing.", "frame_description", "Provide one concrete static visual moment."));
@@ -94,11 +118,18 @@ export function validateStoryboardPrompt(
   if (hasPattern(visualPositive, CONTINUOUS_ACTION_PATTERNS)) {
     errors.push(issue("error", "continuous_action_in_positive_prompt", "Positive prompt contains multiple sequential actions.", "positive_prompt", "Keep one static key moment."));
   }
+  const actionNodes = detectActionNodes(frame.frame_description);
+  if (hasMultipleActionNodes(frame.frame_description)) {
+    errors.push(issue("error", "multiple_action_nodes", `Frame contains multiple visual action nodes: ${actionNodes.map((node) => node.label).join(", ")}.`, "frame_description", "Split this shot into separate StoryboardFrameSpec items."));
+  }
   if (hasPattern(visualPositive, CAMERA_MOVEMENT_PATTERNS)) {
     errors.push(issue("error", "camera_movement_in_positive_prompt", "Positive prompt contains camera movement.", "positive_prompt", "Keep only static composition."));
   }
   if (hasPattern(visualPositive, EXPLICIT_GORE_PATTERNS)) {
     errors.push(issue("error", "explicit_gore_in_positive_prompt", "Positive prompt contains explicit gore or graphic injury.", "positive_prompt", "Use restrained non-graphic safety wording."));
+  }
+  if (containsPlaceholder(positive) || containsPlaceholder(frame.negative_prompt)) {
+    errors.push(issue("error", "placeholder_in_prompt", "Prompt contains compiler placeholder text.", "positive_prompt", "Compile production bible and asset bindings into concrete visual language."));
   }
 
   const active = activeIds(frame);
@@ -134,5 +165,6 @@ export function validateStoryboardPrompt(
     status: errors.length > 0 ? "invalid" : warnings.length > 0 ? "needs_review" : "valid",
     errors,
     warnings,
+    split_suggestions: splitSuggestionsFor(frame.metadata.source_text || frame.frame_description),
   };
 }

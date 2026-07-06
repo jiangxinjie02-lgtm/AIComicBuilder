@@ -4,6 +4,7 @@ import type {
   StoryboardLookup,
   StoryboardProductionBibleInput,
 } from "./types";
+import type { StoryboardFramePlan } from "./storyboard-frame-planner";
 import { selectActiveAssets } from "./active-asset-selector";
 import { compactText } from "./prompt-sanitizer";
 import { rewriteUnsafeVisuals } from "./safety-rewriter";
@@ -18,11 +19,11 @@ function safeIdPart(value: string, fallback: string) {
     .slice(0, 48) || fallback;
 }
 
-function buildFrameId(shot: NormalizedStoryboardShot, index: number) {
+function buildFrameId(shot: NormalizedStoryboardShot, shotIndex: number, frameIndex: number) {
   const episode = safeIdPart(shot.episode_id, "ep");
   const scene = safeIdPart(shot.scene_id, "scene");
-  const shotId = safeIdPart(shot.shot_id, `shot_${String(index + 1).padStart(2, "0")}`);
-  return `${episode}_${scene}_${shotId}_frame01`;
+  const shotId = safeIdPart(shot.shot_id, `shot_${String(shotIndex + 1).padStart(2, "0")}`);
+  return `${episode}_${scene}_${shotId}_frame${String(frameIndex + 1).padStart(2, "0")}`;
 }
 
 function buildComposition(shot: NormalizedStoryboardShot, frameDescription: string) {
@@ -46,11 +47,12 @@ function buildCamera(shot: NormalizedStoryboardShot) {
 export function buildStoryboardFrame(input: {
   shot: NormalizedStoryboardShot;
   shotIndex: number;
+  framePlan?: StoryboardFramePlan;
   lookup: StoryboardLookup;
   productionBible?: StoryboardProductionBibleInput | null;
 }): Omit<StoryboardFrameSpec, "positive_prompt" | "negative_prompt" | "validation"> {
   const staticDescription = normalizeStaticFrameDescription({
-    text: input.shot.frame_description || input.shot.action,
+    text: input.framePlan?.frameDescription || input.shot.frame_description || input.shot.action,
     fallback: input.shot.action || input.shot.source_text,
   });
   const safety = rewriteUnsafeVisuals(staticDescription);
@@ -69,7 +71,7 @@ export function buildStoryboardFrame(input: {
   });
 
   return {
-    frame_id: buildFrameId(input.shot, input.shotIndex),
+    frame_id: buildFrameId(input.shot, input.shotIndex, input.framePlan?.frameIndex ?? 0),
     shot_id: input.shot.shot_id,
     episode_id: input.shot.episode_id,
     scene_id: input.shot.scene_id,
@@ -84,6 +86,11 @@ export function buildStoryboardFrame(input: {
       sound_effect: input.shot.sound_effect,
       duration: input.shot.duration,
       voiceover: input.shot.voiceover,
+      source_text: input.framePlan?.sourceText || input.shot.source_text,
+      split_from_shot: input.framePlan?.splitFromShot || false,
+      frame_index: input.framePlan?.frameIndex ?? 0,
+      frame_count: input.framePlan?.frameCount ?? 1,
+      safety_rewrites: safety.rewrites,
     },
     status: "draft",
   };

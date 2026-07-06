@@ -146,6 +146,7 @@ export interface StoryboardValidationReport {
   status: StoryboardFrameStatus;
   errors: StoryboardValidationIssue[];
   warnings: StoryboardValidationIssue[];
+  split_suggestions?: string[];
 }
 
 export interface StoryboardFrameSpec {
@@ -169,6 +170,11 @@ export interface StoryboardFrameSpec {
     sound_effect: string;
     duration: string;
     voiceover: string;
+    source_text?: string;
+    split_from_shot?: boolean;
+    frame_index?: number;
+    frame_count?: number;
+    safety_rewrites?: string[];
   };
   positive_prompt: string;
   negative_prompt: string;
