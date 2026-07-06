@@ -18,6 +18,19 @@ export interface StoryboardFramePlan {
 }
 
 export function planStoryboardFramesForShot(shot: NormalizedStoryboardShot): StoryboardFramePlan[] {
+  if (shot.preplanned_frame) {
+    const text = sanitizePromptText(shot.frame_description || shot.action || shot.source_text || "");
+    return [{
+      frameIndex: 0,
+      frameCount: 1,
+      frameDescription: compactText(text || "single static storyboard key frame", 260),
+      sourceText: shot.source_text || text,
+      actionNodes: detectActionNodes(text),
+      splitFromShot: false,
+      splitSuggestions: [],
+    }];
+  }
+
   const rawText = collectShotVisualText(shot);
   const candidates = splitIntoStaticFrameCandidates(rawText);
   const useful = candidates

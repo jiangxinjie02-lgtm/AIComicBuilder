@@ -89,6 +89,9 @@ export interface NormalizedStoryboardShot {
   duration: string;
   lock_status: string;
   source_text: string;
+  planned_frame_id?: string;
+  preplanned_frame?: boolean;
+  planner_visible_asset_ids?: string[];
 }
 
 export interface StoryboardBoundAsset {
@@ -156,6 +159,7 @@ export interface StoryboardFrameSpec {
   scene_id: string;
   subject: StoryboardSubject;
   active_assets: StoryboardActiveAssets;
+  static_frame_description: string;
   frame_description: string;
   composition: string;
   camera: {

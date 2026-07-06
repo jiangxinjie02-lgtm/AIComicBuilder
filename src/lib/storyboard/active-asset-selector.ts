@@ -143,7 +143,7 @@ export function normalizeStoryboardShot(rawShot: unknown, index: number, lookup:
   const record = toRecord(rawShot);
   const camera = normalizeCamera(record.camera, record);
   const action = readString(record, ["action", "motionScript", "motion_script"]);
-  const frameDescription = readString(record, ["frame_description", "frameDescription", "startFrame", "prompt", "videoPrompt", "source_text", "sourceText"]);
+  const frameDescription = readString(record, ["static_frame_description", "staticFrameDescription", "frame_description", "frameDescription", "startFrame", "prompt", "videoPrompt", "source_text", "sourceText"]);
   const characterLegacyIds = parseStringArray(record.character_asset_ids ?? record.characterAssetIds ?? record.character_ids ?? record.characterIds);
   const propLegacyIds = parseStringArray(record.prop_asset_ids ?? record.propAssetIds ?? record.prop_ids ?? record.propIds);
   const sceneAsset = normalizeShotRef(record.scene_asset ?? record.sceneAsset, lookup)
@@ -188,7 +188,35 @@ export function normalizeStoryboardShot(rawShot: unknown, index: number, lookup:
     duration: readString(record, ["duration"]),
     lock_status: readString(record, ["lock_status", "lockStatus"]),
     source_text: sourceText,
+    planned_frame_id: readString(record, ["frame_id", "frameId"]),
+    preplanned_frame: Boolean(record.preplanned_frame ?? record.preplannedFrame),
+    planner_visible_asset_ids: collectPlannerVisibleAssetIds(record),
   };
+}
+
+function collectPlannerVisibleAssetIds(record: Record<string, unknown>) {
+  const ids: string[] = [];
+  const visit = (value: unknown, allowString = false) => {
+    if (!value) return;
+    if (typeof value === "string") {
+      if (allowString && value.trim()) ids.push(value.trim());
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, allowString));
+      return;
+    }
+    if (typeof value !== "object") return;
+    const item = value as Record<string, unknown>;
+    const assetId = readString(item, ["asset_id", "assetId"]);
+    if (assetId) ids.push(assetId);
+    Object.entries(item).forEach(([key, nested]) => {
+      if (["characters", "scene", "props"].includes(key)) visit(nested, true);
+    });
+  };
+  visit(record.active_assets ?? record.activeAssets);
+  visit(record.subject);
+  return unique(ids);
 }
 
 function uniqueRefs(refs: StoryboardAssetRef[]) {
@@ -292,11 +320,12 @@ export function selectActiveAssets(input: {
   const isVehicleOrComponentFrame = VEHICLE_TERMS.test(frameText) || COMPONENT_TERMS.test(frameText);
   const isBodyDetailFrame = BODY_DETAIL_TERMS.test(frameText);
   const isPersonFrame = PERSON_TERMS.test(frameText);
+  const plannerVisibleIds = new Set(input.shot.planner_visible_asset_ids ?? []);
 
   const mentionedCharacters = input.shot.characters
     .map((ref, index) => bindAsset(ref, "character", index === 0 ? "subject" : isReactionShot ? "reaction" : "background", input.lookup))
     .filter((asset): asset is StoryboardBoundAsset => Boolean(asset))
-    .filter((asset) => characterVisibleInFrame(asset, frameText, input.lookup));
+    .filter((asset) => plannerVisibleIds.has(asset.asset_id) || characterVisibleInFrame(asset, frameText, input.lookup));
   const fallbackCharacters =
     mentionedCharacters.length === 0 &&
     (!isVehicleOrComponentFrame || isBodyDetailFrame) &&
@@ -317,9 +346,9 @@ export function selectActiveAssets(input: {
   const explicitProps = input.shot.props
     .map((ref) => bindAsset(ref, "prop", "supporting", input.lookup))
     .filter((asset): asset is StoryboardBoundAsset => Boolean(asset))
-    .filter((asset) => propVisibleInFrame(asset, frameText, isVehicleOrComponentFrame));
+    .filter((asset) => plannerVisibleIds.has(asset.asset_id) || propVisibleInFrame(asset, frameText, isVehicleOrComponentFrame));
   const mentionedProps = Array.from(input.lookup.assetsById.values())
-    .filter((asset) => asset.type === "prop" && textMentionsAsset(frameText, asset))
+    .filter((asset) => asset.type === "prop" && (plannerVisibleIds.has(asset.id) || textMentionsAsset(frameText, asset)))
     .map((asset) => bindAsset({ asset_id: asset.id, variant_id: chooseBaseVariant(asset.id, input.lookup)?.id ?? "" }, "prop", "supporting", input.lookup))
     .filter((asset): asset is StoryboardBoundAsset => Boolean(asset));
   const fallbackProps =

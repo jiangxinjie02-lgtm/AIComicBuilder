@@ -20,6 +20,7 @@ function safeIdPart(value: string, fallback: string) {
 }
 
 function buildFrameId(shot: NormalizedStoryboardShot, shotIndex: number, frameIndex: number) {
+  if (shot.planned_frame_id) return safeIdPart(shot.planned_frame_id, `frame_${String(frameIndex + 1).padStart(2, "0")}`);
   const episode = safeIdPart(shot.episode_id, "ep");
   const scene = safeIdPart(shot.scene_id, "scene");
   const shotId = safeIdPart(shot.shot_id, `shot_${String(shotIndex + 1).padStart(2, "0")}`);
@@ -77,6 +78,7 @@ export function buildStoryboardFrame(input: {
     scene_id: input.shot.scene_id,
     subject: active.subject,
     active_assets: active.activeAssets,
+    static_frame_description: frameDescription,
     frame_description: frameDescription,
     composition: buildComposition(input.shot, frameDescription),
     camera: buildCamera(input.shot),
