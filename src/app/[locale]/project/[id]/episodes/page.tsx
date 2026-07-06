@@ -1362,6 +1362,24 @@ export default function EpisodesPage({
     );
   }
 
+  function renderAssetPreviewCard(asset: LibraryAsset) {
+    return (
+      <div className="w-[112px] overflow-hidden rounded-lg border border-[--border-subtle] bg-white shadow-sm transition-colors hover:border-primary/35">
+        <div className="flex h-[86px] items-center justify-center bg-[--surface] p-1.5">
+          <img
+            src={uploadUrl(asset.imageUrl || "")}
+            alt={asset.name}
+            className="h-full w-full object-contain"
+          />
+        </div>
+        <div className="border-t border-[--border-subtle] px-2 py-1.5">
+          <div className="truncate text-[11px] font-semibold leading-tight text-[--text-primary]">{asset.name}</div>
+          <div className="mt-0.5 truncate text-[10px] leading-tight text-[--text-muted]">{asset.subtitle}</div>
+        </div>
+      </div>
+    );
+  }
+
   function renderReferenceColumn(scene: StoryboardScene) {
     const sceneRefs = referenceAssetsForScene(scene);
     const characters = charactersForScene(scene);
@@ -1613,7 +1631,8 @@ export default function EpisodesPage({
   }
 
   function renderSelectedAssetChip(scene: DraftScene, category: AssetCategory, asset: LibraryAsset) {
-    const visual = Boolean(asset.imageUrl) || category === "characters";
+    const hasImage = Boolean(asset.imageUrl);
+    const visual = hasImage || category === "characters";
     return (
       <div key={asset.id} className="group relative inline-flex">
         <button
@@ -1622,8 +1641,10 @@ export default function EpisodesPage({
           title={asset.description || asset.visualHint || asset.name}
           className="text-left"
         >
-          {visual
-            ? renderAssetThumb(asset.name, asset.subtitle, asset.imageUrl)
+          {hasImage
+            ? renderAssetPreviewCard(asset)
+            : visual
+              ? renderAssetThumb(asset.name, asset.subtitle, asset.imageUrl)
             : renderTextChip(asset.name, asset.subtitle)}
         </button>
         <button
