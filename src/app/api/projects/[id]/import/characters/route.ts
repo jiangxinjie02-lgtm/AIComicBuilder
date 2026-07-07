@@ -63,6 +63,11 @@ function asStringArray(value: unknown): string[] {
   return value.map((item) => String(item || "").trim()).filter(Boolean);
 }
 
+function storyMetaOnlyAnalysis(analysis?: StoryAssetAnalysis | null): StoryAssetAnalysis | null {
+  if (!analysis?.storyMeta) return null;
+  return { storyMeta: analysis.storyMeta };
+}
+
 function sourceAssetId(asset: PersistedAsset) {
   return String(asRecord(asset.metadata).sourceAssetId || "");
 }
@@ -248,7 +253,7 @@ export async function POST(
     assetProject = analyzeScriptAssets({
       title: project.title,
       script: scriptForAssetExtraction,
-      storyAnalysis: body.storyAnalysis || null,
+      storyAnalysis: storyMetaOnlyAnalysis(body.storyAnalysis),
       aspectRatio: "16:9",
       targetSize: "1536x1024",
       style: "真人实拍",

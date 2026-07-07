@@ -877,6 +877,11 @@ interface StoryAssetAnalysis {
   };
 }
 
+function storyMetaOnlyAnalysis(analysis?: StoryAssetAnalysis | null): StoryAssetAnalysis | null {
+  if (!analysis?.storyMeta) return null;
+  return { storyMeta: analysis.storyMeta };
+}
+
 interface ScriptEnrichmentPreview {
   patches?: ScriptEnrichmentPatch[];
   enrichedText?: string;
@@ -1238,12 +1243,13 @@ export default function ImportPage({
           const parseMeta = parseLog?.metadata as { text?: string } | undefined;
           const storyLog = data.find((l: LogEntry) => l.step === 2 && l.status === "done" && l.metadata);
           const storyMeta = storyLog?.metadata as { text?: string; preview?: string; storyAnalysis?: StoryAssetAnalysis | null } | undefined;
+          const logStoryAnalysis = storyMetaOnlyAnalysis(storyMeta?.storyAnalysis ?? null);
           const restoredText = storyMeta?.text || parseMeta?.text || storyMeta?.preview;
           if (restoredText) setFullText(restoredText);
-          if (storyMeta?.storyAnalysis) setStoryAnalysis(storyMeta.storyAnalysis);
+          if (logStoryAnalysis) setStoryAnalysis(logStoryAnalysis);
           restoredTextForStyle = restoredText || "";
-          storyAnalysisForStyle = storyMeta?.storyAnalysis ?? null;
-          const logProjectStyleGuide = buildProjectStyleGuide(storyMeta?.storyAnalysis ?? null, restoredText || "");
+          storyAnalysisForStyle = logStoryAnalysis;
+          const logProjectStyleGuide = buildProjectStyleGuide(logStoryAnalysis, restoredText || "");
 
           const assetLog = data.find((l: LogEntry) => l.step === 3 && l.status === "done" && l.metadata);
           const assetMeta = assetLog?.metadata as {
@@ -1296,16 +1302,17 @@ export default function ImportPage({
           }
           if (typeof draft.fullText === "string") {
             setFullText(draft.fullText);
-            if (draftStepStatus[2] === "done" || draft.storyAnalysis?.assets) {
+            if (draftStepStatus[2] === "done") {
               enrichedTextRef.current = draft.fullText;
               detailSupplementedRef.current = true;
               setDetailSupplemented(true);
             }
           }
           if (Array.isArray(draft.reviewIssues)) setReviewIssues(draft.reviewIssues);
-          if (draft.storyAnalysis !== undefined) setStoryAnalysis(draft.storyAnalysis ?? null);
+          const draftStoryAnalysis = storyMetaOnlyAnalysis(draft.storyAnalysis ?? null);
+          if (draft.storyAnalysis !== undefined) setStoryAnalysis(draftStoryAnalysis);
           const draftProjectStyleGuide = buildProjectStyleGuide(
-            draft.storyAnalysis ?? storyAnalysisForStyle,
+            draftStoryAnalysis ?? storyAnalysisForStyle,
             typeof draft.fullText === "string" ? draft.fullText : restoredTextForStyle,
           );
           if (Array.isArray(draft.characters)) setCharacters(normalizeImportedCharacters(draft.characters, draftProjectStyleGuide));
@@ -1319,10 +1326,6 @@ export default function ImportPage({
           }
           if (Array.isArray(draft.confirmedEpisodeIndexes)) {
             setConfirmedEpisodeIndexes(new Set(draft.confirmedEpisodeIndexes));
-          }
-          if (typeof draft.enrichmentJobId === "string" && draft.enrichmentJobId) {
-            enrichmentJobIdRef.current = draft.enrichmentJobId;
-            setEnrichmentJobId(draft.enrichmentJobId);
           }
           if (typeof draft.intakeJobId === "string" && draft.intakeJobId) {
             restoredIntakeJobId = draft.intakeJobId;
@@ -1738,90 +1741,47 @@ export default function ImportPage({
   async function runStoryReview(text: string = fullText) {
     if (!text.trim()) return;
     if (!textGuard()) return;
+    if (!intakeJobId) {
+      const message = "请先重新上传并完成剧本标准化，再刷新审阅结果";
+      toast.error(message);
+      addLog(2, "error", message);
+      return;
+    }
 
     setCurrentStep(2);
     setStepStatus((prev) => ({ ...prev, 2: "running" }));
     setReviewIssues([]);
-    addLog(2, "running", intakeJobId ? "刷新剧本标准化审阅结果..." : "开始 AI 剧情审阅...");
+    addLog(2, "running", "刷新剧本标准化审阅结果...");
 
     try {
       setSelectedIssueIndexes(new Set());
       setActiveIssueIndex(null);
-      if (intakeJobId) {
-        const intakeRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}`);
-        if (!intakeRes.ok) {
-          const errData = await intakeRes.json().catch(() => ({}));
-          throw new Error(errData.error || `HTTP ${intakeRes.status}`);
-        }
-        const status = await intakeRes.json() as IntakeJobStatus;
-        const candidateText = status.candidate_text || text;
-        const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
-        setIntakeJobStatus(status);
-        setFullText(candidateText);
-        setReviewIssues(intakeReviewIssues);
-        setDetailSupplementReady(status.status === "awaiting_review" || status.status === "confirmed");
-        setStepStatus((prev) => ({ ...prev, 2: "idle" }));
-        addLog(2, "done", `剧本标准化审阅结果已刷新，发现 ${intakeReviewIssues.length} 个问题`);
-        await saveDraft({
-          ...buildDraftPayload(),
-          currentStep: 2,
-          stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
-          fullText: candidateText,
-          reviewIssues: intakeReviewIssues,
-          intakeJobId,
-          confirmedScriptVersionId: status.confirmed_script_version_id || confirmedScriptVersionId,
-        });
-        return;
+      const intakeRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}`);
+      if (!intakeRes.ok) {
+        const errData = await intakeRes.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${intakeRes.status}`);
       }
-      if (!detailSupplementedRef.current) {
-        setDetailSupplementReady(true);
-      }
-      const preparedReview: ReviewPreparation = {
-        text,
-        visualEnrichment: visualEnrichmentRef.current,
-      };
-      const reviewText = preparedReview.text;
-
-      const res = await apiFetch(`/api/projects/${projectId}/import/structure`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: reviewText,
-          visualEnrichment: preparedReview.visualEnrichment,
-          modelConfig: getModelConfig(),
-          concurrency: 2,
-        }),
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || `HTTP ${res.status}`);
-      }
-      const data = await res.json() as {
-        issues: StoryReviewIssue[];
-        storyAnalysis?: StoryAssetAnalysis | null;
-        usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
-      };
-      setReviewIssues(data.issues || []);
-      setStoryAnalysis(data.storyAnalysis || null);
-      const usageParts = [
-        typeof data.usage?.inputTokens === "number" ? `输入 ${data.usage.inputTokens}` : null,
-        typeof data.usage?.outputTokens === "number" ? `输出 ${data.usage.outputTokens}` : null,
-        typeof data.usage?.totalTokens === "number" ? `合计 ${data.usage.totalTokens}` : null,
-      ].filter(Boolean);
-      const usageSuffix = usageParts.length > 0 ? `，token：${usageParts.join(" / ")}` : "";
-      addLog(2, "done", data.issues?.length ? `AI 剧情审阅完成，发现 ${data.issues.length} 个问题${usageSuffix}` : `AI 剧情审阅完成，未发现明显问题${usageSuffix}`);
+      const status = await intakeRes.json() as IntakeJobStatus;
+      const candidateText = status.candidate_text || text;
+      const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+      setIntakeJobStatus(status);
+      setFullText(candidateText);
+      setReviewIssues(intakeReviewIssues);
+      setDetailSupplementReady(status.status === "awaiting_review" || status.status === "confirmed");
       setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+      addLog(2, "done", `剧本标准化审阅结果已刷新，发现 ${intakeReviewIssues.length} 个问题`);
       await saveDraft({
         ...buildDraftPayload(),
         currentStep: 2,
         stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
-        fullText: reviewText,
-        reviewIssues: data.issues || [],
-        storyAnalysis: data.storyAnalysis || null,
+        fullText: candidateText,
+        reviewIssues: intakeReviewIssues,
+        intakeJobId,
+        confirmedScriptVersionId: status.confirmed_script_version_id || confirmedScriptVersionId,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Review failed";
-      addLog(2, "error", intakeJobId ? `刷新剧本标准化审阅失败: ${msg}` : `AI 剧情审阅失败: ${msg}`);
+      addLog(2, "error", `刷新剧本标准化审阅失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 2: "error" }));
     }
   }
@@ -2004,7 +1964,7 @@ export default function ImportPage({
         content: fullText,
         reviewNotes: {
           reviewIssues,
-          storyAnalysis,
+          storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis),
         },
       }),
     });
@@ -2050,7 +2010,7 @@ export default function ImportPage({
         step: 2,
         status: "done",
         message: `剧情审阅通过，共 ${fullText.length} 字`,
-        metadata: { charCount: fullText.length, preview: fullText.slice(0, 2000), text: fullText, storyAnalysis },
+        metadata: { charCount: fullText.length, preview: fullText.slice(0, 2000), text: fullText, storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis) },
       }),
     });
     setCurrentStep(3);
@@ -2062,19 +2022,17 @@ export default function ImportPage({
       stepStatus: { ...stepStatus, 2: "done" },
       fullText,
       reviewIssues,
-      storyAnalysis,
+      storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis),
     });
     await runCharacterExtract(activeConfirmedScriptVersionId);
   }
 
   function updateStoryMetaField(field: keyof NonNullable<StoryAssetAnalysis["storyMeta"]>, value: string) {
     setStoryAnalysis((prev) => ({
-      ...(prev || {}),
       storyMeta: {
         ...(prev?.storyMeta || {}),
         [field]: value,
       },
-      assets: prev?.assets || { characters: [], scenes: [], props: [] },
     }));
   }
 
@@ -2100,7 +2058,7 @@ export default function ImportPage({
       const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ confirmedScriptVersionId: versionId, storyAnalysis }),
+        body: JSON.stringify({ confirmedScriptVersionId: versionId, storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis) }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -3523,13 +3481,17 @@ export default function ImportPage({
                 <Button
                   variant="outline"
                   onClick={() => runStoryReview()}
-                  disabled={stepTwoBusy || !fullText.trim()}
+                  disabled={stepTwoBusy || !fullText.trim() || !intakeJobId}
                   className="rounded-xl"
                 >
                   {stepTwoBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  {enrichmentRunning ? "AI补全中" : intakeJobId ? "刷新审阅结果" : reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
+                  {enrichmentRunning ? "AI补全中" : intakeJobId ? "刷新审阅结果" : "需重新标准化"}
                 </Button>
-                <Button onClick={confirmStoryReview} disabled={stepTwoBusy || !fullText.trim()} className="rounded-xl">
+                <Button
+                  onClick={confirmStoryReview}
+                  disabled={stepTwoBusy || !fullText.trim() || (!intakeJobId && !confirmedScriptVersionId)}
+                  className="rounded-xl"
+                >
                   {t("confirmStoryReview")}
                 </Button>
               </div>
