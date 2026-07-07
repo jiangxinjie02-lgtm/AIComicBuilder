@@ -5,7 +5,7 @@ import { eq, and, max } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
-import { findCharacterIdByName, syncImportAssets } from "@/lib/story-assets";
+import { findCharacterIdByName, pruneStaleImportDraftAssets, syncImportAssets } from "@/lib/story-assets";
 import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
 import { lockAssetLibraryVersion } from "@/lib/industrial-pipeline";
 
@@ -167,10 +167,12 @@ export async function POST(
     },
     { characterIdByName: await findCharacterIdByName(projectId) }
   );
+  const persistedAssetIds = new Set(persistedAssetRows.map((asset) => asset.id));
+  const prunedAssetCount = await pruneStaleImportDraftAssets(projectId, persistedAssetIds);
 
   await addImportLog(
     projectId, 5, "running",
-    `已写入资产库：人物 ${body.characters.length}、道具 ${body.items?.length || 0}、场景 ${body.environments?.length || 0}`
+    `已写入资产库：人物 ${body.characters.length}、道具 ${body.items?.length || 0}、场景 ${body.environments?.length || 0}${prunedAssetCount ? `，清理旧草稿资产 ${prunedAssetCount} 个` : ""}`
   );
 
   let assetLibraryVersion: Awaited<ReturnType<typeof lockAssetLibraryVersion>>;
@@ -181,6 +183,7 @@ export async function POST(
       reviewSummary: {
         source: "import_generate",
         assetCount: persistedAssetRows.length,
+        prunedAssetCount,
         characterCount: body.characters.length,
         itemCount: body.items?.length || 0,
         environmentCount: body.environments?.length || 0,
@@ -260,6 +263,7 @@ export async function POST(
       environmentCount: body.environments?.length || 0,
       voiceCount: body.voices?.length || 0,
       assetCount: persistedAssetRows.length,
+      prunedAssetCount,
       confirmedScriptVersionId: confirmedVersion.id,
       assetLibraryVersionId: assetLibraryVersion.id,
       items: body.items || [],
@@ -280,6 +284,7 @@ export async function POST(
     environmentCount: body.environments?.length || 0,
     voiceCount: body.voices?.length || 0,
     assetCount: persistedAssetRows.length,
+    prunedAssetCount,
     confirmedScriptVersionId: confirmedVersion.id,
     assetLibraryVersionId: assetLibraryVersion.id,
     assetLibraryVersion,

@@ -198,7 +198,9 @@ function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleG
   const faceTemplate = CHARACTER_FACE_TEMPLATES[roleKey] || character.faceTemplate || null;
   const profile = sanitizeCharacterProfile(character);
   const background = buildCharacterBackground(character, profile);
-  const variants = buildExpectedCharacterVariants(character, faceTemplate, profile);
+  const variants = character.variants?.length
+    ? character.variants
+    : buildExpectedCharacterVariants(character, faceTemplate, profile);
   const visualConstraints = ensureCharacterVisualConstraints(character, faceTemplate, roleKey);
   const compiledPrompt = compileImportAssetPrompt(
     "character",
@@ -1143,6 +1145,7 @@ export default function ImportPage({
   const [confirmedScriptVersionId, setConfirmedScriptVersionId] = useState<string | null>(null);
   const [assetLibraryVersionId, setAssetLibraryVersionId] = useState<string | null>(null);
   const intakePollingRef = useRef(false);
+  const persistedAssetsHydratedRef = useRef(false);
 
   // Step 0: Upload
   const [file, setFile] = useState<File | null>(null);
@@ -1480,7 +1483,7 @@ export default function ImportPage({
 
   useEffect(() => {
     if (!draftHydrated) return;
-    if (characters.length + items.length + environments.length > 0) return;
+    if (persistedAssetsHydratedRef.current) return;
     if (!(forceAssetWorkbench || currentStep >= 3 || stepStatus[3] === "done" || historyMode)) return;
 
     let cancelled = false;
@@ -1491,6 +1494,7 @@ export default function ImportPage({
         const data = await res.json() as { assets?: PersistedStoryAsset[] };
         const persistedAssets = Array.isArray(data.assets) ? data.assets : [];
         if (cancelled || persistedAssets.length === 0) return;
+        persistedAssetsHydratedRef.current = true;
         const projectStyleGuide = buildProjectStyleGuide(storyAnalysis, fullText);
         const persistedCharacters = persistedAssets
           .filter((asset) => asset.type === "character")
@@ -1514,14 +1518,11 @@ export default function ImportPage({
       cancelled = true;
     };
   }, [
-    characters.length,
     currentStep,
     draftHydrated,
-    environments.length,
     forceAssetWorkbench,
     fullText,
     historyMode,
-    items.length,
     projectId,
     stepStatus,
     storyAnalysis,

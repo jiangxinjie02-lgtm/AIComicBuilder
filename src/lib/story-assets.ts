@@ -137,6 +137,322 @@ function normalizeAliases(value: unknown): string[] {
   return [];
 }
 
+const CHARACTER_STATE_PATTERNS = [
+  "一身", "衣着", "衣衫", "身着", "穿着", "神情", "表情", "面容", "满身", "浑身",
+  "风尘满面", "衣衫褴褛", "狼狈便装", "硬朗冷峻", "坚毅冷峻", "壮实紧张",
+  "紧张", "冷峻", "坚毅", "疲惫", "虚弱", "受伤", "重伤", "断腿", "警觉", "惊恐", "愤怒",
+  "倒地", "眩晕倒地", "敬礼", "咆哮", "拍肩赞赏",
+];
+
+const CHARACTER_NOISE_NAMES = new Set([
+  "制作提示",
+  "厘清场景归属",
+  "客观视角",
+  "转场字幕",
+  "监狱画面",
+  "题材",
+  "核心",
+  "中立",
+  "忠诚",
+  "酷飒",
+]);
+
+const GROUP_CHARACTER_NAMES = [
+  "丧尸群",
+  "丧尸",
+  "联盟战士",
+  "战士",
+  "士兵",
+  "伤员",
+  "幸存者",
+  "难民",
+  "群众",
+  "村民",
+  "黑衣人",
+  "守卫",
+  "敌兵",
+  "工人",
+  "暴徒",
+  "混混",
+  "流寇",
+  "囚犯",
+];
+
+const PROP_BASE_KEYWORDS = [
+  "医疗箱", "物资箱", "工具箱", "录音笔", "对讲机", "手电筒", "玻璃杯", "水杯", "茶杯", "酒杯",
+  "重卡", "卡车", "汽车", "轿车", "摩托", "手枪", "步枪", "匕首", "钥匙", "手机", "电脑", "芯片",
+  "地图", "文件", "照片", "合同", "戒指", "项链", "玉佩", "令牌", "杯子", "面具", "制服", "外套",
+  "炸药", "炸弹", "手电", "遥控器", "水箱", "罐头", "背包", "针剂", "枪", "刀", "剑", "弓", "箱", "杯", "药", "信",
+];
+
+const SCENE_BASE_KEYWORDS = [
+  "军区一号会议室", "军区医院", "医院中医科", "医院楼顶", "高速服务区", "盘山公路",
+  "沈家客厅", "沈家厨房", "医院", "学校", "教室", "公司", "办公室", "客厅", "卧室", "厨房",
+  "地下室", "仓库", "工厂", "厂房", "实验室", "基地", "天台", "楼顶", "走廊", "街道", "公路",
+  "高速", "车站", "码头", "机场", "商场", "超市", "酒吧", "餐厅", "酒店", "旅馆", "警局", "牢房",
+  "森林", "荒野", "城堡", "避难所", "营地", "操场", "广场", "空间", "房间", "大厅", "屋顶", "据点",
+];
+
+function uniqueByCleanName<T extends { name?: string }>(items: T[]) {
+  const byName = new Map<string, T>();
+  for (const item of items) {
+    const name = normalizeName(item.name);
+    if (!name) continue;
+    if (!byName.has(name)) {
+      byName.set(name, { ...item, name });
+      continue;
+    }
+    byName.set(name, mergeDraftLike(byName.get(name)!, item));
+  }
+  return [...byName.values()];
+}
+
+function mergeDraftLike<T extends { name?: string; variants?: unknown[]; description?: string; frequency?: number }>(existing: T, incoming: T): T {
+  return {
+    ...existing,
+    ...incoming,
+    name: existing.name || incoming.name,
+    assetId: (existing as ImportAssetDraft).assetId || (incoming as ImportAssetDraft).assetId,
+    confirmed: Boolean((existing as ImportAssetDraft).confirmed || (incoming as ImportAssetDraft).confirmed),
+    imageUrl: (existing as ImportAssetDraft).imageUrl || (incoming as ImportAssetDraft).imageUrl,
+    prompt: (existing as ImportAssetDraft).prompt || (incoming as ImportAssetDraft).prompt,
+    negativePrompt: (existing as ImportAssetDraft).negativePrompt || (incoming as ImportAssetDraft).negativePrompt,
+    visualConstraints: (existing as ImportAssetDraft).visualConstraints || (incoming as ImportAssetDraft).visualConstraints,
+    frequency: Math.max(Number(existing.frequency || 0), Number(incoming.frequency || 0)) || existing.frequency || incoming.frequency,
+    description: String(incoming.description || "").length > String(existing.description || "").length
+      ? incoming.description
+      : existing.description || incoming.description,
+    variants: mergeVariantDrafts(existing.variants, incoming.variants),
+  };
+}
+
+function mergeVariantDrafts(...variantLists: Array<unknown[] | undefined>) {
+  const seen = new Set<string>();
+  const variants: ImportAssetVariantDraft[] = [];
+  for (const list of variantLists) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object") continue;
+      const variant = raw as ImportAssetVariantDraft;
+      const name = normalizeName(variant.name || variant.id || variant.description || variant.state);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      variants.push({ ...variant, name });
+    }
+  }
+  return variants;
+}
+
+function findLongestKeyword(value: string, keywords: string[]) {
+  return [...keywords]
+    .sort((a, b) => b.length - a.length)
+    .find((keyword) => value.includes(keyword)) || "";
+}
+
+function normalizeVariantStateText(value: string) {
+  return cleanText(value)
+    .replace(/[“”"「」『』《》【】]/g, "")
+    .replace(/[，。！？；、,.!?;]+/g, " ")
+    .replace(/\s+/g, "")
+    .replace(/^(的|被|已|已经|正在|两名|两位|一名|一位|一群|一队)/, "")
+    .replace(/(滚到|落到|掉到|摔到|放在|放到|拿到|递给|旁边|地上|一旁).*$/g, "")
+    .replace(/(的|后|中|状态|版本)$/g, "")
+    .trim()
+    .slice(0, 24);
+}
+
+function makeVariantDraft(
+  assetName: string,
+  stateText: string,
+  assetType: StoryAssetType,
+  source?: ImportAssetDraft,
+): ImportAssetVariantDraft {
+  const normalizedState = normalizeVariantStateText(stateText) || "剧情状态";
+  const variantType = assetType === "character"
+    ? inferCharacterVariantType(normalizedState)
+    : assetType === "prop"
+      ? inferPropVariantType(normalizedState)
+      : inferSceneVariantType(normalizedState);
+  const suffix = assetType === "scene" ? "变体" : "状态";
+  return {
+    name: `${assetName}${normalizedState}${suffix}`,
+    variantType,
+    state: normalizedState,
+    description: assetType === "character"
+      ? `${normalizedState}：同一角色的剧情状态变体，保持身份、脸型、五官和辨识度一致。`
+      : assetType === "prop"
+        ? `${normalizedState}：同一物品的剧情状态变体，保持核心形状、材质、比例和标志性细节一致。`
+        : `${normalizedState}：同一场景的时间、天气、灯光或陈设状态变体，空间结构和主要陈设保持一致。`,
+    prompt: source?.prompt || source?.visualConstraints || "",
+    visualConstraints: source?.visualConstraints || source?.description || "",
+  };
+}
+
+function inferCharacterVariantType(stateText: string) {
+  if (/衣|服|便装|制服|装束|夹克|外套|睡衣|正装|礼服|军装|作战/.test(stateText)) return "costume";
+  if (/伤|血|虚弱|疲惫|狼狈|倒地|眩晕|断腿/.test(stateText)) return "injury";
+  if (/神情|表情|紧张|坚毅|冷峻|惊恐|愤怒|警觉|咆哮|敬礼/.test(stateText)) return "emotion";
+  if (/丧尸|战士|士兵|伤员|群/.test(stateText)) return "group_state";
+  if (/壮实|瘦弱|高大|矮小|风尘/.test(stateText)) return "body_state";
+  return "appearance";
+}
+
+function inferPropVariantType(stateText: string) {
+  if (/破|碎|裂|断|损|坏|旧|烧焦|磨损|撕/.test(stateText)) return "damaged";
+  if (/血|污|脏|湿/.test(stateText)) return "stained";
+  if (/打开|开启|展开|翻开|拆开/.test(stateText)) return "open";
+  if (/关闭|合上|锁|封/.test(stateText)) return "closed";
+  if (/空|满|装满|塞满|物资/.test(stateText)) return "load_state";
+  if (/佩戴|戴上|穿上|披上/.test(stateText)) return "worn";
+  return "condition";
+}
+
+function inferSceneVariantType(stateText: string) {
+  if (/雨|暴雨|下雨|雪|暴雪|下雪|雾|烟雾|晴|阴/.test(stateText)) return "weather";
+  if (/日|白天|清晨|早晨|上午|中午|午后|夜|晚上|深夜|凌晨|黄昏|傍晚/.test(stateText)) return "time_of_day";
+  if (/逆光|昏暗|灯光|霓虹/.test(stateText)) return "lighting";
+  if (/废弃|破败|坍塌|烧毁|爆炸|战斗/.test(stateText)) return "damage_state";
+  if (/空旷|拥挤|混乱|封锁/.test(stateText)) return "set_dressing";
+  return "scene_state";
+}
+
+function characterStateOnly(name: string) {
+  const value = normalizeVariantStateText(name);
+  if (!value) return false;
+  if (/^(神情|表情|面容|衣着|衣衫|身着|穿着|一身|满身|浑身)/.test(value)) return true;
+  return CHARACTER_STATE_PATTERNS.some((pattern) => value === pattern);
+}
+
+function splitCharacterDraftName(name: string, baseNames: string[]) {
+  const value = normalizeName(name)
+    .replace(/^(两名|两位|一名|一位|数名|几名|多名|一群|一队)/, "")
+    .replace(/(两名|两位|数名|几名|多名)$/, "");
+  if (!value || CHARACTER_NOISE_NAMES.has(value) || /^景\d+$/.test(value)) return { drop: true as const };
+  if (/^[一二两三四五六七八九十0-9]+人$/.test(value)) return { drop: true as const };
+  if (characterStateOnly(value)) return { drop: true as const, stateText: value };
+
+  const explicitBase = baseNames
+    .filter((base) => base !== value && value.startsWith(base) && value.length > base.length)
+    .sort((a, b) => b.length - a.length)[0];
+  if (explicitBase) {
+    const stateText = normalizeVariantStateText(value.slice(explicitBase.length));
+    if (stateText && (characterStateOnly(stateText) || /敬礼|咆哮|拍肩|赞赏|倒地|断腿/.test(stateText))) {
+      return { assetName: explicitBase, stateText };
+    }
+  }
+
+  const groupBase = GROUP_CHARACTER_NAMES
+    .filter((base) => value.startsWith(base) && value.length > base.length)
+    .sort((a, b) => b.length - a.length)[0];
+  if (groupBase) return { assetName: groupBase, stateText: normalizeVariantStateText(value.slice(groupBase.length)) };
+
+  const stateMatch = CHARACTER_STATE_PATTERNS
+    .filter((state) => value.endsWith(state) && value.length > state.length + 1)
+    .sort((a, b) => b.length - a.length)[0];
+  if (stateMatch) {
+    const assetName = normalizeName(value.slice(0, value.length - stateMatch.length));
+    if (assetName.length >= 2) return { assetName, stateText: stateMatch };
+  }
+
+  return { assetName: value };
+}
+
+function propVariantStateFromName(name: string, baseName: string) {
+  const direct = name.match(/(未开封|未拆|完好|崭新|干净|完整|破损|破碎|碎裂|裂开|裂痕|断裂|断掉|损坏|摔坏|砸坏|烧焦|磨损|染血|沾血|血迹|污渍|脏污|打开|开启|展开|翻开|拆开|关闭|合上|锁上|封住|收起|空的|空箱|空包|空瓶|装满|满满|塞满|佩戴|戴上|穿上|披上|丢失|湿透|湿漉|旧|碎|裂|断|脏|湿|撕)/);
+  if (direct) return normalizeVariantStateText(direct[1]);
+  return normalizeVariantStateText(name.replace(baseName, ""));
+}
+
+function sceneVariantStateFromName(name: string, baseName: string) {
+  const direct = name.match(/(白天|清晨|早晨|上午|中午|午后|夜晚|晚上|深夜|凌晨|黄昏|傍晚|雨夜|雨天|暴雨|下雨|雪夜|下雪|雾天|烟雾|晴天|阴天|逆光|昏暗|灯光|霓虹|废弃|破败|坍塌|烧毁|爆炸后|空旷|拥挤|混乱|战斗后|封锁|日|夜|雨|雪|雾)/);
+  if (direct) return normalizeVariantStateText(direct[1]);
+  return normalizeVariantStateText(name.replace(baseName, ""));
+}
+
+function normalizeCharacterDrafts(drafts: ImportAssetDraft[]) {
+  const baseNames = drafts
+    .map((draft) => normalizeName(draft.name))
+    .filter((name) => name.length >= 2 && !characterStateOnly(name) && !CHARACTER_NOISE_NAMES.has(name));
+  const byName = new Map<string, ImportAssetDraft>();
+  for (const draft of drafts) {
+    const split = splitCharacterDraftName(String(draft.name || ""), baseNames);
+    if ("drop" in split && split.drop) continue;
+    const assetName = normalizeName(split.assetName || draft.name);
+    if (!assetName || characterStateOnly(assetName) || CHARACTER_NOISE_NAMES.has(assetName)) continue;
+    const current = byName.get(assetName);
+    const normalized: ImportAssetDraft = {
+      ...draft,
+      name: assetName,
+      assetId: assetName === normalizeName(draft.name) ? draft.assetId : "",
+      variants: draft.variants || [],
+    };
+    if (split.stateText) {
+      normalized.variants = mergeVariantDrafts(normalized.variants, [
+        makeVariantDraft(assetName, split.stateText, "character", draft),
+      ]);
+    }
+    byName.set(assetName, current ? mergeDraftLike(current, normalized) : normalized);
+  }
+  return uniqueByCleanName([...byName.values()]);
+}
+
+function normalizeNamedAssetDrafts(drafts: ImportAssetDraft[], type: "prop" | "scene") {
+  const keywords = type === "prop" ? PROP_BASE_KEYWORDS : SCENE_BASE_KEYWORDS;
+  const byName = new Map<string, ImportAssetDraft>();
+  for (const draft of drafts) {
+    const rawName = normalizeName(draft.name);
+    const baseName = findLongestKeyword(rawName, keywords) || rawName;
+    if (type === "prop" && looksLikeFalsePropHit(rawName, baseName)) continue;
+    if (!baseName || baseName.length < 2) continue;
+    const stateText = type === "prop"
+      ? propVariantStateFromName(rawName, baseName)
+      : sceneVariantStateFromName(rawName, baseName);
+    const shouldFoldVariant = rawName !== baseName
+      && stateText
+      && (type === "prop" ? inferPropVariantType(stateText) !== "condition" || /完好|完整|干净/.test(stateText) : inferSceneVariantType(stateText) !== "scene_state");
+    const shouldFoldWrapper = rawName !== baseName
+      && rawName.length > baseName.length + 3
+      && (type === "prop"
+        ? /(取出|拿起|递出|伸手|制造|缓缓|他的|她的|被彻底|残骸)/.test(rawName)
+        : /(墙面|科幻|里面|外面|附近|门口|来到|进入|走进|冲进)/.test(rawName));
+    const assetName = shouldFoldVariant || shouldFoldWrapper ? baseName : rawName;
+    if (!assetName || assetName.length < 2 || assetName.length > 18) continue;
+    const normalized: ImportAssetDraft = {
+      ...draft,
+      name: assetName,
+      assetId: assetName === rawName ? draft.assetId : "",
+      variants: draft.variants || [],
+    };
+    if (shouldFoldVariant) {
+      normalized.variants = mergeVariantDrafts(normalized.variants, [
+        makeVariantDraft(assetName, stateText, type, draft),
+      ]);
+    }
+    const current = byName.get(assetName);
+    byName.set(assetName, current ? mergeDraftLike(current, normalized) : normalized);
+  }
+  return uniqueByCleanName([...byName.values()]);
+}
+
+function looksLikeFalsePropHit(name: string, baseName: string) {
+  if (!name || !baseName) return false;
+  if (baseName === "剑" && /(剑拔弩张|如利剑|利剑般)/.test(name)) return true;
+  if (baseName.length === 1 && /(气氛|光柱|黑暗|弓身|伸手)/.test(name)) return true;
+  return false;
+}
+
+function normalizeImportAssetsForSync(input: {
+  characters?: ImportAssetDraft[];
+  items?: ImportAssetDraft[];
+  environments?: ImportAssetDraft[];
+}) {
+  return {
+    characters: normalizeCharacterDrafts(input.characters || []),
+    items: normalizeNamedAssetDrafts(input.items || [], "prop"),
+    environments: normalizeNamedAssetDrafts(input.environments || [], "scene"),
+  };
+}
+
 function normalizeVariantDrafts(type: StoryAssetType, draft: ImportAssetDraft) {
   const rawVariants = Array.isArray(draft.variants)
     ? draft.variants
@@ -600,16 +916,17 @@ export async function syncImportAssets(
   },
   links?: { characterIdByName?: Map<string, string> },
 ) {
+  const normalizedInput = normalizeImportAssetsForSync(input);
   const created: AssetRow[] = [];
-  for (const draft of input.characters || []) {
+  for (const draft of normalizedInput.characters) {
     const row = await upsertStoryAsset(projectId, "character", draft, links);
     if (row) created.push(row);
   }
-  for (const draft of input.items || []) {
+  for (const draft of normalizedInput.items) {
     const row = await upsertStoryAsset(projectId, "prop", draft, links);
     if (row) created.push(row);
   }
-  for (const draft of input.environments || []) {
+  for (const draft of normalizedInput.environments) {
     const row = await upsertStoryAsset(projectId, "scene", draft, links);
     if (row) created.push(row);
   }
