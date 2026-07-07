@@ -46,6 +46,7 @@ interface FaceTemplate {
 
 export interface AssetAgentVariant {
   name: string;
+  variantType?: string;
   description?: string;
   prompt?: string;
   imageUrl?: string;
@@ -149,6 +150,15 @@ interface NamedSeed {
   type: string;
   contexts: string[];
   times?: string[];
+  variantHints?: AssetVariantHint[];
+}
+
+interface AssetVariantHint {
+  name: string;
+  description: string;
+  promptDetail: string;
+  variantType: string;
+  evidenceText?: string;
 }
 
 const FACE_TEMPLATES: Record<string, FaceTemplate> = {
@@ -287,6 +297,12 @@ const PROP_KEYWORDS: Array<{ keyword: string; type: string }> = [
   { keyword: "项链", type: "饰品" },
   { keyword: "玉佩", type: "饰品" },
   { keyword: "令牌", type: "标识物" },
+  { keyword: "玻璃杯", type: "容器" },
+  { keyword: "水杯", type: "容器" },
+  { keyword: "茶杯", type: "容器" },
+  { keyword: "酒杯", type: "容器" },
+  { keyword: "杯子", type: "容器" },
+  { keyword: "杯", type: "容器" },
   { keyword: "箱", type: "容器" },
   { keyword: "背包", type: "容器" },
   { keyword: "药", type: "医疗物资" },
@@ -351,6 +367,7 @@ const SCENE_KEYWORDS: Array<{ keyword: string; type: string }> = [
   { keyword: "城堡", type: "幻想建筑" },
   { keyword: "避难所", type: "据点" },
   { keyword: "营地", type: "据点" },
+  { keyword: "操场", type: "公共空间" },
   { keyword: "广场", type: "公共空间" },
 ];
 
@@ -370,8 +387,8 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
   const aiSceneSeeds = buildSceneSeedsFromAnalysis(input.storyAnalysis, characterNames);
   const rulePropSeeds = collectPropSeeds(lines, normalized, characterNames);
   const ruleSceneSeeds = collectSceneSeeds(sceneBuckets, lines, normalized, characterNames);
-  const propSeeds = mergeNamedSeeds(aiPropSeeds, rulePropSeeds);
-  const sceneSeeds = mergeNamedSeeds(aiSceneSeeds, ruleSceneSeeds);
+  const propSeeds = normalizePropSeeds(mergeNamedSeeds(aiPropSeeds, rulePropSeeds));
+  const sceneSeeds = normalizeSceneSeeds(mergeNamedSeeds(aiSceneSeeds, ruleSceneSeeds));
 
   const storyMeta = normalizeStoryMeta(input.storyAnalysis?.storyMeta);
   const settings: AssetPromptSettings = {
@@ -844,6 +861,246 @@ function mergeNamedSeeds(primary: NamedSeed[], fallback: NamedSeed[]) {
   return dedupeNamedSeeds([...primary, ...fallback]).sort((a, b) => b.score - a.score);
 }
 
+function normalizePropSeeds(seeds: NamedSeed[]) {
+  const byName = new Map<string, NamedSeed>();
+  const pendingHints: Array<{ seed: NamedSeed; hint: AssetVariantHint; targetName?: string }> = [];
+
+  function ensureBaseSeed(name: string, source: NamedSeed, type = inferPropType(name)) {
+    const normalizedName = normalizePropName(name);
+    if (!isProperPropAssetName(normalizedName)) return null;
+    const existing = byName.get(normalizedName);
+    if (existing) {
+      existing.score = Math.max(existing.score, Math.max(1, source.score - 1));
+      existing.type = existing.type || type || source.type;
+      existing.contexts = [...new Set([...existing.contexts, ...source.contexts])].slice(0, 12);
+      existing.times = [...new Set([...(existing.times || []), ...(source.times || [])])];
+      for (const hint of source.variantHints || []) appendNamedVariantHint(existing, hint);
+      return existing;
+    }
+    const created: NamedSeed = {
+      ...source,
+      name: normalizedName,
+      type: type || source.type || inferPropType(normalizedName),
+      score: Math.max(1, source.score - (source.name === normalizedName ? 0 : 1)),
+      contexts: source.contexts.slice(0, 12),
+      times: source.times || [],
+      variantHints: [],
+    };
+    byName.set(normalizedName, created);
+    for (const hint of source.variantHints || []) appendNamedVariantHint(created, hint);
+    return created;
+  }
+
+  for (const seed of seeds) {
+    const name = normalizePropName(seed.name);
+    const split = splitCompositePropStateName(name);
+    if (split) {
+      const baseSeed = ensureBaseSeed(split.assetName, seed, inferPropType(split.assetName));
+      if (baseSeed) {
+        pendingHints.push({
+          seed,
+          targetName: baseSeed.name,
+          hint: buildPropVariantHint(baseSeed.name, split.stateText, seed.contexts, baseSeed.type),
+        });
+      }
+      continue;
+    }
+    ensureBaseSeed(name, seed, seed.type || inferPropType(name));
+  }
+
+  const baseNames = [...byName.keys()].sort((a, b) => b.length - a.length);
+  for (const pending of pendingHints) {
+    const targetName = pending.targetName || findMentionedCharacterName(pending.seed.contexts, baseNames);
+    if (!targetName) continue;
+    const target = byName.get(targetName);
+    if (!target) continue;
+    appendNamedVariantHint(target, pending.hint);
+    target.contexts = [...new Set([...target.contexts, ...pending.seed.contexts])].slice(0, 12);
+    target.score = Math.max(target.score, pending.seed.score);
+  }
+
+  return [...byName.values()].sort((a, b) => b.score - a.score);
+}
+
+function normalizeSceneSeeds(seeds: NamedSeed[]) {
+  const byName = new Map<string, NamedSeed>();
+  const pendingHints: Array<{ seed: NamedSeed; hint: AssetVariantHint; targetName?: string; times?: string[] }> = [];
+
+  function ensureBaseSeed(name: string, source: NamedSeed, type = inferSceneType(name), times: string[] = []) {
+    const normalizedName = normalizeSceneAssetCandidate(name);
+    if (!isProperSceneAssetName(normalizedName)) return null;
+    const mergedTimes = [...new Set([...(source.times || []), ...times])];
+    const existing = byName.get(normalizedName);
+    if (existing) {
+      existing.score = Math.max(existing.score, Math.max(1, source.score - 1));
+      existing.type = existing.type || type || source.type;
+      existing.contexts = [...new Set([...existing.contexts, ...source.contexts])].slice(0, 12);
+      existing.times = [...new Set([...(existing.times || []), ...mergedTimes])];
+      for (const hint of source.variantHints || []) appendNamedVariantHint(existing, hint);
+      return existing;
+    }
+    const created: NamedSeed = {
+      ...source,
+      name: normalizedName,
+      type: type || source.type || inferSceneType(normalizedName),
+      score: Math.max(1, source.score - (source.name === normalizedName ? 0 : 1)),
+      contexts: source.contexts.slice(0, 12),
+      times: mergedTimes,
+      variantHints: [],
+    };
+    byName.set(normalizedName, created);
+    for (const hint of source.variantHints || []) appendNamedVariantHint(created, hint);
+    return created;
+  }
+
+  for (const seed of seeds) {
+    const name = normalizeSceneAssetCandidate(seed.name);
+    const split = splitCompositeSceneStateName(name);
+    if (split) {
+      const baseSeed = ensureBaseSeed(split.assetName, seed, inferSceneType(split.assetName), split.times);
+      if (baseSeed) {
+        pendingHints.push({
+          seed,
+          targetName: baseSeed.name,
+          times: split.times,
+          hint: buildSceneVariantHint(baseSeed.name, split.stateText, seed.contexts, split.times),
+        });
+      }
+      continue;
+    }
+    ensureBaseSeed(name, seed, seed.type || inferSceneType(name));
+  }
+
+  const baseNames = [...byName.keys()].sort((a, b) => b.length - a.length);
+  for (const pending of pendingHints) {
+    const targetName = pending.targetName || findMentionedCharacterName(pending.seed.contexts, baseNames);
+    if (!targetName) continue;
+    const target = byName.get(targetName);
+    if (!target) continue;
+    appendNamedVariantHint(target, pending.hint);
+    target.contexts = [...new Set([...target.contexts, ...pending.seed.contexts])].slice(0, 12);
+    target.times = [...new Set([...(target.times || []), ...(pending.times || [])])];
+    target.score = Math.max(target.score, pending.seed.score);
+  }
+
+  return [...byName.values()].sort((a, b) => b.score - a.score);
+}
+
+function appendNamedVariantHint(seed: NamedSeed, hint: AssetVariantHint) {
+  const name = normalizeNameForCompare(hint.name);
+  const existing = seed.variantHints || [];
+  if (!name || existing.some((item) => normalizeNameForCompare(item.name) === name)) return;
+  seed.variantHints = [...existing, hint].slice(0, 10);
+}
+
+function splitCompositePropStateName(name: string) {
+  const value = normalizePropName(name);
+  const assetName = findLongestKeyword(value, PROP_KEYWORDS.map((item) => item.keyword));
+  if (!assetName || value === assetName) return null;
+  const stateText = extractPropVariantStateText(value)
+    || normalizeVariantStateText(value.replace(new RegExp(escapeRegExp(assetName), "g"), ""));
+  if (!stateText || !isPropVariantStateText(stateText)) return null;
+  if (!isProperPropAssetName(assetName)) return null;
+  return { assetName, stateText };
+}
+
+function splitCompositeSceneStateName(name: string) {
+  const value = normalizeSceneAssetCandidate(name);
+  const assetName = findLongestSceneBaseName(value);
+  if (!assetName || value === assetName) return null;
+  const stateText = normalizeVariantStateText(value.replace(new RegExp(escapeRegExp(assetName), "g"), ""));
+  if (!stateText || !isSceneVariantStateText(stateText)) return null;
+  if (!isProperSceneAssetName(assetName)) return null;
+  return { assetName, stateText, times: extractTimeTags(stateText) };
+}
+
+function findLongestSceneBaseName(value: string) {
+  return findLongestKeyword(value, [
+    ...SCENE_KEYWORDS.map((item) => item.keyword),
+    "空间",
+    "房间",
+    "大厅",
+    "屋顶",
+    "据点",
+    "广场",
+    "营地",
+    "操场",
+  ]);
+}
+
+function normalizeVariantStateText(value: string) {
+  return cleanAssetName(value)
+    .replace(/^(的|被|已|已经|正在)/, "")
+    .replace(/(滚到|落到|掉到|摔到|放在|放到|拿到|递给|旁边|地上).*$/g, "")
+    .replace(/(的|后|中|状态|版本)$/g, "")
+    .trim();
+}
+
+function extractPropVariantStateText(value: string) {
+  const match = value.match(/(未开封|未拆|完好|崭新|干净|完整|破损|破碎|碎裂|裂开|裂痕|断裂|断掉|损坏|摔坏|砸坏|烧焦|磨损|染血|沾血|血迹|污渍|脏污|打开|开启|展开|翻开|拆开|关闭|合上|锁上|封住|收起|空的|空箱|空包|空瓶|装满|满满|塞满|佩戴|戴上|穿上|披上|丢失|湿透|湿漉|旧|碎|裂|断|脏|湿)/);
+  return match ? normalizeVariantStateText(match[1]) : "";
+}
+
+function isPropVariantStateText(value: string) {
+  return /(完好|崭新|干净|完整|破|碎|裂|断|损|坏|旧|烧焦|磨损|染血|血迹|污|脏|打开|开启|展开|翻开|拆开|关闭|合上|锁|封|空|满|装满|塞满|佩戴|戴上|穿上|披上|丢失|湿)/.test(value);
+}
+
+function isSceneVariantStateText(value: string) {
+  return /(日|白天|清晨|早晨|上午|中午|午后|夜|晚上|深夜|凌晨|黄昏|傍晚|雨|暴雨|下雨|雪|暴雪|下雪|雾|烟雾|晴|阴|逆光|昏暗|灯光|霓虹|废弃|破败|坍塌|烧毁|爆炸后|空旷|拥挤|混乱|战斗后|封锁)/.test(value);
+}
+
+function buildPropVariantHint(assetName: string, stateText: string, contexts: string[], type: string): AssetVariantHint {
+  const normalizedState = normalizeVariantStateText(stateText) || "剧情状态";
+  return {
+    name: `${assetName}${assetVariantLabelFromState(normalizedState)}`,
+    description: `${normalizedState}：同一物品在剧情中的状态变体，必须保持核心形状、材质、比例和标志性细节一致。`,
+    promptDetail: normalizedState,
+    variantType: inferPropVariantType(normalizedState, type),
+    evidenceText: contexts[0] || "",
+  };
+}
+
+function buildSceneVariantHint(assetName: string, stateText: string, contexts: string[], times: string[] = []): AssetVariantHint {
+  const normalizedState = normalizeVariantStateText(stateText) || times.join("、") || "剧情状态";
+  return {
+    name: `${assetName}${sceneVariantLabelFromState(normalizedState, times)}`,
+    description: `${normalizedState}：同一场景在剧情中的时间、天气、灯光或破损状态变体，空间结构和主要陈设保持一致。`,
+    promptDetail: normalizedState,
+    variantType: inferSceneVariantType(normalizedState, times),
+    evidenceText: contexts[0] || "",
+  };
+}
+
+function inferPropVariantType(stateText: string, type = "") {
+  if (/破|碎|裂|断|损|坏|旧|烧焦|磨损/.test(stateText)) return "damaged";
+  if (/血|污|脏|湿/.test(stateText)) return "stained";
+  if (/打开|开启|展开|翻开|拆开/.test(stateText)) return "open";
+  if (/关闭|合上|锁|封/.test(stateText)) return "closed";
+  if (/空|满|装满|塞满/.test(stateText)) return "load_state";
+  if (/佩戴|戴上|穿上|披上|制服|外套|面具/.test(`${stateText} ${type}`)) return "worn";
+  return "condition";
+}
+
+function inferSceneVariantType(stateText: string, times: string[] = []) {
+  if (/雨|暴雨|下雨|雪|暴雪|下雪|雾|烟雾|晴|阴/.test(stateText)) return "weather";
+  if (times.some((time) => time === "雨" || time === "雪" || time === "雾")) return "weather";
+  if (times.length || /日|白天|清晨|早晨|上午|中午|午后|夜|晚上|深夜|凌晨|黄昏|傍晚/.test(stateText)) return "time_of_day";
+  if (/逆光|昏暗|灯光|霓虹/.test(stateText)) return "lighting";
+  if (/废弃|破败|坍塌|烧毁|爆炸后|战斗后/.test(stateText)) return "damage_state";
+  if (/空旷|拥挤|混乱|封锁/.test(stateText)) return "set_dressing";
+  return "scene_state";
+}
+
+function assetVariantLabelFromState(stateText: string) {
+  const cleaned = normalizeVariantStateText(stateText);
+  return `${cleaned || stateText}状态`;
+}
+
+function sceneVariantLabelFromState(stateText: string, times: string[] = []) {
+  const cleaned = normalizeVariantStateText(stateText) || times.join("、");
+  return `${cleaned || stateText}变体`;
+}
+
 function buildCharacterSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null): CharacterSeed[] {
   const seen = new Set<string>();
   return (analysis?.assets?.characters || [])
@@ -977,7 +1234,7 @@ function makeCharacterAsset(
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
     },
-    variants: mergeCharacterVariants(
+    variants: mergeAssetVariants(
       suggestCharacterVariants(seed.name, seed.role, snippets, faceTemplate),
       variantHintsToAssetVariants(seed.name, seed.variantHints || [], faceTemplate),
     ),
@@ -1016,6 +1273,7 @@ function makePropAsset(
     },
   });
   const prompt = buildPropImagePrompt(seed.name, seed.type, description, settings.visualStyleGuide);
+  const explicitVariants = variantHintsToPropVariants(seed.name, seed.type, seed.variantHints || [], prompt);
 
   return {
     id: `prop_${index + 1}_${slugify(seed.name)}`,
@@ -1040,7 +1298,7 @@ function makePropAsset(
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
     },
-    variants: suggestPropVariants(seed.name, seed.type, sourceSnippets, prompt),
+    variants: explicitVariants.length ? explicitVariants : suggestPropVariants(seed.name, seed.type, sourceSnippets, prompt),
     imageUrl: "",
     history: [],
   };
@@ -1102,7 +1360,10 @@ function makeSceneAsset(
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
     },
-    variants: suggestSceneVariants(seed.name, times, prompt),
+    variants: mergeAssetVariants(
+      suggestSceneVariants(seed.name, times, prompt),
+      variantHintsToSceneVariants(seed.name, seed.variantHints || [], prompt),
+    ),
     imageUrl: "",
     history: [],
   };
@@ -1368,12 +1629,18 @@ function mergeSeed(map: Map<string, NamedSeed>, incoming: NamedSeed) {
   const key = incoming.name.toLowerCase();
   const existing = map.get(key);
   if (!existing) {
-    map.set(key, { ...incoming, contexts: incoming.contexts.slice(0, 6), times: incoming.times || [] });
+    map.set(key, {
+      ...incoming,
+      contexts: incoming.contexts.slice(0, 6),
+      times: incoming.times || [],
+      variantHints: incoming.variantHints || [],
+    });
     return;
   }
   existing.score += incoming.score;
   existing.contexts = [...new Set([...existing.contexts, ...incoming.contexts])].slice(0, 8);
   existing.times = [...new Set([...(existing.times || []), ...(incoming.times || [])])];
+  for (const hint of incoming.variantHints || []) appendNamedVariantHint(existing, hint);
 }
 
 function dedupeNamedSeeds(seeds: NamedSeed[]) {
@@ -1389,7 +1656,20 @@ function dedupeNamedSeeds(seeds: NamedSeed[]) {
       (existing.name.includes(seed.name) && seed.name.length <= 4) ||
       (seed.name.includes(existing.name) && existing.name.length <= 4)
     );
-    if (!duplicate) results.push(seed);
+    if (!duplicate) {
+      results.push(seed);
+      continue;
+    }
+    const target = results.find((existing) =>
+      existing.name === seed.name ||
+      existing.name.includes(seed.name) ||
+      seed.name.includes(existing.name)
+    );
+    if (target) {
+      target.contexts = [...new Set([...target.contexts, ...seed.contexts])].slice(0, 8);
+      target.times = [...new Set([...(target.times || []), ...(seed.times || [])])];
+      for (const hint of seed.variantHints || []) appendNamedVariantHint(target, hint);
+    }
   }
   return results;
 }
@@ -1792,6 +2072,7 @@ function variantHintsToAssetVariants(name: string, hints: CharacterVariantHint[]
     : "锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；";
   return hints.map((hint) => ({
     name: hint.name,
+    variantType: hint.variantType,
     description: hint.description,
     prompt: `人物资产变体，${name}，${hint.promptDetail}，${faceLock}真人实拍摄影质感，只改变服装、妆造、表情、体态或剧情状态，不改变角色身份。纯白背景。`,
     imageUrl: "",
@@ -1799,7 +2080,33 @@ function variantHintsToAssetVariants(name: string, hints: CharacterVariantHint[]
   }));
 }
 
-function mergeCharacterVariants(primary: AssetAgentVariant[], secondary: AssetAgentVariant[]) {
+function variantHintsToPropVariants(name: string, type: string, hints: AssetVariantHint[], basePrompt: string): AssetAgentVariant[] {
+  if (!hints.length) return [];
+  const identityRule = `物品资产变体，${name}，${type}；严格保持同一物品的核心形状、材质、比例、颜色体系和标志性细节，只改变剧情状态；无人物、无手、无文字水印。`;
+  return hints.map((hint) => ({
+    name: hint.name,
+    variantType: hint.variantType,
+    description: hint.description,
+    prompt: `${basePrompt}\n\n【变体要求】${identityRule}${hint.promptDetail}。`,
+    imageUrl: "",
+    history: [],
+  }));
+}
+
+function variantHintsToSceneVariants(name: string, hints: AssetVariantHint[], basePrompt: string): AssetAgentVariant[] {
+  if (!hints.length) return [];
+  const identityRule = `场景资产变体，${name}；严格保持同一空间结构、主要陈设、镜头高度、镜头方位和空间比例一致，只改变时间、天气、灯光、氛围或剧情状态；无人物、无文字水印。`;
+  return hints.map((hint) => ({
+    name: hint.name,
+    variantType: hint.variantType,
+    description: hint.description,
+    prompt: `${basePrompt}\n\n【变体要求】${identityRule}${hint.promptDetail}。`,
+    imageUrl: "",
+    history: [],
+  }));
+}
+
+function mergeAssetVariants(primary: AssetAgentVariant[], secondary: AssetAgentVariant[]) {
   const seen = new Set<string>();
   return [...primary, ...secondary].filter((variant) => {
     const key = cleanAssetName(variant.name || variant.description || "");
@@ -1814,6 +2121,7 @@ function suggestSceneVariants(name: string, times: string[], basePrompt: string)
   if (normalizedTimes.length < 2) return [];
   return normalizedTimes.map((time) => ({
     name: `${name}${time}变体`,
+    variantType: inferSceneVariantType(time, extractTimeTags(time)),
     description: `同一场景的${time}版本，空间结构、陈设和镜头方位不变。`,
     prompt: `${basePrompt}\n\n【变体要求】${time}版本。保持同一空间结构、主要陈设、镜头高度和镜头方位一致，只改变自然光/灯光、天气氛围和时间段。`,
     imageUrl: "",
@@ -1823,46 +2131,53 @@ function suggestSceneVariants(name: string, times: string[], basePrompt: string)
 
 function suggestPropVariants(name: string, type: string, snippets: string[], basePrompt: string) {
   const joined = snippets.join(" ");
-  const variantRules: Array<{ test: RegExp; suffix: string; description: string; promptDetail: string }> = [
+  const variantRules: Array<{ test: RegExp; suffix: string; variantType: string; description: string; promptDetail: string }> = [
     {
       test: /完好|崭新|干净|未拆|未开封|完整/,
       suffix: "完好状态",
+      variantType: "condition",
       description: "完好状态：保留物品的基础造型、材质、比例和可识别细节，表面干净完整。",
       promptDetail: "完好状态，表面完整干净，材质和标志性细节清晰",
     },
     {
       test: /破损|损坏|裂|碎|断|摔坏|砸坏|烧焦|磨损|旧/,
       suffix: "破损状态",
+      variantType: "damaged",
       description: "破损状态：同一物品在剧情受损后的版本，只改变破损、磨损、烧焦或裂痕等状态。",
       promptDetail: "破损状态，保留同一物品核心造型，增加磨损、裂痕或损坏痕迹",
     },
     {
       test: /血|染血|血迹/,
       suffix: "染血状态",
+      variantType: "stained",
       description: "染血状态：同一物品沾染血迹或污渍后的剧情版本，形状和材质保持一致。",
       promptDetail: "染血状态，局部血迹或污渍，核心形状材质不变",
     },
     {
       test: /打开|开启|展开|翻开|拆开/,
       suffix: "打开状态",
+      variantType: "open",
       description: "打开状态：同一物品被打开、展开或拆开的版本，突出内部结构和使用状态。",
       promptDetail: "打开状态，展示内部结构或展开形态，保持同一物品识别度",
     },
     {
       test: /关闭|合上|锁上|封住|收起/,
       suffix: "关闭状态",
+      variantType: "closed",
       description: "关闭状态：同一物品合上、锁住或收起后的版本，外形轮廓稳定统一。",
       promptDetail: "关闭状态，外部轮廓清晰，锁扣或封闭结构可见",
     },
     {
       test: /空的|空箱|空包|空瓶|装满|满满|塞满|物资/,
       suffix: "装载状态",
+      variantType: "load_state",
       description: "装载状态：同一容器或物资类道具在空、满或装载物资时的剧情版本。",
       promptDetail: "装载状态，体现空满差异或内部物资，外部结构保持一致",
     },
     {
       test: /佩戴|戴上|穿上|披上|制服|外套|面具/,
       suffix: "佩戴状态",
+      variantType: "worn",
       description: "佩戴状态：同一服饰或随身物品被穿戴/佩戴时的版本，强调材质和识别符号。",
       promptDetail: "佩戴状态，服饰或随身物品处于被使用状态，核心设计一致",
     },
@@ -1872,6 +2187,7 @@ function suggestPropVariants(name: string, type: string, snippets: string[], bas
   const identityRule = `物品资产变体，${name}，${type}；严格保持同一物品的核心形状、材质、比例、颜色体系和标志性细节，只改变剧情状态；无人物、无手、无文字水印。`;
   return selected.map((rule) => ({
     name: `${name}${rule.suffix}`,
+    variantType: rule.variantType,
     description: rule.description,
     prompt: `${basePrompt}\n\n【变体要求】${identityRule}${rule.promptDetail}。`,
     imageUrl: "",

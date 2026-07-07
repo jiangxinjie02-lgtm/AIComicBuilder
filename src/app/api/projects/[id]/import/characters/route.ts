@@ -89,6 +89,7 @@ function mapPersistedVariant(variant: Record<string, unknown>) {
   return {
     id: String(variant.id || ""),
     name: String(variant.name || "资产变体"),
+    variantType: String(variant.variantType || ""),
     description: String(variant.state || variant.visualConstraints || ""),
     prompt: String(changedTraits.prompt || variant.visualConstraints || variant.state || ""),
     imageUrl: String(variant.referenceImage || ""),

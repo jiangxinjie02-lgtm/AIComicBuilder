@@ -69,6 +69,7 @@ interface ExtractedCharacter {
 interface AssetVariant {
   id?: string;
   name: string;
+  variantType?: string;
   description?: string;
   prompt?: string;
   imageUrl?: string;
@@ -887,6 +888,7 @@ function storyMetaOnlyAnalysis(analysis?: StoryAssetAnalysis | null): StoryAsset
 interface PersistedAssetVariant {
   id?: string;
   name?: string;
+  variantType?: string;
   state?: string;
   visualConstraints?: string;
   referenceImage?: string | null;
@@ -933,6 +935,7 @@ function persistedVariantToWorkbench(variant: PersistedAssetVariant): AssetVaria
   return {
     id: String(variant.id || ""),
     name: String(variant.name || "资产变体"),
+    variantType: String(variant.variantType || ""),
     description: String(variant.state || variant.visualConstraints || ""),
     prompt: String(changedTraits.prompt || variant.visualConstraints || variant.state || ""),
     imageUrl: String(variant.referenceImage || ""),
