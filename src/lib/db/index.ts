@@ -173,6 +173,9 @@ export function ensureImportStatesTable() {
       "confirmed_episode_indexes" text,
       "shot_review" text,
       "enrichment_job_id" text,
+      "intake_job_id" text,
+      "confirmed_script_version_id" text,
+      "asset_library_version_id" text,
       "updated_at" integer NOT NULL,
       FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade
     )
@@ -182,6 +185,15 @@ export function ensureImportStatesTable() {
   }
   if (!columnExists(sqlite, "import_states", "enrichment_job_id")) {
     sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "enrichment_job_id" text`).run();
+  }
+  if (!columnExists(sqlite, "import_states", "intake_job_id")) {
+    sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "intake_job_id" text`).run();
+  }
+  if (!columnExists(sqlite, "import_states", "confirmed_script_version_id")) {
+    sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "confirmed_script_version_id" text`).run();
+  }
+  if (!columnExists(sqlite, "import_states", "asset_library_version_id")) {
+    sqlite.prepare(`ALTER TABLE "import_states" ADD COLUMN "asset_library_version_id" text`).run();
   }
 }
 
@@ -513,6 +525,7 @@ export function ensureStoryPipelineTables() {
       "content_hash" text DEFAULT '',
       "raw_text" text DEFAULT '' NOT NULL,
       "cleaned_text" text DEFAULT '',
+      "structured_json" text,
       "status" text DEFAULT 'uploaded' NOT NULL,
       "metadata" text,
       "created_at" integer NOT NULL,
@@ -523,6 +536,9 @@ export function ensureStoryPipelineTables() {
   `).run();
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_scripts_project" ON "scripts" ("project_id")`).run();
   sqlite.prepare(`CREATE INDEX IF NOT EXISTS "idx_scripts_episode" ON "scripts" ("episode_id")`).run();
+  if (!columnExists(sqlite, "scripts", "structured_json")) {
+    sqlite.prepare(`ALTER TABLE "scripts" ADD COLUMN "structured_json" text`).run();
+  }
 
   sqlite.prepare(`
     CREATE TABLE IF NOT EXISTS "script_chunks" (

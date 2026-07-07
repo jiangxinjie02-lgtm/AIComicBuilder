@@ -109,6 +109,27 @@ interface IntakeJobStatus {
   candidate_text?: string;
   error_message?: string;
   confirmed_script_version_id?: string;
+  issue_summary?: {
+    total?: number;
+    high?: number;
+    medium?: number;
+    low?: number;
+  };
+  stages?: Array<{
+    stage: string;
+    sequence: number;
+    status: "pending" | "running" | "completed" | "failed" | "skipped";
+    issues?: Array<{
+      stage?: string;
+      severity?: "high" | "medium" | "low";
+      category?: string;
+      message?: string;
+      text?: string;
+      suggestion?: string;
+    }>;
+    result?: unknown;
+    error_message?: string;
+  }>;
 }
 
 type AssetTab = "characters" | "items" | "environments" | "voices";
@@ -799,6 +820,48 @@ interface StoryReviewIssue {
   applied?: boolean;
 }
 
+function categoryFromIntakeIssue(stage: string, category?: string): StoryReviewIssue["category"] {
+  const key = `${stage} ${category || ""}`.toLowerCase();
+  if (/compliance|risk|symbol|violence|crime|sexual|medical|state|law/.test(key)) return "prohibited";
+  if (/continuity/.test(key)) return "continuity";
+  if (/setting|era|world/.test(key)) return "setting";
+  if (/structure|format|logic/.test(key)) return "logic";
+  return "other";
+}
+
+function severityFromIntakeIssue(severity?: string): StoryReviewIssue["severity"] {
+  if (severity === "high" || severity === "low") return severity;
+  return "medium";
+}
+
+function intakeIssuesToStoryIssues(status: IntakeJobStatus, sourceText: string): StoryReviewIssue[] {
+  const issues = (status.stages || []).flatMap((stage) =>
+    (stage.issues || []).map((issue) => {
+      const exactQuote = String(issue.text || "").trim();
+      const suggestion = String(issue.suggestion || "").trim();
+      const hasSourceQuote = exactQuote && sourceText.includes(exactQuote);
+      return {
+        category: categoryFromIntakeIssue(stage.stage, issue.category),
+        severity: severityFromIntakeIssue(issue.severity),
+        title: `${stage.stage}: ${issue.category || "review"}`,
+        exactQuote,
+        explanation: String(issue.message || "需要人工复查"),
+        suggestion: suggestion || "请人工复查后确认是否修改。",
+        replacement: hasSourceQuote && suggestion ? suggestion : exactQuote,
+        replaceMode: "first" as const,
+      };
+    })
+  );
+
+  const seen = new Set<string>();
+  return issues.filter((issue) => {
+    const key = `${issue.title}:${issue.exactQuote}:${issue.explanation}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 interface StoryAssetAnalysis {
   storyMeta?: {
     time?: string;
@@ -887,8 +950,6 @@ const STEP_IDLE_STATUS: Record<Step, StepStatusValue> = {
 };
 
 const SCRIPT_ENRICHMENT_POLL_MS = 2500;
-const SCRIPT_ENRICHMENT_BEAT_GROUP_SIZE = 3;
-const SCRIPT_ENRICHMENT_MAX_BEATS_PER_CHUNK = 10;
 
 function sanitizePersistedStepStatus(status?: Partial<Record<Step, StepStatusValue>>) {
   const next = { ...STEP_IDLE_STATUS };
@@ -897,6 +958,19 @@ function sanitizePersistedStepStatus(status?: Partial<Record<Step, StepStatusVal
     const value = status[step];
     if (!value) continue;
     next[step] = value === "running" ? "idle" : value;
+  }
+  return next;
+}
+
+function mergeStepStatusPreservingDone(
+  current: Record<Step, StepStatusValue>,
+  incoming: Partial<Record<Step, StepStatusValue>>,
+) {
+  const next = { ...current };
+  for (const step of [1, 2, 3, 4, 5] as Step[]) {
+    const value = incoming[step];
+    if (!value) continue;
+    next[step] = current[step] === "done" ? "done" : value;
   }
   return next;
 }
@@ -1151,12 +1225,16 @@ export default function ImportPage({
         const data = await logsRes.json();
         let restoredTextForStyle = "";
         let storyAnalysisForStyle: StoryAssetAnalysis | null = null;
+        let restoredIntakeJobId: string | null = null;
+        let draftCurrentStepValue = 0;
+        let logCurrentStepValue = 0;
         if (data.length > 0) {
           setLogs(data);
           setHistoryMode(true);
           // Determine last completed step
           const doneSteps = data.filter((l: LogEntry) => l.status === "done").map((l: LogEntry) => l.step);
           const maxDone = Math.max(0, ...doneSteps) as Step | 0;
+          logCurrentStepValue = maxDone;
           setCurrentStep(maxDone);
           const parseLog = data.find((l: LogEntry) => l.step === 1 && l.status === "done" && l.metadata);
           const parseMeta = parseLog?.metadata as { text?: string } | undefined;
@@ -1207,14 +1285,16 @@ export default function ImportPage({
           const draftStepStatus = sanitizePersistedStepStatus(draft.stepStatus);
           if (typeof draft.currentStep === "number") {
             const draftCurrentStep = Math.max(0, Math.min(5, draft.currentStep)) as Step | 0;
-            setCurrentStep(draftCurrentStep as Step | 0);
-            if (draftCurrentStep < 5 || draftStepStatus[5] !== "done") {
+            const mergedCurrentStep = Math.max(draftCurrentStep, logCurrentStepValue) as Step | 0;
+            draftCurrentStepValue = mergedCurrentStep;
+            setCurrentStep(mergedCurrentStep as Step | 0);
+            if (mergedCurrentStep < 5 || draftStepStatus[5] !== "done") {
               setHistoryMode(false);
               setSelectedStep(null);
             }
           }
           if (draft.stepStatus) {
-            setStepStatus((prev) => ({ ...prev, ...draftStepStatus }));
+            setStepStatus((prev) => mergeStepStatusPreservingDone(prev, draftStepStatus));
           }
           if (typeof draft.fullText === "string") {
             setFullText(draft.fullText);
@@ -1247,6 +1327,7 @@ export default function ImportPage({
             setEnrichmentJobId(draft.enrichmentJobId);
           }
           if (typeof draft.intakeJobId === "string" && draft.intakeJobId) {
+            restoredIntakeJobId = draft.intakeJobId;
             setIntakeJobId(draft.intakeJobId);
           }
           if (typeof draft.confirmedScriptVersionId === "string" && draft.confirmedScriptVersionId) {
@@ -1256,6 +1337,31 @@ export default function ImportPage({
             setAssetLibraryVersionId(draft.assetLibraryVersionId);
           }
           storyReviewedRef.current = draftStepStatus[2] === "done";
+        }
+
+        if (restoredIntakeJobId) {
+          const intakeRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${restoredIntakeJobId}`);
+          if (intakeRes.ok) {
+            const status = await intakeRes.json() as IntakeJobStatus;
+            setIntakeJobStatus(status);
+            const candidateText = status.candidate_text || "";
+            if ((status.status === "awaiting_review" || status.status === "confirmed") && candidateText.trim()) {
+              const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+              setFullText(candidateText);
+              setReviewIssues((prev) => prev.length > 0 ? prev : intakeReviewIssues);
+              enrichedTextRef.current = candidateText;
+              visualEnrichmentRef.current = null;
+              detailSupplementedRef.current = true;
+              setDetailSupplemented(true);
+              if (draftCurrentStepValue < 2) {
+                setCurrentStep(2);
+                setStepStatus((prev) => ({ ...prev, 1: "done", 2: "idle" }));
+              }
+              if (status.confirmed_script_version_id) {
+                setConfirmedScriptVersionId(status.confirmed_script_version_id);
+              }
+            }
+          }
         }
       } catch {
         // No draft/logs, fresh import
@@ -1552,8 +1658,10 @@ export default function ImportPage({
       if (status.status === "awaiting_review" || status.status === "confirmed") {
         const candidateText = status.candidate_text || "";
         if (!candidateText.trim()) throw new Error("Script intake finished without candidate text");
+        const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
 
         setFullText(candidateText);
+        setReviewIssues(intakeReviewIssues);
         enrichedTextRef.current = candidateText;
         visualEnrichmentRef.current = null;
         setDetailSupplementReady(true);
@@ -1568,6 +1676,7 @@ export default function ImportPage({
           currentStep: 2,
           stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
           fullText: candidateText,
+          reviewIssues: intakeReviewIssues,
           intakeJobId: jobId,
           confirmedScriptVersionId: status.confirmed_script_version_id || null,
           assetLibraryVersionId: null,
@@ -1627,60 +1736,7 @@ export default function ImportPage({
     }
   }
 
-  // ── Step 2: AI story review, then human review gate ──
-  async function startScriptEnrichmentBeforeReview(sourceText: string) {
-    if (enrichmentJobStatus && (enrichmentJobStatus.status === "queued" || enrichmentJobStatus.status === "running")) {
-      addLog(2, "running", "AI 细节补全任务已经在运行，请看上方进度");
-      return;
-    }
-
-    addLog(2, "running", "创建 AI 细节补全后台任务...");
-    visualEnrichmentRef.current = null;
-    enrichedTextRef.current = sourceText;
-    lastEnrichmentTerminalLogRef.current = null;
-    setDetailSupplementReady(false);
-    const res = await apiFetch(`/api/projects/${projectId}/script/enrich/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        script: sourceText,
-        modelConfig: getModelConfig(),
-        useAI: true,
-        fallbackToLocal: false,
-        concurrency: 2,
-        beatGroupSize: SCRIPT_ENRICHMENT_BEAT_GROUP_SIZE,
-        maxBeatsPerChunk: SCRIPT_ENRICHMENT_MAX_BEATS_PER_CHUNK,
-        maxRetries: 2,
-      }),
-    });
-    const data = await res.json() as { jobId?: string; job_id?: string; status?: string; totalTasks?: number; total_tasks?: number };
-    const jobId = data.jobId || data.job_id;
-    if (!jobId) throw new Error("AI 细节补全任务没有返回 jobId");
-    setCurrentEnrichmentJob(jobId);
-    setEnrichmentJobStatus({
-      job_id: jobId,
-      status: "queued",
-      progress: 0,
-      total_tasks: data.totalTasks || data.total_tasks || 0,
-      completed_tasks: 0,
-      failed_tasks: 0,
-      skipped_tasks: 0,
-      enrichedText: sourceText,
-      visualEnrichment: null,
-      recent_logs: [],
-    });
-    await saveDraft({
-      ...buildDraftPayload(),
-      currentStep: 2,
-      stepStatus: { 1: "done", 2: "running", 3: "idle", 4: "idle", 5: "idle" },
-      fullText: sourceText,
-      reviewIssues: [],
-      storyAnalysis: null,
-      enrichmentJobId: jobId,
-    });
-    addLog(2, "running", `AI 细节补全后台任务已创建：${data.totalTasks || data.total_tasks || 0} 个小任务`);
-  }
-
+  // ── Step 2: Intake review refresh, then human review gate ──
   async function runStoryReview(text: string = fullText) {
     if (!text.trim()) return;
     if (!textGuard()) return;
@@ -1688,15 +1744,39 @@ export default function ImportPage({
     setCurrentStep(2);
     setStepStatus((prev) => ({ ...prev, 2: "running" }));
     setReviewIssues([]);
-    setStoryAnalysis(null);
-    addLog(2, "running", detailSupplementedRef.current ? "开始 AI 剧情审阅..." : "开始 AI 细节补全...");
+    addLog(2, "running", intakeJobId ? "刷新剧本标准化审阅结果..." : "开始 AI 剧情审阅...");
 
     try {
       setSelectedIssueIndexes(new Set());
       setActiveIssueIndex(null);
-      if (!detailSupplementedRef.current) {
-        await startScriptEnrichmentBeforeReview(text);
+      if (intakeJobId) {
+        const intakeRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}`);
+        if (!intakeRes.ok) {
+          const errData = await intakeRes.json().catch(() => ({}));
+          throw new Error(errData.error || `HTTP ${intakeRes.status}`);
+        }
+        const status = await intakeRes.json() as IntakeJobStatus;
+        const candidateText = status.candidate_text || text;
+        const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+        setIntakeJobStatus(status);
+        setFullText(candidateText);
+        setReviewIssues(intakeReviewIssues);
+        setDetailSupplementReady(status.status === "awaiting_review" || status.status === "confirmed");
+        setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+        addLog(2, "done", `剧本标准化审阅结果已刷新，发现 ${intakeReviewIssues.length} 个问题`);
+        await saveDraft({
+          ...buildDraftPayload(),
+          currentStep: 2,
+          stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
+          fullText: candidateText,
+          reviewIssues: intakeReviewIssues,
+          intakeJobId,
+          confirmedScriptVersionId: status.confirmed_script_version_id || confirmedScriptVersionId,
+        });
         return;
+      }
+      if (!detailSupplementedRef.current) {
+        setDetailSupplementReady(true);
       }
       const preparedReview: ReviewPreparation = {
         text,
@@ -1743,7 +1823,7 @@ export default function ImportPage({
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Review failed";
-      addLog(2, "error", detailSupplementedRef.current ? `AI 剧情审阅失败: ${msg}` : `AI 细节补全启动失败: ${msg}`);
+      addLog(2, "error", intakeJobId ? `刷新剧本标准化审阅失败: ${msg}` : `AI 剧情审阅失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 2: "error" }));
     }
   }
@@ -2400,7 +2480,7 @@ export default function ImportPage({
   const hideParseStep = stepStatus[2] === "done" || currentStep >= 3;
   const visibleSteps = hideParseStep ? STEPS.filter(({ num }) => num !== 1) : STEPS;
   const enrichmentRunning = Boolean(enrichmentJobStatus && (enrichmentJobStatus.status === "queued" || enrichmentJobStatus.status === "running"));
-  const reviewRunning = stepStatus[2] === "running" && !enrichmentRunning && detailSupplemented;
+  const reviewRunning = stepStatus[2] === "running" && !enrichmentRunning;
   const stepTwoBusy = enrichmentRunning || reviewRunning;
   const unappliedIssueCount = reviewIssues.filter((issue) => !issue.applied).length;
   const selectableIssueIndexes = reviewIssues
@@ -3511,9 +3591,9 @@ export default function ImportPage({
                   className="rounded-xl"
                 >
                   {stepTwoBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  {enrichmentRunning ? "AI补全中" : !detailSupplemented ? "AI补全细节" : reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
+                  {enrichmentRunning ? "AI补全中" : intakeJobId ? "刷新审阅结果" : reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
                 </Button>
-                <Button onClick={confirmStoryReview} disabled={stepTwoBusy || !detailSupplemented} className="rounded-xl">
+                <Button onClick={confirmStoryReview} disabled={stepTwoBusy || !fullText.trim()} className="rounded-xl">
                   {t("confirmStoryReview")}
                 </Button>
               </div>

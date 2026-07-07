@@ -23,6 +23,10 @@ import {
   type StructuredScript,
 } from "@/lib/script-structure";
 import {
+  buildStructuredScriptJson,
+  type StructuredScriptJson,
+} from "@/lib/script-intake/structured-script-json";
+import {
   applyEnrichmentPatchesToText,
   generateScriptVisualEnrichmentPreview,
   type EnrichmentPatch,
@@ -40,17 +44,19 @@ export const INTAKE_STAGES = [
   { stage: "upload_document", sequence: 1, progress: 5 },
   { stage: "extract_raw_text", sequence: 2, progress: 12 },
   { stage: "clean_text", sequence: 3, progress: 18 },
-  { stage: "detect_document_type", sequence: 4, progress: 24 },
-  { stage: "parse_sections", sequence: 5, progress: 32 },
-  { stage: "parse_script_body", sequence: 6, progress: 40 },
-  { stage: "document_cleaner", sequence: 7, progress: 48 },
-  { stage: "ai_structure_review", sequence: 8, progress: 56 },
-  { stage: "light_compliance_precheck", sequence: 9, progress: 64 },
-  { stage: "script_visual_enrichment", sequence: 10, progress: 74 },
-  { stage: "enrichment_validation", sequence: 11, progress: 80 },
-  { stage: "text_compliance_review", sequence: 12, progress: 88 },
-  { stage: "human_review", sequence: 13, progress: 92 },
-  { stage: "confirmed_script_version", sequence: 14, progress: 100 },
+  { stage: "light_compliance_precheck", sequence: 4, progress: 22 },
+  { stage: "detect_document_type", sequence: 5, progress: 28 },
+  { stage: "parse_sections", sequence: 6, progress: 34 },
+  { stage: "parse_script_body", sequence: 7, progress: 42 },
+  { stage: "document_cleaner", sequence: 8, progress: 48 },
+  { stage: "parse_dialogue_action_emotion", sequence: 9, progress: 54 },
+  { stage: "structured_script_json", sequence: 10, progress: 60 },
+  { stage: "ai_structure_review", sequence: 11, progress: 66 },
+  { stage: "script_visual_enrichment", sequence: 12, progress: 76 },
+  { stage: "enrichment_validation", sequence: 13, progress: 82 },
+  { stage: "text_compliance_review", sequence: 14, progress: 90 },
+  { stage: "human_review", sequence: 15, progress: 94 },
+  { stage: "confirmed_script_version", sequence: 16, progress: 100 },
 ] as const;
 
 const SCRIPT_INTAKE_AI_TIMEOUT_MS = Math.max(
@@ -313,6 +319,8 @@ async function getLatestCandidateText(jobId: string) {
     { stage: "text_compliance_review", key: "candidateText" },
     { stage: "script_visual_enrichment", key: "candidateText" },
     { stage: "document_cleaner", key: "candidateText" },
+    { stage: "parse_script_body", key: "candidateText" },
+    { stage: "parse_sections", key: "candidateText" },
     { stage: "clean_text", key: "cleanedText" },
     { stage: "extract_raw_text", key: "rawText" },
   ];
@@ -374,7 +382,16 @@ async function persistScriptText(params: {
   ensureStoryPipelineTables();
   const structured = structureScriptText(params.text);
   const scriptId = params.scriptId || genId();
+  const structuredJson = buildStructuredScriptJson(structured, params.text);
   const metadata = summarizeStructure(structured);
+  const metadataWithStructuredSummary = {
+    ...metadata,
+    structuredScriptJson: {
+      schemaVersion: structuredJson.schemaVersion,
+      summary: structuredJson.summary,
+      statistics: structuredJson.statistics,
+    },
+  };
   const existing = params.scriptId
     ? await db.select({ id: scripts.id }).from(scripts).where(eq(scripts.id, params.scriptId)).limit(1)
     : [];
@@ -391,8 +408,9 @@ async function persistScriptText(params: {
         contentHash: hashText(params.text),
         rawText: params.rawText,
         cleanedText: params.text,
+        structuredJson,
         status: params.status ?? "chunked",
-        metadata,
+        metadata: metadataWithStructuredSummary,
         updatedAt: now(),
       })
       .where(eq(scripts.id, scriptId));
@@ -407,8 +425,9 @@ async function persistScriptText(params: {
       contentHash: hashText(params.text),
       rawText: params.rawText,
       cleanedText: params.text,
+      structuredJson,
       status: params.status ?? "chunked",
-      metadata,
+      metadata: metadataWithStructuredSummary,
       createdAt: now(),
       updatedAt: now(),
     });
@@ -445,7 +464,62 @@ async function persistScriptText(params: {
     .where(eq(projects.id, params.job.projectId));
 
   await updateJob(params.job.id, { scriptId });
-  return { scriptId, structured, metadata };
+  return { scriptId, structured, structuredJson, metadata: metadataWithStructuredSummary };
+}
+
+async function loadCurrentScript(job: IntakeJob) {
+  const latestJob = await loadJob(job.id);
+  const scriptId = latestJob?.scriptId || job.scriptId;
+  if (!scriptId) return null;
+  const [script] = await db
+    .select()
+    .from(scripts)
+    .where(and(eq(scripts.id, scriptId), eq(scripts.projectId, job.projectId)));
+  return script ?? null;
+}
+
+async function ensureStructuredJsonForJob(job: IntakeJob): Promise<StructuredScriptJson> {
+  const script = await loadCurrentScript(job);
+  if (!script) throw new Error("Script body must be parsed before structured JSON generation");
+  if (script.structuredJson && typeof script.structuredJson === "object") {
+    return script.structuredJson as StructuredScriptJson;
+  }
+
+  const text = String(script.cleanedText || script.rawText || await getLatestCandidateText(job.id));
+  const structured = structureScriptText(text);
+  const structuredJson = buildStructuredScriptJson(structured, text);
+  const metadata = script.metadata && typeof script.metadata === "object"
+    ? script.metadata as Record<string, unknown>
+    : {};
+  await db
+    .update(scripts)
+    .set({
+      structuredJson,
+      metadata: {
+        ...metadata,
+        structuredScriptJson: {
+          schemaVersion: structuredJson.schemaVersion,
+          summary: structuredJson.summary,
+          statistics: structuredJson.statistics,
+        },
+      },
+      updatedAt: now(),
+    })
+    .where(eq(scripts.id, script.id));
+  return structuredJson;
+}
+
+function compactStructuredJsonStats(structuredJson: StructuredScriptJson) {
+  return {
+    schemaVersion: structuredJson.schemaVersion,
+    episodeCount: structuredJson.episodes.length,
+    sceneCount: structuredJson.scenes.length,
+    chunkCount: structuredJson.chunks.length,
+    unitCount: structuredJson.units.length,
+    unitCounts: structuredJson.statistics.unitCounts,
+    topSpeakers: structuredJson.statistics.speakerCounts.slice(0, 20),
+    topEmotions: structuredJson.statistics.emotionCounts.slice(0, 20),
+  };
 }
 
 function localDocumentCleaner(text: string) {
@@ -454,6 +528,57 @@ function localDocumentCleaner(text: string) {
     .filter((line) => !/^\s*(?:page\s*)?\d+\s*(?:\/\s*\d+)?\s*$/i.test(line.trim()))
     .filter((line) => !/^\s*[-_=]{4,}\s*$/.test(line.trim()));
   return cleanScriptText(lines.join("\n"));
+}
+
+function findScriptBodyStart(text: string) {
+  const lines = text.split("\n");
+  const sceneMarkerPattern = /[\u3010\[]\s*\u573a\u666f\s*[0-9\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+/;
+  const episodeHeadingPattern = /^\s*\u7b2c\s*(?:[0-9]{1,4}|[\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343]+)\s*[\u96c6\u8bdd\u56de]\s*[：:].*/;
+  const bodySectionPattern = /(?:\u5206\u96c6\u5267\u672c|\u5267\u672c\u6b63\u6587|\u6b63\u6587\u5267\u672c|\u62cd\u6444\u811a\u672c|\u5b8c\u6574\u5267\u672c|\u5206\u573a\u5267\u672c)/;
+  const nonBodySectionPattern = /(?:\u5206\u96c6\u5927\u7eb2|\u4f5c\u54c1\u7b80\u4ecb|\u4eba\u7269\u5c0f\u4f20|\u6838\u5fc3\u8bbe\u5b9a|\u9898\u6750\u6807\u7b7e)/;
+
+  let offset = 0;
+  let lastBodySectionOffset = -1;
+  let sawNonBodySection = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    if (nonBodySectionPattern.test(line)) sawNonBodySection = true;
+    if (bodySectionPattern.test(line)) lastBodySectionOffset = offset + line.length + 1;
+
+    if (episodeHeadingPattern.test(line)) {
+      const nextBlock = lines.slice(index, Math.min(lines.length, index + 8)).join("\n");
+      const startsAfterBodySection = lastBodySectionOffset >= 0 && offset >= lastBodySectionOffset;
+      if (sceneMarkerPattern.test(nextBlock) && (startsAfterBodySection || sawNonBodySection || offset > 500)) {
+        return {
+          startIndex: offset,
+          reason: startsAfterBodySection ? "body_section_marker" : "first_episode_with_scenes",
+        };
+      }
+    }
+
+    offset += line.length + 1;
+  }
+
+  return { startIndex: 0, reason: "full_text" };
+}
+
+function extractScriptBodyText(text: string) {
+  const cleanedText = cleanScriptText(text);
+  const bodyStart = findScriptBodyStart(cleanedText);
+  const bodyText = bodyStart.startIndex > 0
+    ? cleanScriptText(cleanedText.slice(bodyStart.startIndex))
+    : cleanedText;
+
+  return {
+    bodyText,
+    changed: bodyText !== cleanedText,
+    sourceCharCount: cleanedText.length,
+    bodyCharCount: bodyText.length,
+    removedPreambleChars: Math.max(0, cleanedText.length - bodyText.length),
+    startIndex: bodyStart.startIndex,
+    reason: bodyStart.reason,
+  };
 }
 
 function localComplianceIssues(text: string, stage: string): IntakeIssue[] {
@@ -825,18 +950,28 @@ async function runDetectDocumentType(job: IntakeJob) {
 
 async function runParseSections(job: IntakeJob) {
   const text = await getLatestCandidateText(job.id);
-  const structured = structureScriptText(text);
+  const extraction = extractScriptBodyText(text);
+  const structured = structureScriptText(extraction.bodyText);
   return {
     result: {
       ...summarizeStructure(structured),
       candidateText: structured.cleanedText,
+      extraction: {
+        changed: extraction.changed,
+        sourceCharCount: extraction.sourceCharCount,
+        bodyCharCount: extraction.bodyCharCount,
+        removedPreambleChars: extraction.removedPreambleChars,
+        startIndex: extraction.startIndex,
+        reason: extraction.reason,
+      },
     },
   };
 }
 
 async function runParseScriptBody(job: IntakeJob) {
   const raw = await loadStageResult<{ rawText?: string }>(job.id, "extract_raw_text");
-  const text = await getLatestCandidateText(job.id);
+  const parsed = await loadStageResult<{ candidateText?: string; extraction?: Record<string, unknown> }>(job.id, "parse_sections");
+  const text = String(parsed.candidateText || (await getLatestCandidateText(job.id)));
   const title = job.sourceFilename.replace(/\.[^.]+$/, "") || "Imported script";
   const persisted = await persistScriptText({
     job,
@@ -851,11 +986,15 @@ async function runParseScriptBody(job: IntakeJob) {
   await addImportLog(job.projectId, 1, "done", `Script intake parsed: ${text.length} chars, ${persisted.structured.chunks.length} chunks`, {
     intakeJobId: job.id,
     scriptId: persisted.scriptId,
+    removedPreambleChars: Number(parsed.extraction?.removedPreambleChars || 0),
   });
   return {
     result: {
       scriptId: persisted.scriptId,
+      candidateText: text,
       charCount: text.length,
+      sourceCharCount: Number(parsed.extraction?.sourceCharCount || text.length),
+      removedPreambleChars: Number(parsed.extraction?.removedPreambleChars || 0),
       chunkCount: persisted.structured.chunks.length,
       episodeCount: persisted.structured.episodes.length,
       sceneCount: persisted.structured.scenes.length,
@@ -888,10 +1027,34 @@ async function runDocumentCleaner(job: IntakeJob) {
   };
 }
 
+async function runParseDialogueActionEmotion(job: IntakeJob) {
+  const structuredJson = await ensureStructuredJsonForJob(job);
+  return {
+    result: {
+      ...compactStructuredJsonStats(structuredJson),
+      persisted: true,
+      storedIn: "scripts.structured_json",
+    },
+  };
+}
+
+async function runStructuredScriptJson(job: IntakeJob) {
+  const structuredJson = await ensureStructuredJsonForJob(job);
+  const stats = compactStructuredJsonStats(structuredJson);
+  await addJobLog(job, "structured_script_json", "info", "Structured script JSON persisted", stats);
+  return {
+    result: {
+      ...stats,
+      persisted: true,
+      storedIn: "scripts.structured_json",
+    },
+  };
+}
+
 async function runAiStructureReview(job: IntakeJob, _stage: IntakeStage, context: StageRunContext) {
   const text = await getLatestCandidateText(job.id);
   const result = await aiStructureReview(text, readOptions(job), async (chunkIndex, totalChunks) => {
-    const progress = 56 + Math.floor(((chunkIndex - 1) / Math.max(totalChunks, 1)) * 8);
+    const progress = 66 + Math.floor(((chunkIndex - 1) / Math.max(totalChunks, 1)) * 8);
     await context.updateProgress(progress);
     await addJobLog(job, "ai_structure_review", "info", `AI structure review chunk ${chunkIndex}/${totalChunks}`);
   });
@@ -978,14 +1141,14 @@ async function runScriptVisualEnrichment(job: IntakeJob, _stage: IntakeStage, co
         });
       }
       completedChunks += 1;
-      await context.updateProgress(74 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
+      await context.updateProgress(76 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
       return {
         patches: result.validation.accepted_patches,
         issues,
       };
     } catch (error) {
       completedChunks += 1;
-      await context.updateProgress(74 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
+      await context.updateProgress(76 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
       return {
         patches: [] as EnrichmentPatch[],
         issues: [{
@@ -1064,7 +1227,7 @@ async function runTextComplianceReview(job: IntakeJob, _stage: IntakeStage, cont
   const currentText = await getLatestCandidateText(job.id);
   const localIssues = localComplianceIssues(currentText, "text_compliance_review");
   const rewrite = await aiComplianceRewrite(currentText, readOptions(job), async (chunkIndex, totalChunks) => {
-    const progress = 88 + Math.floor(((chunkIndex - 1) / Math.max(totalChunks, 1)) * 4);
+    const progress = 90 + Math.floor(((chunkIndex - 1) / Math.max(totalChunks, 1)) * 4);
     await context.updateProgress(progress);
     await addJobLog(job, "text_compliance_review", "info", `Text compliance review chunk ${chunkIndex}/${totalChunks}`);
   });
@@ -1183,6 +1346,29 @@ export async function startScriptIntakeJob(input: StartScriptIntakeJobInput) {
   return { jobId, status: "queued" as const };
 }
 
+async function ensureIntakeStagesForJob(job: IntakeJob) {
+  const existing = await db
+    .select({ stage: intakeJobStages.stage })
+    .from(intakeJobStages)
+    .where(eq(intakeJobStages.jobId, job.id));
+  const existingStages = new Set(existing.map((row) => row.stage));
+  const missing = INTAKE_STAGES.filter((stage) => !existingStages.has(stage.stage));
+  if (missing.length === 0) return;
+
+  await db.insert(intakeJobStages).values(
+    missing.map((stage) => ({
+      id: genId(),
+      jobId: job.id,
+      projectId: job.projectId,
+      stage: stage.stage,
+      sequence: stage.sequence,
+      status: "pending" as const,
+      createdAt: now(),
+      updatedAt: now(),
+    })),
+  );
+}
+
 export async function ensureScriptIntakeJobQueued(projectId: string, jobId: string) {
   ensureScriptIntakeTables();
   const [job] = await db
@@ -1233,6 +1419,7 @@ export async function runScriptIntakeJob(jobId: string) {
   ensureScriptIntakeTables();
   const job = await loadJob(jobId);
   if (!job) throw new Error(`Intake job not found: ${jobId}`);
+  await ensureIntakeStagesForJob(job);
   if (job.status === "confirmed" || job.status === "cancelled") return { status: job.status };
   if (job.status === "awaiting_review") return { status: job.status };
 
@@ -1253,6 +1440,8 @@ export async function runScriptIntakeJob(jobId: string) {
     parse_sections: runParseSections,
     parse_script_body: runParseScriptBody,
     document_cleaner: runDocumentCleaner,
+    parse_dialogue_action_emotion: runParseDialogueActionEmotion,
+    structured_script_json: runStructuredScriptJson,
     ai_structure_review: runAiStructureReview,
     light_compliance_precheck: runLightCompliancePrecheck,
     script_visual_enrichment: runScriptVisualEnrichment,
@@ -1286,6 +1475,7 @@ export async function getScriptIntakeJobStatus(projectId: string, jobId: string)
     .from(intakeJobs)
     .where(and(eq(intakeJobs.id, jobId), eq(intakeJobs.projectId, projectId)));
   if (!job) return null;
+  await ensureIntakeStagesForJob(job);
 
   const stages = await db
     .select()
@@ -1360,6 +1550,7 @@ export async function confirmScriptIntakeJob(input: ConfirmScriptIntakeInput) {
     text: candidateText,
     status: "parsed",
   });
+  const confirmedStructuredJson = buildStructuredScriptJson(persisted.structured, candidateText);
 
   const [versionResult] = await db
     .select({ maxVersion: max(confirmedScriptVersions.versionNum) })
@@ -1384,7 +1575,10 @@ export async function confirmScriptIntakeJob(input: ConfirmScriptIntakeInput) {
     language: persisted.structured.summary.language,
     contentHash: hashText(candidateText),
     content: candidateText,
-    structureJson: summarizeStructure(persisted.structured),
+    structureJson: {
+      ...summarizeStructure(persisted.structured),
+      structuredScriptJson: confirmedStructuredJson,
+    },
     reviewSummary: {
       issueSummary: await collectIssueSummary(input.jobId),
       reviewNotes: input.reviewNotes ?? null,

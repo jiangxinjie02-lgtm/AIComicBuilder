@@ -260,6 +260,9 @@ export const importStates = sqliteTable("import_states", {
   confirmedEpisodeIndexes: text("confirmed_episode_indexes", { mode: "json" }),
   shotReview: text("shot_review", { mode: "json" }),
   enrichmentJobId: text("enrichment_job_id"),
+  intakeJobId: text("intake_job_id"),
+  confirmedScriptVersionId: text("confirmed_script_version_id"),
+  assetLibraryVersionId: text("asset_library_version_id"),
   updatedAt: integer("updated_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -357,6 +360,7 @@ export const scripts = sqliteTable("scripts", {
   contentHash: text("content_hash").default(""),
   rawText: text("raw_text").notNull().default(""),
   cleanedText: text("cleaned_text").default(""),
+  structuredJson: text("structured_json", { mode: "json" }),
   status: text("status", {
     enum: ["uploaded", "cleaning", "chunked", "parsed", "failed"],
   })

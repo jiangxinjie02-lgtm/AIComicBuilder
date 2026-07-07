@@ -428,6 +428,13 @@
       "when": 1783497600000,
       "tag": "0060_add_industrial_pipeline_versions",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1783584000000,
+      "tag": "0061_add_script_intake_state_fields",
+      "breakpoints": true
     }
   ]
 }
