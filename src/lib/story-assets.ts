@@ -616,6 +616,33 @@ export async function syncImportAssets(
   return created;
 }
 
+export async function pruneStaleImportDraftAssets(
+  projectId: string,
+  keepAssetIds: Set<string>,
+  types: StoryAssetType[] = ["character", "scene", "prop"],
+) {
+  ensureAssetLibraryTables();
+  ensureStoryPipelineTables();
+
+  const rows = await db
+    .select()
+    .from(assets)
+    .where(eq(assets.projectId, projectId))
+    .orderBy(asc(assets.createdAt));
+  let deletedCount = 0;
+  for (const row of rows) {
+    if (!types.includes(row.type)) continue;
+    if (keepAssetIds.has(row.id)) continue;
+    if (row.confirmed === 1 || row.referenceImage) continue;
+    const metadata = parseJson<Record<string, unknown>>(row.metadata, {});
+    const sourceAssetId = String(metadata.sourceAssetId || "");
+    if (!/^(char|prop|scene)_/.test(sourceAssetId)) continue;
+    await db.delete(assets).where(eq(assets.id, row.id));
+    deletedCount += 1;
+  }
+  return deletedCount;
+}
+
 export async function listProjectAssets(projectId: string, type?: StoryAssetType) {
   ensureAssetLibraryTables();
   ensureStoryPipelineTables();

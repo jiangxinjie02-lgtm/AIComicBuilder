@@ -131,6 +131,16 @@ interface CharacterSeed {
   role: string;
   explicitRole?: string;
   contexts: string[];
+  variantHints?: CharacterVariantHint[];
+  assetKind?: "named" | "unnamed_support" | "group";
+}
+
+interface CharacterVariantHint {
+  name: string;
+  description: string;
+  promptDetail: string;
+  variantType: "costume" | "emotion" | "injury" | "body_state" | "group_state" | "appearance";
+  evidenceText?: string;
 }
 
 interface NamedSeed {
@@ -354,7 +364,7 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
   const sceneBuckets = collectSceneBuckets(lines);
   const aiCharacterSeeds = buildCharacterSeedsFromAnalysis(input.storyAnalysis);
   const ruleCharacterSeeds = collectCharacterSeeds(lines, normalized);
-  const characterSeeds = mergeCharacterSeeds(aiCharacterSeeds, ruleCharacterSeeds);
+  const characterSeeds = normalizeCharacterSeeds(mergeCharacterSeeds(aiCharacterSeeds, ruleCharacterSeeds));
   const characterNames = characterSeeds.map((seed) => seed.name);
   const aiPropSeeds = buildPropSeedsFromAnalysis(input.storyAnalysis);
   const aiSceneSeeds = buildSceneSeedsFromAnalysis(input.storyAnalysis, characterNames);
@@ -673,6 +683,163 @@ function mergeCharacterSeeds(primary: CharacterSeed[], fallback: CharacterSeed[]
   return [...merged.values()].sort((a, b) => b.score - a.score);
 }
 
+function normalizeCharacterSeeds(seeds: CharacterSeed[]) {
+  const byName = new Map<string, CharacterSeed>();
+  const pendingHints: Array<{ seed: CharacterSeed; hint: CharacterVariantHint; targetName?: string }> = [];
+
+  function ensureBaseSeed(name: string, source: CharacterSeed, kind: CharacterSeed["assetKind"] = "named") {
+    const normalizedName = cleanCharacterName(name);
+    if (!isProperCharacterAssetName(normalizedName)) return null;
+    const existing = byName.get(normalizedName);
+    if (existing) {
+      existing.score = Math.max(existing.score, Math.max(1, source.score - 1));
+      existing.role = existing.role || roleForCharacterKind(kind, source.role);
+      existing.explicitRole = existing.explicitRole || source.explicitRole;
+      existing.contexts = [...new Set([...existing.contexts, ...source.contexts])].slice(0, 12);
+      existing.assetKind = existing.assetKind || kind;
+      return existing;
+    }
+    const role = roleForCharacterKind(kind, source.role);
+    const created: CharacterSeed = {
+      ...source,
+      name: normalizedName,
+      score: Math.max(1, source.score - (source.name === normalizedName ? 0 : 1)),
+      role,
+      explicitRole: source.explicitRole || role,
+      contexts: source.contexts.slice(0, 12),
+      variantHints: [],
+      assetKind: kind,
+    };
+    byName.set(normalizedName, created);
+    return created;
+  }
+
+  for (const seed of seeds) {
+    const name = cleanCharacterName(seed.name);
+    const split = splitCompositeCharacterStateName(name);
+    if (split) {
+      const kind = isGroupCharacterName(split.assetName) ? "group" : "named";
+      const baseSeed = ensureBaseSeed(split.assetName, seed, kind);
+      if (baseSeed) {
+        pendingHints.push({ seed, targetName: baseSeed.name, hint: buildCharacterVariantHint(baseSeed.name, split.stateText, seed.contexts) });
+      }
+      continue;
+    }
+
+    if (isCharacterStateOnlyPhrase(name)) {
+      pendingHints.push({ seed, hint: buildCharacterVariantHint("", name, seed.contexts) });
+      continue;
+    }
+
+    const kind = inferCharacterAssetKind(name);
+    ensureBaseSeed(name, seed, kind);
+  }
+
+  const baseNames = [...byName.keys()].sort((a, b) => b.length - a.length);
+  for (const pending of pendingHints) {
+    const targetName = pending.targetName || findMentionedCharacterName(pending.seed.contexts, baseNames);
+    if (!targetName) continue;
+    const target = byName.get(targetName);
+    if (!target) continue;
+    const hint = pending.hint.name
+      ? pending.hint
+      : buildCharacterVariantHint(targetName, pending.seed.name, pending.seed.contexts);
+    appendCharacterVariantHint(target, hint);
+    target.contexts = [...new Set([...target.contexts, ...pending.seed.contexts])].slice(0, 12);
+    target.score = Math.max(target.score, pending.seed.score);
+  }
+
+  return [...byName.values()].sort((a, b) => b.score - a.score);
+}
+
+function appendCharacterVariantHint(seed: CharacterSeed, hint: CharacterVariantHint) {
+  const name = normalizeNameForCompare(hint.name);
+  const existing = seed.variantHints || [];
+  if (!name || existing.some((item) => normalizeNameForCompare(item.name) === name)) return;
+  seed.variantHints = [...existing, hint].slice(0, 8);
+}
+
+function roleForCharacterKind(kind: CharacterSeed["assetKind"], fallback = "") {
+  if (kind === "group") return "群体角色";
+  if (kind === "unnamed_support") return fallback && !/主角/.test(fallback) ? fallback : "无名配角";
+  return fallback || "配角";
+}
+
+function inferCharacterAssetKind(name: string): CharacterSeed["assetKind"] {
+  if (isGroupCharacterName(name)) return "group";
+  if (/(老头|老人|男子|女人|女孩|男孩|司机|保镖|守卫|战士|士兵|医生|护士|警察|看门|老板|店员|下属|领导)$/.test(name)) {
+    return "unnamed_support";
+  }
+  return "named";
+}
+
+function normalizeNameForCompare(value: string) {
+  return cleanAssetName(value).toLowerCase();
+}
+
+function isGroupCharacterName(name: string) {
+  return /^(丧尸|联盟战士|战士|士兵|伤员|幸存者|难民|群众|村民|黑衣人|守卫|敌兵|工人)$/.test(cleanCharacterName(name));
+}
+
+function splitCompositeCharacterStateName(name: string) {
+  const value = cleanCharacterName(name);
+  if (!value || isCharacterStateOnlyPhrase(value)) return null;
+  const match = value.match(/^([\u4e00-\u9fa5A-Za-z0-9·]{2,6}?)(一身.+|衣着.+|衣衫.+|身着.+|穿着.+|神情.+|表情.+|面容.+|满身.+|浑身.+|风尘满面|衣衫褴褛|狼狈便装|硬朗冷峻|坚毅冷峻|壮实紧张|紧张|冷峻|坚毅|疲惫|虚弱|受伤|警觉|惊恐|愤怒|倒地|眩晕倒地)$/);
+  if (!match) return null;
+  const assetName = cleanCharacterName(match[1]);
+  const stateText = cleanAssetName(match[2]);
+  if (!assetName || !stateText) return null;
+  if (isCharacterStateOnlyPhrase(assetName)) return null;
+  if (!isProperCharacterAssetName(assetName)) return null;
+  return { assetName, stateText };
+}
+
+function isCharacterStateOnlyPhrase(name: string) {
+  const value = cleanCharacterName(name);
+  if (!value) return false;
+  if (/^(神情|表情|面容|衣着|衣衫|身着|穿着|一身|满身|浑身)/.test(value)) return true;
+  if (/(坚毅|冷峻|紧张|惊恐|愤怒|疲惫|虚弱|受伤|狼狈|风尘满面|衣衫褴褛|便装|作战装束|警觉|倒地|眩晕)$/.test(value)
+    && !/(老头|老人|男子|女人|女孩|男孩|战士|士兵|丧尸|伤员|守卫)$/.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+function findMentionedCharacterName(contexts: string[], baseNames: string[]) {
+  const joined = contexts.join(" ");
+  return baseNames.find((name) => joined.includes(name)) || "";
+}
+
+function buildCharacterVariantHint(assetName: string, stateText: string, contexts: string[]): CharacterVariantHint {
+  const normalizedState = cleanAssetName(stateText) || "剧情状态";
+  const type = inferCharacterVariantType(normalizedState);
+  const prefix = assetName ? `${assetName}` : "";
+  return {
+    name: `${prefix}${variantLabelFromState(normalizedState)}`,
+    description: `${normalizedState}：来自剧本证据的服装、表情、体态或剧情状态变体，必须保持同一人物身份与脸型五官。`,
+    promptDetail: normalizedState,
+    variantType: type,
+    evidenceText: contexts[0] || "",
+  };
+}
+
+function inferCharacterVariantType(stateText: string): CharacterVariantHint["variantType"] {
+  if (/衣|服|便装|制服|装束|夹克|外套|睡衣|正装|礼服|军装|作战/.test(stateText)) return "costume";
+  if (/伤|血|虚弱|疲惫|狼狈|倒地|眩晕/.test(stateText)) return "injury";
+  if (/神情|表情|紧张|坚毅|冷峻|惊恐|愤怒|警觉/.test(stateText)) return "emotion";
+  if (/丧尸|战士|士兵|伤员|群/.test(stateText)) return "group_state";
+  if (/壮实|瘦弱|高大|矮小|风尘/.test(stateText)) return "body_state";
+  return "appearance";
+}
+
+function variantLabelFromState(stateText: string) {
+  const cleaned = stateText
+    .replace(/^(一身|满身|浑身|身着|穿着|衣着|衣衫|神情|表情|面容)/, "")
+    .replace(/[，。！？；、,.!?;]+/g, "")
+    .trim();
+  return `${cleaned || stateText}状态`;
+}
+
 function mergeNamedSeeds(primary: NamedSeed[], fallback: NamedSeed[]) {
   return dedupeNamedSeeds([...primary, ...fallback]).sort((a, b) => b.score - a.score);
 }
@@ -810,7 +977,10 @@ function makeCharacterAsset(
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
     },
-    variants: suggestCharacterVariants(seed.name, seed.role, snippets, faceTemplate),
+    variants: mergeCharacterVariants(
+      suggestCharacterVariants(seed.name, seed.role, snippets, faceTemplate),
+      variantHintsToAssetVariants(seed.name, seed.variantHints || [], faceTemplate),
+    ),
     imageUrl: "",
     history: [],
   };
@@ -1098,6 +1268,7 @@ function roleKeyFromRole(role: string, gender = "") {
 function cleanCharacterName(name: string) {
   return cleanAssetName(String(name || "")
     .replace(/[（(].*?[）)]/g, "")
+    .replace(/^(一名|一位|两名|两位|数名|几名|多名|一群|一队)/, "")
     .replace(/^(前世|年轻|老年|少年|少女|小)/, "")
     .replace(/(os|vo|OS|VO|若干|数名|多人|一行人|等人)$/i, ""));
 }
@@ -1121,6 +1292,7 @@ function isProperCharacterAssetName(name: string) {
 function looksLikeNonCharacterAssetName(name: string) {
   const value = cleanCharacterName(name);
   if (!value) return true;
+  if (isGroupCharacterName(value)) return false;
   if (BANNED_CHARACTER_NAMES.has(value)) return true;
   if (/^(今生|前世|重生前|重生后|前期|初期|中期|后期|高潮|开端|结尾|尾声|背景|性格|人设|设定|剧情|简介|梗概|主题|主线|支线|卖点|看点|题材标签|核心看点|人物弧光|角色弧光|性格反差|高光时刻)$/.test(value)) return true;
   if (/(标签|看点|弧光|反差|时刻|阶段|背景|设定|剧情|简介|梗概|主题|主线|支线|卖点|金手指)$/.test(value)) return true;
@@ -1611,6 +1783,30 @@ function suggestCharacterVariants(name: string, role: string, snippets: string[]
     imageUrl: "",
     history: [],
   }));
+}
+
+function variantHintsToAssetVariants(name: string, hints: CharacterVariantHint[], faceTemplate: FaceTemplate | null): AssetAgentVariant[] {
+  if (!hints.length) return [];
+  const faceLock = faceTemplate
+    ? `严格参考${faceTemplate.label}，锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；`
+    : "锁定脸型、五官、眉眼鼻唇比例、骨相和面部辨识度；";
+  return hints.map((hint) => ({
+    name: hint.name,
+    description: hint.description,
+    prompt: `人物资产变体，${name}，${hint.promptDetail}，${faceLock}真人实拍摄影质感，只改变服装、妆造、表情、体态或剧情状态，不改变角色身份。纯白背景。`,
+    imageUrl: "",
+    history: [],
+  }));
+}
+
+function mergeCharacterVariants(primary: AssetAgentVariant[], secondary: AssetAgentVariant[]) {
+  const seen = new Set<string>();
+  return [...primary, ...secondary].filter((variant) => {
+    const key = cleanAssetName(variant.name || variant.description || "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function suggestSceneVariants(name: string, times: string[], basePrompt: string) {

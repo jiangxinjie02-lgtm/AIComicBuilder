@@ -61,6 +61,7 @@ interface ExtractedCharacter {
   editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
+  promptMetadata?: Record<string, unknown>;
   visualSchema?: AssetVisualSchema | null;
   styleSpec?: AssetStyleSpec | null;
 }
@@ -98,6 +99,7 @@ interface ExtractedAsset {
   editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
+  promptMetadata?: Record<string, unknown>;
   visualSchema?: AssetVisualSchema | null;
   styleSpec?: AssetStyleSpec | null;
 }
@@ -882,6 +884,98 @@ function storyMetaOnlyAnalysis(analysis?: StoryAssetAnalysis | null): StoryAsset
   return { storyMeta: analysis.storyMeta };
 }
 
+interface PersistedAssetVariant {
+  id?: string;
+  name?: string;
+  state?: string;
+  visualConstraints?: string;
+  referenceImage?: string | null;
+  metadata?: unknown;
+  changedTraits?: unknown;
+}
+
+interface PersistedStoryAsset {
+  id: string;
+  type: "character" | "scene" | "prop";
+  name: string;
+  importance?: number;
+  description?: string;
+  visualConstraints?: string;
+  negativeConstraints?: string;
+  referenceImage?: string | null;
+  confirmed?: boolean | number;
+  metadata?: unknown;
+  variants?: PersistedAssetVariant[];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return asRecord(parsed);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean);
+}
+
+function persistedVariantToWorkbench(variant: PersistedAssetVariant): AssetVariant {
+  const metadata = asRecord(variant.metadata);
+  const changedTraits = asRecord(variant.changedTraits);
+  return {
+    id: String(variant.id || ""),
+    name: String(variant.name || "资产变体"),
+    description: String(variant.state || variant.visualConstraints || ""),
+    prompt: String(changedTraits.prompt || variant.visualConstraints || variant.state || ""),
+    imageUrl: String(variant.referenceImage || ""),
+    history: Array.isArray(metadata.history) ? metadata.history as Array<Record<string, unknown>> : [],
+    editInstruction: String(changedTraits.editInstruction || ""),
+  };
+}
+
+function persistedAssetToWorkbench(asset: PersistedStoryAsset): WorkbenchAsset {
+  const metadata = asRecord(asset.metadata);
+  const variants = (asset.variants || [])
+    .filter((variant) => {
+      const variantType = String((variant as PersistedAssetVariant & { variantType?: string }).variantType || "");
+      return variantType !== "default" && variantType !== "base";
+    })
+    .map(persistedVariantToWorkbench);
+  const role = String(metadata.role || metadata.roleKey || "");
+  const scope = metadata.scope === "main" || /男主|女主|主角/.test(role) ? "main" as const : "guest" as const;
+  return {
+    name: asset.name,
+    frequency: Number(metadata.frequency ?? asset.importance ?? 1),
+    description: asset.description || "",
+    visualHint: String(metadata.visualHint || metadata.mainImageName || asset.name),
+    visualConstraints: asset.visualConstraints || "",
+    confirmed: Boolean(asset.confirmed),
+    assetId: asset.id,
+    category: String(metadata.category || asset.type),
+    role,
+    roleKey: String(metadata.roleKey || ""),
+    episodes: asStringArray(metadata.episodes),
+    prompt: String(metadata.prompt || asset.visualConstraints || ""),
+    negativePrompt: asset.negativeConstraints || "",
+    variants,
+    imageUrl: asset.referenceImage || "",
+    history: Array.isArray(metadata.imageHistory) ? metadata.imageHistory as Array<Record<string, unknown>> : [],
+    mainImageName: String(metadata.mainImageName || asset.name),
+    tags: asStringArray(metadata.tags),
+    faceTemplate: metadata.faceTemplate as ExtractedCharacter["faceTemplate"],
+    promptMetadata: metadata.promptMetadata as ExtractedCharacter["promptMetadata"],
+    scope,
+  };
+}
+
 interface ScriptEnrichmentPreview {
   patches?: ScriptEnrichmentPatch[];
   enrichedText?: string;
@@ -1380,6 +1474,55 @@ export default function ImportPage({
     setSelectedStep(null);
     setCurrentStep(3);
   }, [draftHydrated, forceAssetWorkbench]);
+
+  useEffect(() => {
+    if (!draftHydrated) return;
+    if (characters.length + items.length + environments.length > 0) return;
+    if (!(forceAssetWorkbench || currentStep >= 3 || stepStatus[3] === "done" || historyMode)) return;
+
+    let cancelled = false;
+    async function loadPersistedAssets() {
+      try {
+        const res = await apiFetch(`/api/projects/${projectId}/assets`);
+        if (!res.ok) return;
+        const data = await res.json() as { assets?: PersistedStoryAsset[] };
+        const persistedAssets = Array.isArray(data.assets) ? data.assets : [];
+        if (cancelled || persistedAssets.length === 0) return;
+        const projectStyleGuide = buildProjectStyleGuide(storyAnalysis, fullText);
+        const persistedCharacters = persistedAssets
+          .filter((asset) => asset.type === "character")
+          .map((asset) => persistedAssetToWorkbench(asset) as ExtractedCharacter);
+        const persistedItems = persistedAssets
+          .filter((asset) => asset.type === "prop")
+          .map((asset) => persistedAssetToWorkbench(asset));
+        const persistedEnvironments = persistedAssets
+          .filter((asset) => asset.type === "scene")
+          .map((asset) => persistedAssetToWorkbench(asset));
+        setCharacters(normalizeImportedCharacters(persistedCharacters, projectStyleGuide));
+        setItems(normalizeImportedItems(persistedItems, projectStyleGuide));
+        setEnvironments(normalizeImportedEnvironments(persistedEnvironments, projectStyleGuide));
+      } catch (error) {
+        console.warn("Failed to hydrate persisted assets:", error);
+      }
+    }
+
+    void loadPersistedAssets();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    characters.length,
+    currentStep,
+    draftHydrated,
+    environments.length,
+    forceAssetWorkbench,
+    fullText,
+    historyMode,
+    items.length,
+    projectId,
+    stepStatus,
+    storyAnalysis,
+  ]);
 
   useEffect(() => {
     if (!draftHydratedRef.current) return;

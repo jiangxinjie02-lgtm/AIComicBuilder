@@ -5,7 +5,7 @@ import { eq, and } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
 import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
-import { listProjectAssets, syncImportAssets } from "@/lib/story-assets";
+import { listProjectAssets, pruneStaleImportDraftAssets, syncImportAssets } from "@/lib/story-assets";
 import {
   analyzeScriptAssets,
   type AssetAgentAsset,
@@ -281,6 +281,7 @@ export async function POST(
     environments: extractedEnvironments,
   });
   const persistedIds = new Set(persistedRows.map((asset) => asset.id));
+  const prunedAssetCount = await pruneStaleImportDraftAssets(projectId, persistedIds);
   const persistedAssets = (await listProjectAssets(projectId))
     .filter((asset) => persistedIds.has(asset.id));
   const characters = extractedCharacters.map((asset) =>
@@ -312,6 +313,7 @@ export async function POST(
         stages: assetProject.stages,
       },
       persistedAssetIds: [...persistedIds],
+      prunedAssetCount,
     }
   );
 
@@ -323,6 +325,7 @@ export async function POST(
     voices,
     confirmedScriptVersionId: confirmedVersion.id,
     persistedAssets,
+    prunedAssetCount,
     assetAgent: {
       id: assetProject.id,
       settings: assetProject.settings,
