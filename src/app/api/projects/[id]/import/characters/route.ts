@@ -5,6 +5,7 @@ import { eq, and } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
 import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
+import { listProjectAssets, syncImportAssets } from "@/lib/story-assets";
 import {
   analyzeScriptAssets,
   type AssetAgentAsset,
@@ -39,6 +40,101 @@ interface ImportedAsset {
 interface ImportedCharacter extends ImportedAsset {
   scope: "main" | "guest";
   faceTemplate?: AssetAgentAsset["faceTemplate"];
+}
+
+type PersistedAsset = Awaited<ReturnType<typeof listProjectAssets>>[number];
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return asRecord(parsed);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean);
+}
+
+function sourceAssetId(asset: PersistedAsset) {
+  return String(asRecord(asset.metadata).sourceAssetId || "");
+}
+
+function findPersistedAsset(
+  persistedAssets: PersistedAsset[],
+  type: "character" | "scene" | "prop",
+  draft: ImportedAsset,
+) {
+  const sourceId = String(draft.assetId || "");
+  const draftName = draft.name.toLowerCase().trim();
+  return persistedAssets.find((asset) => asset.type === type && sourceId && sourceAssetId(asset) === sourceId)
+    ?? persistedAssets.find((asset) => asset.type === type && asset.name.toLowerCase().trim() === draftName);
+}
+
+function mapPersistedVariant(variant: Record<string, unknown>) {
+  const metadata = asRecord(variant.metadata);
+  const changedTraits = asRecord(variant.changedTraits);
+  return {
+    id: String(variant.id || ""),
+    name: String(variant.name || "资产变体"),
+    description: String(variant.state || variant.visualConstraints || ""),
+    prompt: String(changedTraits.prompt || variant.visualConstraints || variant.state || ""),
+    imageUrl: String(variant.referenceImage || ""),
+    history: Array.isArray(metadata.history) ? metadata.history as Array<Record<string, unknown>> : [],
+    editInstruction: String(changedTraits.editInstruction || ""),
+  };
+}
+
+function mapPersistedVariants(asset: PersistedAsset) {
+  const variants = Array.isArray(asset.variants) ? asset.variants : [];
+  return variants
+    .filter((variant) => {
+      const record = variant as Record<string, unknown>;
+      const variantType = String(record.variantType || "");
+      return variantType !== "default" && variantType !== "base";
+    })
+    .map((variant) => mapPersistedVariant(variant as Record<string, unknown>));
+}
+
+function hydrateAssetFromLibrary<T extends ImportedAsset>(
+  draft: T,
+  type: "character" | "scene" | "prop",
+  persistedAssets: PersistedAsset[],
+): T {
+  const persisted = findPersistedAsset(persistedAssets, type, draft);
+  if (!persisted) return draft;
+
+  const metadata = asRecord(persisted.metadata);
+  const variants = mapPersistedVariants(persisted);
+  return {
+    ...draft,
+    name: persisted.name || draft.name,
+    frequency: Number(metadata.frequency ?? draft.frequency ?? persisted.importance ?? 1),
+    description: persisted.description || draft.description,
+    visualHint: String(metadata.visualHint || draft.visualHint || persisted.name),
+    visualConstraints: persisted.visualConstraints || draft.visualConstraints,
+    confirmed: Boolean(persisted.confirmed),
+    assetId: persisted.id,
+    category: String(metadata.category || draft.category || type),
+    role: String(metadata.role || draft.role || ""),
+    roleKey: String(metadata.roleKey || draft.roleKey || ""),
+    episodes: asStringArray(metadata.episodes).length ? asStringArray(metadata.episodes) : draft.episodes,
+    prompt: String(metadata.prompt || draft.prompt || ""),
+    negativePrompt: persisted.negativeConstraints || draft.negativePrompt,
+    variants: variants.length ? variants : draft.variants,
+    imageUrl: persisted.referenceImage || draft.imageUrl,
+    history: Array.isArray(metadata.imageHistory) ? metadata.imageHistory as Array<Record<string, unknown>> : draft.history,
+    mainImageName: String(metadata.mainImageName || draft.mainImageName || persisted.name),
+    tags: asStringArray(metadata.tags).length ? asStringArray(metadata.tags) : draft.tags,
+    promptMetadata: asRecord(metadata.promptMetadata).compilerIR ? metadata.promptMetadata as AssetAgentAsset["promptMetadata"] : draft.promptMetadata,
+  };
 }
 
 function toVisualHint(asset: AssetAgentAsset) {
@@ -164,9 +260,9 @@ export async function POST(
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 
-  const characters = assetProject.assets.characters.map(mapCharacter);
-  const items = assetProject.assets.props.map(mapAsset);
-  const environments = assetProject.assets.scenes.map(mapAsset);
+  const extractedCharacters = assetProject.assets.characters.map(mapCharacter);
+  const extractedItems = assetProject.assets.props.map(mapAsset);
+  const extractedEnvironments = assetProject.assets.scenes.map(mapAsset);
   const voices = assetProject.assets.voices.map(mapAsset);
   const relationships: Array<{
     characterA: string;
@@ -174,12 +270,29 @@ export async function POST(
     relationType: string;
     description?: string;
   }> = [];
+  const persistedRows = await syncImportAssets(projectId, {
+    characters: extractedCharacters,
+    items: extractedItems,
+    environments: extractedEnvironments,
+  });
+  const persistedIds = new Set(persistedRows.map((asset) => asset.id));
+  const persistedAssets = (await listProjectAssets(projectId))
+    .filter((asset) => persistedIds.has(asset.id));
+  const characters = extractedCharacters.map((asset) =>
+    hydrateAssetFromLibrary(asset, "character", persistedAssets)
+  );
+  const items = extractedItems.map((asset) =>
+    hydrateAssetFromLibrary(asset, "prop", persistedAssets)
+  );
+  const environments = extractedEnvironments.map((asset) =>
+    hydrateAssetFromLibrary(asset, "scene", persistedAssets)
+  );
 
   await addImportLog(
     projectId,
     3,
     "done",
-    `资产设定完成，共 ${characters.length} 个角色、${items.length} 个物品、${environments.length} 个环境、${voices.length} 个音色`,
+    `资产设定完成并写入资产草稿库，共 ${characters.length} 个角色、${items.length} 个物品、${environments.length} 个环境、${voices.length} 个音色`,
     {
       characters,
       relationships,
@@ -193,6 +306,7 @@ export async function POST(
         summary: assetProject.summary,
         stages: assetProject.stages,
       },
+      persistedAssetIds: [...persistedIds],
     }
   );
 
@@ -203,6 +317,7 @@ export async function POST(
     environments,
     voices,
     confirmedScriptVersionId: confirmedVersion.id,
+    persistedAssets,
     assetAgent: {
       id: assetProject.id,
       settings: assetProject.settings,

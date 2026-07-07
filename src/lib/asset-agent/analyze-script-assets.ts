@@ -771,7 +771,7 @@ function makeCharacterAsset(
       role: seed.role,
       description: profile,
       visualConstraints,
-      tags: [seed.role, gender, age].filter(Boolean),
+      tags: [seed.role, gender, age, temperament].filter(Boolean),
       faceTemplate,
     },
     visualSpec: defaultAssetVisualSpec("character", settings.targetSize),
@@ -792,7 +792,7 @@ function makeCharacterAsset(
     role: seed.role,
     roleKey,
     faceTemplate,
-    tags: [seed.role, gender, age].filter(Boolean),
+    tags: [seed.role, gender, age, temperament].filter(Boolean),
     status: "draft",
     confirmed: false,
     score: seed.score,
@@ -825,7 +825,8 @@ function makePropAsset(
 ): AssetAgentAsset {
   const snippets = findSnippets(text, seed.name);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
-  const description = compactText(seed.contexts.concat(snippets).join(" "), 180);
+  const sourceSnippets = seed.contexts.concat(snippets);
+  const description = compactText(sourceSnippets.join(" "), 180);
   const visualConstraints = [seed.type, description].filter(Boolean).join("；");
   const builtPrompt = buildAssetImagePrompt({
     asset: {
@@ -869,7 +870,7 @@ function makePropAsset(
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       validation: builtPrompt.validation_report,
     },
-    variants: [],
+    variants: suggestPropVariants(seed.name, seed.type, sourceSnippets, prompt),
     imageUrl: "",
     history: [],
   };
@@ -1619,6 +1620,64 @@ function suggestSceneVariants(name: string, times: string[], basePrompt: string)
     name: `${name}${time}变体`,
     description: `同一场景的${time}版本，空间结构、陈设和镜头方位不变。`,
     prompt: `${basePrompt}\n\n【变体要求】${time}版本。保持同一空间结构、主要陈设、镜头高度和镜头方位一致，只改变自然光/灯光、天气氛围和时间段。`,
+    imageUrl: "",
+    history: [],
+  }));
+}
+
+function suggestPropVariants(name: string, type: string, snippets: string[], basePrompt: string) {
+  const joined = snippets.join(" ");
+  const variantRules: Array<{ test: RegExp; suffix: string; description: string; promptDetail: string }> = [
+    {
+      test: /完好|崭新|干净|未拆|未开封|完整/,
+      suffix: "完好状态",
+      description: "完好状态：保留物品的基础造型、材质、比例和可识别细节，表面干净完整。",
+      promptDetail: "完好状态，表面完整干净，材质和标志性细节清晰",
+    },
+    {
+      test: /破损|损坏|裂|碎|断|摔坏|砸坏|烧焦|磨损|旧/,
+      suffix: "破损状态",
+      description: "破损状态：同一物品在剧情受损后的版本，只改变破损、磨损、烧焦或裂痕等状态。",
+      promptDetail: "破损状态，保留同一物品核心造型，增加磨损、裂痕或损坏痕迹",
+    },
+    {
+      test: /血|染血|血迹/,
+      suffix: "染血状态",
+      description: "染血状态：同一物品沾染血迹或污渍后的剧情版本，形状和材质保持一致。",
+      promptDetail: "染血状态，局部血迹或污渍，核心形状材质不变",
+    },
+    {
+      test: /打开|开启|展开|翻开|拆开/,
+      suffix: "打开状态",
+      description: "打开状态：同一物品被打开、展开或拆开的版本，突出内部结构和使用状态。",
+      promptDetail: "打开状态，展示内部结构或展开形态，保持同一物品识别度",
+    },
+    {
+      test: /关闭|合上|锁上|封住|收起/,
+      suffix: "关闭状态",
+      description: "关闭状态：同一物品合上、锁住或收起后的版本，外形轮廓稳定统一。",
+      promptDetail: "关闭状态，外部轮廓清晰，锁扣或封闭结构可见",
+    },
+    {
+      test: /空的|空箱|空包|空瓶|装满|满满|塞满|物资/,
+      suffix: "装载状态",
+      description: "装载状态：同一容器或物资类道具在空、满或装载物资时的剧情版本。",
+      promptDetail: "装载状态，体现空满差异或内部物资，外部结构保持一致",
+    },
+    {
+      test: /佩戴|戴上|穿上|披上|制服|外套|面具/,
+      suffix: "佩戴状态",
+      description: "佩戴状态：同一服饰或随身物品被穿戴/佩戴时的版本，强调材质和识别符号。",
+      promptDetail: "佩戴状态，服饰或随身物品处于被使用状态，核心设计一致",
+    },
+  ];
+  const selected = variantRules.filter((rule) => rule.test.test(joined)).slice(0, 4);
+  if (!selected.length) return [];
+  const identityRule = `物品资产变体，${name}，${type}；严格保持同一物品的核心形状、材质、比例、颜色体系和标志性细节，只改变剧情状态；无人物、无手、无文字水印。`;
+  return selected.map((rule) => ({
+    name: `${name}${rule.suffix}`,
+    description: rule.description,
+    prompt: `${basePrompt}\n\n【变体要求】${identityRule}${rule.promptDetail}。`,
     imageUrl: "",
     history: [],
   }));

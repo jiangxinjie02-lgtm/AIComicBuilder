@@ -936,8 +936,6 @@ interface ScriptEnrichmentJobStatus {
   }>;
 }
 
-type StoryAssetSectionKey = "characters" | "scenes" | "props";
-
 type Step = 1 | 2 | 3 | 4 | 5;
 type StepStatusValue = "idle" | "running" | "done" | "error";
 
@@ -2069,17 +2067,6 @@ export default function ImportPage({
     await runCharacterExtract(activeConfirmedScriptVersionId);
   }
 
-  function ensureEditableStoryAnalysis(): StoryAssetAnalysis {
-    return {
-      storyMeta: storyAnalysis?.storyMeta || {},
-      assets: {
-        characters: storyAnalysis?.assets?.characters || [],
-        scenes: storyAnalysis?.assets?.scenes || [],
-        props: storyAnalysis?.assets?.props || [],
-      },
-    };
-  }
-
   function updateStoryMetaField(field: keyof NonNullable<StoryAssetAnalysis["storyMeta"]>, value: string) {
     setStoryAnalysis((prev) => ({
       ...(prev || {}),
@@ -2089,54 +2076,6 @@ export default function ImportPage({
       },
       assets: prev?.assets || { characters: [], scenes: [], props: [] },
     }));
-  }
-
-  function updateStoryAssetItem(section: StoryAssetSectionKey, index: number, patch: Record<string, string>) {
-    setStoryAnalysis((prev) => {
-      const base = prev || ensureEditableStoryAnalysis();
-      const assets = {
-        characters: base.assets?.characters || [],
-        scenes: base.assets?.scenes || [],
-        props: base.assets?.props || [],
-      };
-      const list = [...assets[section]];
-      list[index] = { ...list[index], ...patch };
-      return { ...base, assets: { ...assets, [section]: list } };
-    });
-  }
-
-  function addStoryAssetItem(section: StoryAssetSectionKey) {
-    setStoryAnalysis((prev) => {
-      const base = prev || ensureEditableStoryAnalysis();
-      const assets = {
-        characters: base.assets?.characters || [],
-        scenes: base.assets?.scenes || [],
-        props: base.assets?.props || [],
-      };
-      const blank =
-        section === "characters"
-          ? { name: "", role: "配角", description: "" }
-          : { name: "", type: section === "scenes" ? "场景空间" : "剧情道具", description: "" };
-      return { ...base, assets: { ...assets, [section]: [...assets[section], blank] } };
-    });
-  }
-
-  function removeStoryAssetItem(section: StoryAssetSectionKey, index: number) {
-    setStoryAnalysis((prev) => {
-      if (!prev) return prev;
-      const assets = {
-        characters: prev.assets?.characters || [],
-        scenes: prev.assets?.scenes || [],
-        props: prev.assets?.props || [],
-      };
-      return {
-        ...prev,
-        assets: {
-          ...assets,
-          [section]: assets[section].filter((_, itemIndex) => itemIndex !== index),
-        },
-      };
-    });
   }
 
   // ── Step 3: Asset setting foundation - character extraction ──
@@ -3386,25 +3325,22 @@ export default function ImportPage({
       key: "characters",
       label: "人物",
       icon: Users,
-      items: storyAnalysis?.assets?.characters || [],
-      roleField: "role",
-      getSubText: (item: { role?: string; description?: string }) => item.role || item.description || "角色资产",
+      items: characters,
+      getSubText: (item: WorkbenchAsset) => item.role || item.description || "角色资产",
     },
     {
       key: "scenes",
       label: "场景",
       icon: Layers,
-      items: storyAnalysis?.assets?.scenes || [],
-      roleField: "type",
-      getSubText: (item: { type?: string; description?: string }) => item.type || item.description || "环境资产",
+      items: environments,
+      getSubText: (item: WorkbenchAsset) => item.role || item.category || item.description || "环境资产",
     },
     {
       key: "props",
       label: "物品",
       icon: ImageIcon,
-      items: storyAnalysis?.assets?.props || [],
-      roleField: "type",
-      getSubText: (item: { type?: string; description?: string }) => item.type || item.description || "道具资产",
+      items,
+      getSubText: (item: WorkbenchAsset) => item.role || item.category || item.description || "道具资产",
     },
   ];
   const reviewAssetTotal = reviewAssetSections.reduce((sum, section) => sum + section.items.length, 0);
@@ -3716,7 +3652,7 @@ export default function ImportPage({
 
                   {!reviewRunning && !storyAnalysis && (
                     <div className="rounded-lg bg-emerald-50 p-3 text-sm leading-relaxed text-emerald-700">
-                      点击“AI 审阅”后，这里会显示人物、场景、物品和统一故事设定。
+                      AI 审阅通过并确认剧情后，会自动提取人物、场景、物品，并写入同一份资产草稿库。
                     </div>
                   )}
 
@@ -3749,15 +3685,6 @@ export default function ImportPage({
                           </div>
                           <div className="flex items-center gap-2">
                             <span className="text-xs text-[--text-muted]">{section.items.length}</span>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => addStoryAssetItem(section.key as StoryAssetSectionKey)}
-                              className="h-7 px-2"
-                            >
-                              <Plus className="h-3.5 w-3.5" />
-                            </Button>
                           </div>
                         </div>
                         <div className="max-h-44 overflow-y-auto p-2">
@@ -3767,36 +3694,23 @@ export default function ImportPage({
                             </div>
                           ) : (
                             section.items.map((item, index) => (
-                              <div key={`${section.key}:${index}`} className="mb-2 space-y-1.5 rounded-md bg-[--surface] p-2 last:mb-0">
-                                <div className="flex items-center gap-1.5">
-                                  <Input
-                                    value={item.name || ""}
-                                    onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { name: e.target.value })}
-                                    placeholder={`${section.label}名称`}
-                                    className="h-8 min-w-0 flex-1 rounded-lg bg-white text-xs font-semibold"
-                                  />
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => removeStoryAssetItem(section.key as StoryAssetSectionKey, index)}
-                                    className="h-8 w-8 shrink-0 p-0"
-                                  >
-                                    <X className="h-3.5 w-3.5" />
-                                  </Button>
+                              <div key={`${section.key}:${item.assetId || item.name}:${index}`} className="mb-2 rounded-md bg-[--surface] p-2 last:mb-0">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <div className="truncate text-xs font-bold text-[--text-primary]">{item.name || `${section.label}资产`}</div>
+                                    <div className="mt-0.5 truncate text-[10px] text-[--text-muted]">{section.getSubText(item)}</div>
+                                  </div>
+                                  {(item.variants?.length || 0) > 0 && (
+                                    <span className="shrink-0 rounded-full bg-white px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                                      {item.variants?.length} 变体
+                                    </span>
+                                  )}
                                 </div>
-                                <Input
-                                  value={(section.roleField === "role" ? (item as { role?: string }).role : (item as { type?: string }).type) || ""}
-                                  onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { [section.roleField]: e.target.value })}
-                                  placeholder={section.roleField === "role" ? "角色定位" : "类型"}
-                                  className="h-8 rounded-lg bg-white text-xs"
-                                />
-                                <Textarea
-                                  value={item.description || ""}
-                                  onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { description: e.target.value })}
-                                  placeholder="描述"
-                                  className="min-h-16 resize-none rounded-lg bg-white text-xs leading-relaxed"
-                                />
+                                {item.description && (
+                                  <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-[--text-secondary]">
+                                    {item.description}
+                                  </p>
+                                )}
                               </div>
                             ))
                           )}

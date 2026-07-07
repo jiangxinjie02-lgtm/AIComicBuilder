@@ -203,30 +203,64 @@ async function createResolvedCandidate(
 ) {
   const now = new Date();
   const name = normalizeName(draft.name);
+  const normalizedName = name.toLowerCase();
+  const existingRows = await db
+    .select()
+    .from(assetCandidates)
+    .where(and(
+      eq(assetCandidates.projectId, projectId),
+      eq(assetCandidates.assetType, type),
+      eq(assetCandidates.mergedAssetId, assetId),
+    ))
+    .orderBy(asc(assetCandidates.createdAt));
+  const existing = existingRows.find((row) => {
+    const metadata = parseJson<Record<string, unknown>>(row.metadata, {});
+    return row.normalizedName === normalizedName
+      && metadata.source === "import_asset_draft"
+      && (!draft.assetId || metadata.sourceAssetId === draft.assetId);
+  }) ?? existingRows.find((row) => row.normalizedName === normalizedName);
+  const previousMetadata = parseJson<Record<string, unknown>>(existing?.metadata, {});
+  const incomingSourceAssetId = draft.assetId && draft.assetId !== assetId
+    ? draft.assetId
+    : "";
+
+  const values = {
+    projectId,
+    assetType: type,
+    name,
+    normalizedName,
+    aliases: normalizeAliases(draft.aliases),
+    role: cleanText(draft.role || draft.roleKey || draft.scope || draft.category),
+    description: cleanText(draft.description),
+    evidenceText: cleanText(draft.description || draft.visualConstraints || draft.visualHint || name),
+    confidence: Math.max(50, Math.min(95, importanceScore(undefined, draft))),
+    source: "ai" as const,
+    status: "merged" as const,
+    mergedAssetId: assetId,
+    metadata: {
+      source: "import_asset_draft",
+      sourceAssetId: incomingSourceAssetId || previousMetadata.sourceAssetId || draft.assetId || "",
+      episodes: draft.episodes || [],
+      visualHint: draft.visualHint || "",
+    },
+    updatedAt: now,
+  };
+
+  if (existing) {
+    const [candidate] = await db
+      .update(assetCandidates)
+      .set(values)
+      .where(eq(assetCandidates.id, existing.id))
+      .returning();
+    return candidate;
+  }
+
   const [candidate] = await db
     .insert(assetCandidates)
     .values({
       id: genId(),
-      projectId,
-      assetType: type,
-      name,
-      normalizedName: name.toLowerCase(),
-      aliases: normalizeAliases(draft.aliases),
-      role: cleanText(draft.role || draft.roleKey || draft.scope || draft.category),
-      description: cleanText(draft.description),
-      evidenceText: cleanText(draft.description || draft.visualConstraints || draft.visualHint || name),
-      confidence: Math.max(50, Math.min(95, importanceScore(undefined, draft))),
-      source: "ai",
-      status: "merged",
-      mergedAssetId: assetId,
-      metadata: {
-        source: "import_asset_draft",
-        sourceAssetId: draft.assetId || "",
-        episodes: draft.episodes || [],
-        visualHint: draft.visualHint || "",
-      },
+      ...values,
       createdAt: now,
-      updatedAt: now,
     })
     .returning();
   return candidate;
@@ -239,6 +273,39 @@ async function createAssetOccurrence(
   candidateId?: string | null,
 ) {
   const evidenceText = cleanText(draft.description || draft.visualConstraints || draft.visualHint || draft.name);
+  const metadata = {
+    source: "import_asset_draft",
+    episodes: draft.episodes || [],
+    visualHint: draft.visualHint || "",
+  };
+  const existingRows = await db
+    .select()
+    .from(assetOccurrences)
+    .where(eq(assetOccurrences.assetId, assetId))
+    .orderBy(asc(assetOccurrences.createdAt));
+  const existing = existingRows.find((row) => {
+    const rowMetadata = parseJson<Record<string, unknown>>(row.metadata, {});
+    return row.candidateId === (candidateId ?? null)
+      && rowMetadata.source === "import_asset_draft";
+  });
+
+  if (existing) {
+    const [occurrence] = await db
+      .update(assetOccurrences)
+      .set({
+        projectId,
+        assetId,
+        candidateId: candidateId ?? null,
+        occurrenceType: "mention",
+        evidenceText,
+        importance: importanceScore(undefined, draft),
+        metadata,
+      })
+      .where(eq(assetOccurrences.id, existing.id))
+      .returning();
+    return occurrence;
+  }
+
   const [occurrence] = await db
     .insert(assetOccurrences)
     .values({
@@ -249,11 +316,7 @@ async function createAssetOccurrence(
       occurrenceType: "mention",
       evidenceText,
       importance: importanceScore(undefined, draft),
-      metadata: {
-        source: "import_asset_draft",
-        episodes: draft.episodes || [],
-        visualHint: draft.visualHint || "",
-      },
+      metadata,
       createdAt: new Date(),
     })
     .returning();
@@ -361,6 +424,7 @@ async function findExistingAsset(projectId: string, type: StoryAssetType, name: 
 
   const normalizedName = name.toLowerCase();
   return existing.find((row) => {
+    if (sourceAssetId && row.id === sourceAssetId) return true;
     if (row.name.toLowerCase() === normalizedName) return true;
     const aliases = normalizeAliases(row.aliases);
     if (aliases.some((alias) => alias.toLowerCase() === normalizedName)) return true;
@@ -371,9 +435,12 @@ async function findExistingAsset(projectId: string, type: StoryAssetType, name: 
 
 function buildMetadata(type: StoryAssetType, draft: ImportAssetDraft, previous?: AssetRow | null) {
   const previousMetadata = parseJson<Record<string, unknown>>(previous?.metadata, {});
+  const incomingSourceAssetId = draft.assetId && draft.assetId !== previous?.id
+    ? draft.assetId
+    : "";
   return {
     ...previousMetadata,
-    sourceAssetId: draft.assetId || previousMetadata.sourceAssetId || "",
+    sourceAssetId: incomingSourceAssetId || previousMetadata.sourceAssetId || draft.assetId || "",
     category: draft.category || previousMetadata.category || type,
     role: draft.role || previousMetadata.role || "",
     roleKey: draft.roleKey || previousMetadata.roleKey || "",
@@ -487,8 +554,8 @@ export async function upsertStoryAsset(
     visualConstraints: cleanText(draft.visualConstraints || draft.visualHint || draft.description),
     negativeConstraints: cleanText(draft.negativePrompt),
     firstAppearance: Array.isArray(draft.episodes) ? draft.episodes[0] ?? "" : "",
-    confirmed: draft.confirmed ? 1 : 0,
-    referenceImage: draft.imageUrl || null,
+    confirmed: draft.confirmed ? 1 : existing?.confirmed ?? 0,
+    referenceImage: draft.imageUrl || existing?.referenceImage || null,
     metadata,
     updatedAt: now,
   };
