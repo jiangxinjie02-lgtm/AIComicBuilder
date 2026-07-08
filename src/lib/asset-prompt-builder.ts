@@ -361,6 +361,7 @@ export function shouldRebuildAssetDisplayPrompt(prompt: unknown) {
   if (/Asset reference sheet|Reusable prop asset reference|Reusable empty scene environment reference|STRUCTURED ENGLISH IMAGE PROMPT/i.test(text)) {
     return true;
   }
+  if (looksLikeConstraintOnlyPrompt(text)) return true;
   const profileText = extractDisplayPromptSection(text, ["角色档案", "物品档案", "环境档案"]) || text;
   return looksLikeDialogueOrActionLeak(profileText);
 }
@@ -398,6 +399,16 @@ function looksLikeDialogueOrActionLeak(text: string) {
   if (pronounCount >= 4 && (dialoguePunctuationCount > 0 || actionLeak)) return true;
   if (pronounCount >= 2 && actionLeak) return true;
   return false;
+}
+
+function looksLikeConstraintOnlyPrompt(text: string) {
+  const value = clean(text);
+  if (!value) return false;
+  const hasDisplaySections = /【(?:整体美学|画面规格|角色档案|物品档案|环境档案|职业与画风锚点|模板锁定|排除项)】/.test(value);
+  if (hasDisplaySections) return false;
+  const hasTemplateOrIdentityRules = /(模板|主图与全部变体|同一角色身份|脸型|五官|眉眼鼻唇|骨相|面部辨识度|性别识别|不改变年龄|只允许改变发型|禁止漫画风|换脸感)/.test(value);
+  const hasReusableAssetContext = /(整体美学|画面规格|角色档案|物品档案|环境档案|空间类型|物品参考图|环境概念图|角色设定图|时代约束|资产设定|主图用于后续分镜复用)/.test(value);
+  return hasTemplateOrIdentityRules && !hasReusableAssetContext;
 }
 
 function looksLikeSpeakerDialogueLine(line: string) {

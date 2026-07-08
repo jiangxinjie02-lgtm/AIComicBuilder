@@ -245,6 +245,8 @@ assert.doesNotMatch(providerPrompt, /AUTHORITATIVE USER IMAGE PROMPT|The followi
 
 const pollutedDisplayPrompt = "【角色档案】\n测试女主是剧本中的女主角。陆少，听说你缺个端茶倒水的。巧了，我刚好不想努力了。这婚，我结。你回来怎么不出声？你能感觉到我吃的味道？没事。";
 assert.equal(shouldRebuildAssetDisplayPrompt(pollutedDisplayPrompt), true, "dialogue-polluted display prompt should be rebuilt");
+const partialConstraintPrompt = "女主角真人模板；主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。";
+assert.equal(shouldRebuildAssetDisplayPrompt(partialConstraintPrompt), true, "constraint-only display prompt should be rebuilt");
 assert.equal(shouldRebuildAssetDisplayPrompt(displayPrompt), false, "clean Chinese display prompt should be preserved");
 
 console.log("Asset agent generalization checks passed.");
