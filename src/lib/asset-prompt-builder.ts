@@ -1145,6 +1145,18 @@ function isLate20thCenturyChina(era: string) {
   return /19[5-9][0-9]|1970|1980|1990|70s|80s|90s|七十年代|八十年代|九十年代/i.test(era);
 }
 
+function is1970sEra(era: string) {
+  return /197[0-9]|1970s|70s|七十年代|七零年代/i.test(era);
+}
+
+function is1980sEra(era: string) {
+  return /198[0-9]|1980s|80s|八十年代|八零年代/i.test(era);
+}
+
+function is1990sEra(era: string) {
+  return /199[0-9]|1990s|90s|九十年代|九零年代/i.test(era);
+}
+
 function eraDefaultClothing(era: string) {
   if (/post-apocalyptic|wasteland|末世|废土/i.test(era)) {
     return {
@@ -1155,7 +1167,7 @@ function eraDefaultClothing(era: string) {
       accessories: "survival utility belt, medical pouch, radio, gloves, or practical faction accessories only when fitting the role",
     };
   }
-  if (/1983|1980|80s|八十年代/i.test(era)) {
+  if (is1980sEra(era)) {
     return {
       top: "1980s China plain civilian blouse or shirt, simple modern cut, cotton fabric",
       bottom: "1980s China simple trousers or modest knee-length skirt, civilian everyday styling",
@@ -1164,7 +1176,7 @@ function eraDefaultClothing(era: string) {
       accessories: "simple 1980s civilian accessories only when explicitly defined",
     };
   }
-  if (/1970|70s|七十年代/i.test(era)) {
+  if (is1970sEra(era)) {
     return {
       top: "1970s China plain civilian shirt or work jacket, simple modern cut",
       bottom: "1970s China straight trousers or plain skirt",
@@ -1173,7 +1185,7 @@ function eraDefaultClothing(era: string) {
       accessories: "simple 1970s civilian accessories only when explicitly defined",
     };
   }
-  if (/1990|90s|九十年代/i.test(era)) {
+  if (is1990sEra(era)) {
     return {
       top: "1990s China plain civilian blouse, shirt, or simple jacket",
       bottom: "1990s China simple trousers or skirt",
@@ -1193,7 +1205,7 @@ function eraDefaultClothing(era: string) {
 
 function eraDefaultHairstyle(era: string) {
   if (/post-apocalyptic|wasteland|末世|废土/i.test(era)) return "practical post-apocalyptic hairstyle with realistic dust or fatigue when fitting the role";
-  if (/1983|1980|80s|八十年代/i.test(era)) return "simple 1980s China everyday hairstyle";
+  if (is1980sEra(era)) return "simple 1980s China everyday hairstyle";
   return "realistic everyday hairstyle consistent across all views";
 }
 
