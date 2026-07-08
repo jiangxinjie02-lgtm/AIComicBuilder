@@ -73,6 +73,7 @@ const fixtures = [
       absentSceneText: ["公路蜿蜒于青"],
       absentCharacterText: ["声音"],
       promptIncludes: ["1983"],
+      promptExcludes: ["我会把事情说清楚", "我陪你去"],
     },
   },
   {
@@ -104,6 +105,7 @@ const fixtures = [
       scenes: ["公司会议室"],
       props: ["合同"],
       absentProps: ["弓"],
+      promptExcludes: ["秦总，会议室已经清空", "把合同推到秦越面前"],
     },
   },
   {
@@ -134,6 +136,7 @@ const fixtures = [
       scenes: ["王府书房"],
       props: ["玉佩"],
       absentCharacterText: ["视角"],
+      promptExcludes: ["她看见桌上的玉佩"],
     },
   },
 ];
@@ -189,6 +192,10 @@ for (const fixture of fixtures) {
   ].map((asset) => asset.prompt).join("\n");
   for (const text of fixture.expect.promptIncludes || []) {
     assert.match(promptSource, new RegExp(text), `${fixture.title}: prompt should include ${text}`);
+  }
+
+  for (const text of fixture.expect.promptExcludes || []) {
+    assert.equal(promptSource.includes(text), false, `${fixture.title}: prompt should not include dialogue/action text "${text}"`);
   }
 
   console.log(`PASS ${fixture.title}`);

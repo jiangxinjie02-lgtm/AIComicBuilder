@@ -1387,8 +1387,8 @@ function makeCharacterAsset(
   const age = inferAge(joined);
   const temperament = inferTemperament(joined);
   const epRefs = inferEpisodeRefs(text, seed.name, episodes);
-  const profile = buildCharacterProfile(seed, snippets, joined);
-  const background = buildCharacterBackground(seed, snippets);
+  const profile = buildCharacterProfile(seed, joined);
+  const background = buildCharacterBackground(seed);
   const faceTemplate = FACE_TEMPLATES[roleKey] || null;
   const visualConstraints = [
     faceTemplate ? `${faceTemplate.label}；${faceTemplate.note}` : "",
@@ -2020,16 +2020,19 @@ function inferTemperament(context: string) {
   return traits.slice(0, 2).join("，") || "自然真实，情绪层次克制";
 }
 
-function buildCharacterProfile(seed: CharacterSeed, snippets: string[], joined: string) {
-  const source = seed.contexts.concat(snippets).join(" ");
-  const compact = compactCompleteSentences(source, 260);
-  let profile = "";
-  if (compact) {
-    profile = ensureSentenceEnd(`${seed.name}是剧本中的${seed.role}。${compact}`);
-  } else {
-    const temperament = inferTemperament(joined);
-    profile = ensureSentenceEnd(`${seed.name}是剧本中的${seed.role}，角色气质为${temperament}，在剧情中承担与其身份相匹配的叙事功能。`);
-  }
+function buildCharacterProfile(seed: CharacterSeed, joined: string) {
+  const gender = inferGender(seed.name, joined, seed.role);
+  const age = inferAge(joined);
+  const temperament = inferTemperament(joined);
+  const identity = [
+    gender && gender !== "性别未定" ? `性别识别为${gender}` : "",
+    age && age !== "年龄未定" ? `年龄层次为${age}` : "",
+    temperament ? `气质为${temperament}` : "",
+  ].filter(Boolean).join("，");
+  const role = seed.role || "角色";
+  const profile = ensureSentenceEnd(
+    `${seed.name}是剧本中的${role}${identity ? `，${identity}` : ""}。造型需依据项目时代、题材、身份层级和人物关系建立，保持稳定身份，不复现单场戏对白或动作。`,
+  );
   return normalizeCharacterProfileLength(profile, seed.name, seed.role);
 }
 
@@ -2140,18 +2143,10 @@ function joinPromptSections(sections: Array<[string, string | string[]]>) {
     .join("\n\n");
 }
 
-function buildCharacterBackground(seed: CharacterSeed, snippets: string[]) {
-  const source = seed.contexts.concat(snippets).join(" ");
-  const sentences = source
-    .replace(/\s+/g, " ")
-    .split(/(?<=[。！？!?])/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  const first = ensureSentenceEnd(sentences[0] || `${seed.name}的主要剧情围绕${seed.role}身份、关键选择和人物关系展开`);
-  const second = ensureSentenceEnd(
-    compactText(sentences.slice(1).join(""), 90)
-    || `${seed.name}在冲突推进、情绪转折和阵营关系中承担重要叙事作用`,
-  );
+function buildCharacterBackground(seed: CharacterSeed) {
+  const role = seed.role || "角色";
+  const first = ensureSentenceEnd(`${seed.name}的资产设定围绕${role}身份、年龄层次、气质和时代造型展开`);
+  const second = ensureSentenceEnd(`${seed.name}的主图用于后续分镜复用，应表现可长期保持的人物识别点，而不是某一句对白或单场戏动作`);
   return `${first}\n${second}`;
 }
 
@@ -2180,6 +2175,7 @@ function buildCharacterProfileSummary(name: string, role: string, profile: strin
 function cleanPromptSentence(text: string) {
   return String(text || "")
     .replace(/^主体[:：]\s*/, "")
+    .replace(/^[\u4e00-\u9fa5A-Za-z0-9·]{1,12}(?:[（(][^）)]{1,24}[）)])?[：:]\s*/g, "")
     .replace(/人物[:：][^。！？!?]*/g, "")
     .replace(/【[\s\S]*$/g, "")
     .replace(/模板锁定[:：][\s\S]*$/g, "")
@@ -2203,20 +2199,19 @@ function buildCharacterVisualAnchors(
   role: string,
   profile: string,
   background: string,
-  projectStyleGuide: string,
 ) {
-  const text = `${name} ${role} ${profile} ${background} ${projectStyleGuide}`;
+  const text = `${name} ${role} ${profile} ${background}`;
   const anchors: string[] = [];
-  if (/医疗|医生|外科|急救|护士|医疗官/.test(text)) {
-    anchors.push("医疗职业必须可视化：服装和配件体现据点医疗官或外科医生身份，可使用战术医疗背心、急救包、医用腰包、医疗臂章等，不要普通白衫牛仔裤。");
+  if (/医生|军医|护士|护工|大夫|医师|医疗官|外科|急救/.test(text)) {
+    anchors.push("医疗职业必须可视化：服装、配件和工作状态体现医生、护士或医疗人员身份；可使用白大褂、医疗胸牌、急救包、医用腰包或年代匹配的医疗用品，避免普通棚拍装。");
   }
-  if (/重卡|指挥官|车队|队长|战神|系统|救援/.test(text)) {
+  if (/重卡|指挥官|车队|队长|战神|救援/.test(text)) {
     anchors.push("指挥/车队身份必须可视化：服装体现末世重卡指挥官或救援队核心身份，可使用战术夹克、工装裤、战术靴、腰挂装备、通讯配件等，不要普通黑衬衫棚拍。");
   }
-  if (/工程师|工兵|机械|焊接|维修|工厂/.test(text)) {
+  if (/工程师|工兵|机械|焊接|维修|工厂|技工/.test(text)) {
     anchors.push("工程职业必须可视化：服装和配件体现机械工程师或工兵身份，可使用耐磨工装、工具腰带、焊接痕迹、机械油污或护具。");
   }
-  if (/反派|暴君|城主|军官|武装|势力|黑市|商会/.test(text)) {
+  if (/反派|暴君|城主|军官|武装|势力|黑市|商会|将军|首长/.test(text)) {
     anchors.push("阵营身份必须可视化：服装、配饰和气质体现所属势力、权力层级或黑市/武装背景，避免普通路人造型。");
   }
   anchors.push("整体画风必须落到服装材质、配件磨损、妆发状态、色彩气氛和资产细节；禁止与角色档案无关的普通都市棚拍装。");
@@ -2249,7 +2244,7 @@ function buildCharacterImagePrompt(
       "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
     ]],
     ["角色档案", buildCharacterProfileSummary(name, role, profile, background)],
-    ["职业与画风锚点", buildCharacterVisualAnchors(name, role, profile, background, projectStyleGuide)],
+    ["职业与画风锚点", buildCharacterVisualAnchors(name, role, profile, background)],
     ["模板锁定", [
       `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
       supportConstraint ? `身份约束：${supportConstraint}` : "",
@@ -2260,13 +2255,9 @@ function buildCharacterImagePrompt(
 
 function buildPropImagePrompt(name: string, type: string, description: string, projectStyleGuide: string) {
   const assetType = type || "剧情道具";
-  const propSource = String(description || "").replace(/\s+/g, " ").trim();
   const propFallback = `${name}是剧本中的${assetType}，需体现核心功能、材质结构和关键识别特征。`;
-  const propDescription = propSource.length > 150 || /剧名|人设|第\d+集/.test(propSource)
-    ? propFallback
-    : propSource || propFallback;
   const assetDescription = ensureSentenceEnd(
-    compactText(propDescription, 120)
+    compactText(propFallback, 120)
       .replace(/\s+/g, " ")
       .trim(),
   );
@@ -2285,13 +2276,9 @@ function buildPropImagePrompt(name: string, type: string, description: string, p
 function buildSceneImagePrompt(name: string, type: string, description: string, times: string[], projectStyleGuide: string) {
   const sceneType = type || "剧情场景";
   const timeText = times.length ? `可扩展为${times.map((time) => `${time}景`).join("、")}。` : "";
-  const sceneSource = String(description || "").replace(/\s+/g, " ").trim();
   const sceneFallback = `${name}是剧本中的${sceneType}，需要建立稳定的空间结构、环境氛围和可复用方位关系。`;
-  const sceneBase = sceneSource.length > 170 || /剧名|人设|第\d+集/.test(sceneSource)
-    ? sceneFallback
-    : sceneSource || sceneFallback;
   const sceneDescription = ensureSentenceEnd(
-    `${compactText(sceneBase, 140)}${timeText}`
+    `${compactText(sceneFallback, 140)}${timeText}`
       .replace(/\s+/g, " ")
       .trim(),
   );
@@ -2534,36 +2521,6 @@ function findSnippets(text: string, keyword: string) {
 function compactText(text: string, maxLength: number) {
   const cleaned = String(text || "").replace(/\s+/g, " ").trim();
   return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}...` : cleaned;
-}
-
-function compactCompleteSentences(text: string, maxLength: number) {
-  const cleaned = String(text || "")
-    .replace(/\s+/g, " ")
-    .replace(/\.\.\.|…/g, "")
-    .trim();
-  if (!cleaned) return "";
-  if (cleaned.length <= maxLength) return ensureSentenceEnd(cleaned);
-
-  const pieces = cleaned
-    .split(/(?<=[。！？!?；;])/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  let result = "";
-  for (const piece of pieces) {
-    if ((result + piece).length > maxLength) break;
-    result += piece;
-  }
-  if (result) return ensureSentenceEnd(result);
-
-  const truncated = cleaned.slice(0, maxLength);
-  const lastStop = Math.max(
-    truncated.lastIndexOf("。"),
-    truncated.lastIndexOf("！"),
-    truncated.lastIndexOf("？"),
-    truncated.lastIndexOf(";"),
-    truncated.lastIndexOf("；"),
-  );
-  return ensureSentenceEnd(lastStop > 20 ? truncated.slice(0, lastStop + 1) : truncated);
 }
 
 function ensureSentenceEnd(text: string) {
