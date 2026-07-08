@@ -13,7 +13,7 @@ import {
 } from "@/lib/story-assets";
 import {
   buildAssetImagePrompt,
-  buildPromptAnchoredFinalPrompt,
+  buildCompiledAssetProviderPrompt,
   categoryToAssetType,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
@@ -181,7 +181,7 @@ export async function POST(
       ...(body.styleSpec || {}),
     },
   });
-  const providerPrompt = buildPromptAnchoredFinalPrompt({
+  const providerPrompt = buildCompiledAssetProviderPrompt({
     sourcePrompt: authoritativePrompt,
     compiledPrompt: builtPrompt.compiled_final_prompt,
     category,

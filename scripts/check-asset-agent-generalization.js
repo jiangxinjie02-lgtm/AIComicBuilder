@@ -40,6 +40,10 @@ require.extensions[".ts"] = function compileTypescript(module, filename) {
 };
 
 const { analyzeScriptAssets } = require("../src/lib/asset-agent/analyze-script-assets.ts");
+const {
+  buildAssetImagePrompt,
+  buildCompiledAssetProviderPrompt,
+} = require("../src/lib/asset-prompt-builder.ts");
 
 const fixtures = [
   {
@@ -200,5 +204,42 @@ for (const fixture of fixtures) {
 
   console.log(`PASS ${fixture.title}`);
 }
+
+const displayPrompt = "【整体美学】\n1990年代中国现实主义摄影质感。\n\n【角色档案】\n测试女主是剧本中的女主角，性别识别为女性。\n\n【服装发型】\n上衣：红色棉袄。发型：短发。\n\n【排除项】\n无文字，无现代豪车。";
+const compiled = buildAssetImagePrompt({
+  asset: {
+    id: "test_character",
+    type: "character",
+    name: "测试女主",
+    role: "女主角",
+    category: "characters",
+    prompt: displayPrompt,
+    description: "测试女主是剧本中的女主角。",
+    visualConstraints: "性别识别保持女性，1990年代中国，红色棉袄，短发。",
+    negativeConstraints: "无文字，无现代豪车。",
+    tags: ["女主角", "女性"],
+  },
+  styleSpec: {
+    era: "1990s China",
+    eraConstraint: "1990s China",
+    genre: "realistic Chinese short-drama asset reference",
+  },
+});
+assert.match(compiled.compiled_final_prompt, /Asset reference sheet/i);
+assert.match(compiled.compiled_final_prompt, /1990s China/i);
+assert.match(compiled.compiled_final_prompt, /red cotton-padded jacket/i);
+assert.match(compiled.compiled_final_prompt, /short hair/i);
+assert.doesNotMatch(compiled.compiled_final_prompt, /【整体美学】|【角色档案】|上衣：|发型：/);
+
+const providerPrompt = buildCompiledAssetProviderPrompt({
+  sourcePrompt: displayPrompt,
+  compiledPrompt: compiled.compiled_final_prompt,
+  category: "characters",
+  targetName: "测试女主",
+  mode: "main",
+});
+assert.match(providerPrompt, /STRUCTURED ENGLISH IMAGE PROMPT/i);
+assert.match(providerPrompt, /COMPILED VISUAL PROMPT/i);
+assert.doesNotMatch(providerPrompt, /AUTHORITATIVE USER IMAGE PROMPT|The following Chinese image prompt/i);
 
 console.log("Asset agent generalization checks passed.");

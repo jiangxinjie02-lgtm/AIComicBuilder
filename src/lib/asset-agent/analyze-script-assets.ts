@@ -1436,10 +1436,13 @@ function makeCharacterAsset(
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("characters"),
     promptMetadata: {
+      displayPromptLanguage: "zh",
+      generationPromptLanguage: "en_structured",
       promptBuilder: "asset_prompt_compiler_v2",
       compilerInput: builtPrompt.compiler_input,
       compilerIR: builtPrompt.compiler_ir,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      compiledNegativePrompt: builtPrompt.compiled_negative_prompt,
       validation: builtPrompt.validation_report,
     },
     variants: mergeAssetVariants(
@@ -1500,10 +1503,13 @@ function makePropAsset(
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("props"),
     promptMetadata: {
+      displayPromptLanguage: "zh",
+      generationPromptLanguage: "en_structured",
       promptBuilder: "asset_prompt_compiler_v2",
       compilerInput: builtPrompt.compiler_input,
       compilerIR: builtPrompt.compiler_ir,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      compiledNegativePrompt: builtPrompt.compiled_negative_prompt,
       validation: builtPrompt.validation_report,
     },
     variants: explicitVariants.length ? explicitVariants : suggestPropVariants(seed.name, seed.type, sourceSnippets, prompt),
@@ -1562,10 +1568,13 @@ function makeSceneAsset(
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("scenes"),
     promptMetadata: {
+      displayPromptLanguage: "zh",
+      generationPromptLanguage: "en_structured",
       promptBuilder: "asset_prompt_compiler_v2",
       compilerInput: builtPrompt.compiler_input,
       compilerIR: builtPrompt.compiler_ir,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      compiledNegativePrompt: builtPrompt.compiled_negative_prompt,
       validation: builtPrompt.validation_report,
     },
     variants: mergeAssetVariants(

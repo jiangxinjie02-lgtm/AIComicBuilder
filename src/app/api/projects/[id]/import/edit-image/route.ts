@@ -8,7 +8,7 @@ import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 import {
   buildAssetImagePrompt,
-  buildPromptAnchoredFinalPrompt,
+  buildCompiledAssetProviderPrompt,
   categoryToAssetType,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
@@ -181,7 +181,7 @@ export async function POST(
       ...(body.styleSpec || {}),
     },
   });
-  const anchoredPrompt = buildPromptAnchoredFinalPrompt({
+  const anchoredPrompt = buildCompiledAssetProviderPrompt({
     sourcePrompt: authoritativePrompt,
     compiledPrompt: builtPrompt.compiled_final_prompt,
     category,

@@ -331,6 +331,30 @@ export function buildPromptAnchoredFinalPrompt(input: {
   ].filter(Boolean).join("\n\n");
 }
 
+export function buildCompiledAssetProviderPrompt(input: {
+  sourcePrompt?: string | null;
+  compiledPrompt: string;
+  category: string;
+  targetName?: string | null;
+  mode?: "main" | "variant" | "edit";
+}) {
+  const compiledPrompt = clean(input.compiledPrompt);
+  const relationRules = promptRelationRules(input.category, input.mode);
+  const sourcePrompt = normalizeAuthoritativePrompt(input.sourcePrompt);
+  const sourceFingerprint = sourcePrompt
+    ? `Display prompt source: Chinese editable asset prompt, ${sourcePrompt.length} characters, compiled into structured English slots.`
+    : "";
+
+  return [
+    `STRUCTURED ENGLISH IMAGE PROMPT FOR ${input.targetName || "ASSET"}:`,
+    sourceFingerprint,
+    "GENERATION RULES:",
+    relationRules,
+    "COMPILED VISUAL PROMPT:",
+    compiledPrompt,
+  ].filter(Boolean).join("\n\n");
+}
+
 function normalizeAuthoritativePrompt(prompt: unknown) {
   const text = clean(prompt)
     .replace(/\r\n/g, "\n")
@@ -689,7 +713,7 @@ function compileConstraints(
       : "Do not turn the reusable prop reference into a held-object story frame.";
   return {
     era,
-    genre: genre || "realistic Chinese short-drama asset reference",
+    genre: toEnglishPromptValue(genre || "realistic Chinese short-drama asset reference"),
     visual_must_not_have: visualMustNotHave,
     system_rules: uniq([SYSTEM_RULES.noStory, SYSTEM_RULES.respectBindings, typeRule]),
   };
@@ -830,6 +854,8 @@ function stableVisualText(asset: AssetPromptAsset, variant?: AssetPromptVariant 
 
 function sanitizeVisualText(value: unknown, maxLength = 420) {
   const text = clean(value)
+    .replace(/\/templates\/[^\s，。；;）)]+/g, "template image")
+    .replace(/【[^】]+】/g, "。")
     .replace(/\s+/g, " ")
     .split(/[。.!！？?]/)
     .map((sentence) => sentence.trim())
@@ -913,12 +939,12 @@ function faceTemplateText(asset: AssetPromptAsset) {
 
 function inferEraConstraint(values: unknown[]) {
   const joined = values.map((value) => clean(value)).filter(Boolean).join(" ");
-  const explicitYear = joined.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
-  if (explicitYear) return `${explicitYear[1]} China`;
   if (/末世|废土|末日|灾变|丧尸|避难所|重卡|荒凉/i.test(joined)) return "post-apocalyptic wasteland China";
   if (/八十年代|80年代|1980年代|1980s/i.test(joined)) return "1980s China";
   if (/七十年代|70年代|1970年代|1970s/i.test(joined)) return "1970s China";
   if (/九十年代|90年代|1990年代|1990s/i.test(joined)) return "1990s China";
+  const explicitYear = joined.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
+  if (explicitYear) return `${explicitYear[1]} China`;
   if (/民国/.test(joined)) return "Republican-era China";
   if (/古代|唐代|宋代|明代|清代|汉代|古风|仙侠|武侠/.test(joined)) return "historical China";
   if (/现代|当代|现实/.test(joined)) return "contemporary realistic China";
@@ -992,6 +1018,197 @@ function eraDefaultHairstyle(era: string) {
   return "realistic everyday hairstyle consistent across all views";
 }
 
+const ZH_VISUAL_PROMPT_TERMS: Array<[string, string]> = [
+  ["真人实拍摄影质感", "realistic live-action photography"],
+  ["自然皮肤毛孔与织物纹理", "natural skin pores and fabric texture"],
+  ["自然皮肤纹理", "natural skin texture"],
+  ["影棚级光影", "studio-grade lighting"],
+  ["35mm 胶片质地", "35mm film texture"],
+  ["年代写实影视画风", "period realistic cinematic style"],
+  ["古装写实影视画风", "historical realistic cinematic style"],
+  ["都市短剧写实画风", "urban realistic short-drama style"],
+  ["真人短剧写实画风", "realistic live-action short-drama style"],
+  ["整体画风", "overall visual style"],
+  ["时代约束", "era constraint"],
+  ["不出现明显跨时代物件", "no visibly anachronistic objects"],
+  ["只允许改变", "only allow changes to"],
+  ["不改变", "do not change"],
+  ["必须与", "must match "],
+  ["必须", "must"],
+  ["保持", "keep"],
+  ["参考", "reference "],
+  ["突出", "emphasize "],
+  ["服装、发型、建筑、交通工具、道具、电器和广告字体必须符合该年份", "clothing, hairstyle, architecture, vehicles, props, appliances, and signage must match that year"],
+  ["服装、建筑、道具、色彩和光影保持时代质感统一", "clothing, architecture, props, color, and lighting keep a unified period texture"],
+  ["1980年代中国", "1980s China"],
+  ["八十年代中国", "1980s China"],
+  ["七十年代中国", "1970s China"],
+  ["九十年代中国", "1990s China"],
+  ["1990年代中国", "1990s China"],
+  ["1980年代中国", "1980s China"],
+  ["1970年代中国", "1970s China"],
+  ["现代中国", "contemporary China"],
+  ["民国时期中国", "Republican-era China"],
+  ["古代或架空古代中国", "ancient or fictional historical China"],
+  ["女主角", "female lead"],
+  ["男主角", "male lead"],
+  ["女主角真人模板", "female lead live-action face template"],
+  ["男主角真人模板", "male lead live-action face template"],
+  ["女配角真人模板", "female supporting live-action face template"],
+  ["男配角真人模板", "male supporting live-action face template"],
+  ["女配角", "female supporting character"],
+  ["男配角", "male supporting character"],
+  ["反派角色", "antagonist character"],
+  ["无名配角", "unnamed supporting character"],
+  ["角色", "character"],
+  ["女性", "female"],
+  ["男性", "male"],
+  ["年轻", "young adult"],
+  ["青年", "young adult"],
+  ["中年", "middle-aged"],
+  ["老年", "elderly"],
+  ["自然真实", "natural and realistic"],
+  ["情绪层次克制", "restrained emotional layering"],
+  ["紧张敏感", "tense and sensitive"],
+  ["冷静克制", "calm and restrained"],
+  ["温和细腻", "gentle and nuanced"],
+  ["强势有压迫感", "commanding and oppressive"],
+  ["疲惫脆弱", "tired and fragile"],
+  ["脸型", "face shape"],
+  ["五官比例", "facial feature proportions"],
+  ["眉眼鼻唇比例", "eyebrow-eye-nose-lip proportions"],
+  ["眉眼鼻唇关系", "eyebrow-eye-nose-lip relationship"],
+  ["骨相", "facial bone structure"],
+  ["面部辨识度", "facial recognizability"],
+  ["面部辨识", "facial recognizability"],
+  ["模板一致", "consistent with the template"],
+  ["模板", "template"],
+  ["一致", "consistent"],
+  ["短发", "short hair"],
+  ["长发", "long hair"],
+  ["盘发", "updo hairstyle"],
+  ["辫子", "braided hair"],
+  ["发型", "hairstyle"],
+  ["头发", "hair"],
+  ["服装发型", "clothing and hairstyle"],
+  ["上衣", "top"],
+  ["下装", "bottom clothing"],
+  ["外套", "outerwear jacket"],
+  ["大衣", "coat"],
+  ["夹克", "jacket"],
+  ["衬衫", "shirt"],
+  ["白大褂", "white medical coat"],
+  ["制服", "uniform"],
+  ["棉袄", "cotton-padded jacket"],
+  ["红色棉袄", "red cotton-padded jacket"],
+  ["裙子", "skirt"],
+  ["长裤", "trousers"],
+  ["裤子", "trousers"],
+  ["布鞋", "cloth shoes"],
+  ["皮鞋", "leather shoes"],
+  ["鞋", "shoes"],
+  ["靴", "boots"],
+  ["配饰", "accessories"],
+  ["医疗胸牌", "medical badge"],
+  ["急救包", "first-aid kit"],
+  ["医用腰包", "medical waist pouch"],
+  ["眼镜", "glasses"],
+  ["帽子", "hat"],
+  ["红色", "red"],
+  ["蓝色", "blue"],
+  ["黑色", "black"],
+  ["白色", "white"],
+  ["灰色", "gray"],
+  ["绿色", "green"],
+  ["棕色", "brown"],
+  ["米色", "beige"],
+  ["低饱和", "low-saturation"],
+  ["纯白背景", "pure white background"],
+  ["平视视角", "eye-level view"],
+  ["正面视角", "front view"],
+  ["居中构图", "centered composition"],
+  ["完整展示全貌", "full object visible"],
+  ["单人完整入画", "single full character fully in frame"],
+  ["头脚不裁切", "head and feet not cropped"],
+  ["正面", "front view"],
+  ["侧面", "side view"],
+  ["背面", "back view"],
+  ["三视图", "turnaround three-view sheet"],
+  ["大全景", "wide establishing shot"],
+  ["超广角", "ultra-wide angle"],
+  ["大气透视", "atmospheric perspective"],
+  ["道路", "road"],
+  ["剧情场景", "story scene environment"],
+  ["剧情道具", "story prop"],
+  ["文件", "document prop"],
+  ["合同", "contract document"],
+  ["物品参考图", "prop reference sheet"],
+  ["环境概念图", "environment concept reference"],
+  ["角色设定图", "character design reference sheet"],
+  ["空间结构", "spatial structure"],
+  ["环境氛围", "environmental atmosphere"],
+  ["方位关系", "orientation relationship"],
+  ["空间尺度", "spatial scale"],
+  ["布局", "layout"],
+  ["建筑材质", "architectural materials"],
+  ["主色调", "primary color palette"],
+  ["标志性陈设", "signature set dressing"],
+  ["光源基调", "base lighting direction"],
+  ["形状", "shape"],
+  ["尺寸", "size"],
+  ["材质", "material"],
+  ["颜色", "color"],
+  ["磨损痕迹", "wear marks"],
+  ["表面质感", "surface texture"],
+  ["使用痕迹", "usage marks"],
+  ["核心功能", "core function"],
+  ["关键识别特征", "key recognizable features"],
+  ["无字幕", "no subtitles"],
+  ["无文字", "no text"],
+  ["水印", "watermark"],
+  ["无其他人物", "no other people"],
+  ["无人", "no people"],
+  ["无人物", "no people"],
+  ["无人影", "no human silhouettes"],
+  ["无背景环境", "no background environment"],
+  ["无持握者", "no holder"],
+  ["无手", "no hands"],
+  ["禁止漫画风", "no comic style"],
+  ["二次元", "anime style"],
+  ["插画风", "illustration style"],
+  ["现代豪车", "modern luxury car"],
+  ["迈巴赫", "Maybach luxury car"],
+  ["智能手机", "smartphone"],
+  ["文字", "text"],
+  ["和", " and "],
+];
+
+function toEnglishPromptValue(value: unknown) {
+  let text = clean(value);
+  if (!text) return "";
+  if (!/[\u3400-\u9fff]/.test(text)) return text;
+
+  for (const [source, target] of ZH_VISUAL_PROMPT_TERMS.sort((a, b) => b[0].length - a[0].length)) {
+    text = text.replace(new RegExp(escapeRegExp(source), "g"), target);
+  }
+
+  return text
+    .replace(/[【】]/g, "")
+    .replace(/（/g, " (")
+    .replace(/）/g, ") ")
+    .replace(/[：]/g, ": ")
+    .replace(/[，、]/g, ", ")
+    .replace(/[；]/g, "; ")
+    .replace(/[。！？]/g, ". ")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([,.;:])/g, "$1")
+    .trim();
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function containsForbiddenTerm(text: string, term: string) {
   const lowerTerm = term.toLowerCase().trim();
   if (!lowerTerm) return false;
@@ -1021,7 +1238,7 @@ function collectSlots(ir: AssetCompilerIR) {
 }
 
 function slotValue(slotItem?: CompiledVisualSlot) {
-  return clean(slotItem?.value);
+  return toEnglishPromptValue(slotItem?.value);
 }
 
 function joinValues(values: Array<CompiledVisualSlot | undefined>) {
@@ -1068,7 +1285,7 @@ function commonNegative() {
 
 function renderNegativePrompt(values: unknown[]) {
   return uniq(values.flatMap((value) => String(value ?? "").split(/[,，\n]/)))
-    .map((item) => sanitizeVisualText(item))
+    .map((item) => toEnglishPromptValue(sanitizeVisualText(item)))
     .filter(Boolean)
     .join(", ");
 }
