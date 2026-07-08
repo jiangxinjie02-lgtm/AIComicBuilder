@@ -2,6 +2,7 @@ import {
   buildAssetImagePrompt,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
+  type AssetStyleSpec,
 } from "@/lib/asset-prompt-builder";
 
 type AssetCategory = "characters" | "props" | "scenes" | "voices";
@@ -73,6 +74,7 @@ export interface AssetAgentAsset {
   prompt: string;
   negativePrompt: string;
   promptMetadata?: Record<string, unknown>;
+  styleSpec?: AssetStyleSpec;
   variants: AssetAgentVariant[];
   imageUrl: string;
   audioUrl?: string;
@@ -1436,6 +1438,7 @@ function makeCharacterAsset(
     visualConstraints,
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("characters"),
+    styleSpec: builtPrompt.compiler_input.style_spec,
     promptMetadata: {
       displayPromptLanguage: "zh",
       generationPromptLanguage: "en_structured",
@@ -1505,6 +1508,7 @@ function makePropAsset(
     visualConstraints,
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("props"),
+    styleSpec: builtPrompt.compiler_input.style_spec,
     promptMetadata: {
       displayPromptLanguage: "zh",
       generationPromptLanguage: "en_structured",
@@ -1572,6 +1576,7 @@ function makeSceneAsset(
     visualConstraints,
     prompt,
     negativePrompt: builtPrompt.compiled_negative_prompt || defaultNegativePrompt("scenes"),
+    styleSpec: builtPrompt.compiler_input.style_spec,
     promptMetadata: {
       displayPromptLanguage: "zh",
       generationPromptLanguage: "en_structured",

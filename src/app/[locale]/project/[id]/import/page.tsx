@@ -27,6 +27,7 @@ import {
   buildAssetImagePrompt,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
+  shouldPreferCompiledDisplayPrompt,
   shouldRebuildAssetDisplayPrompt,
   type AssetPromptType,
   type AssetStyleSpec,
@@ -304,7 +305,7 @@ function compileImportAssetPrompt(
 
 function resolveDisplayAssetPrompt(prompt: unknown, fallback: string) {
   const existingPrompt = String(prompt || "").trim();
-  if (shouldRebuildAssetDisplayPrompt(existingPrompt)) return fallback;
+  if (shouldPreferCompiledDisplayPrompt(existingPrompt, fallback)) return fallback;
   return existingPrompt;
 }
 
@@ -336,7 +337,23 @@ function isLegacyAssetPrompt(prompt: string) {
 }
 
 function buildImportAssetStyleSpec(asset: WorkbenchAsset, projectStyleGuide = ""): AssetStyleSpec {
+  const incoming = asRecord(asset.styleSpec);
+  const visualSchema = asRecord(asset.visualSchema);
+  const visualConstraints = asRecord(visualSchema.constraints);
+  const promptMetadata = asRecord(asset.promptMetadata);
+  const compilerIR = asRecord(promptMetadata.compilerIR);
+  const compilerConstraints = asRecord(compilerIR.constraints);
+  const compilerInput = asRecord(promptMetadata.compilerInput);
+  const compilerStyleSpec = asRecord(compilerInput.style_spec);
   const era = detectEraConstraint([
+    readRecordString(incoming, "era"),
+    readRecordString(incoming, "eraConstraint"),
+    readRecordString(visualConstraints, "era"),
+    readRecordString(compilerConstraints, "era"),
+    readRecordString(compilerStyleSpec, "eraConstraint"),
+    readRecordString(compilerStyleSpec, "era"),
+    promptMetadata.compiledFinalPrompt,
+    promptMetadata.compiledDisplayPrompt,
     projectStyleGuide,
     asset.description,
     asset.visualHint,
@@ -347,12 +364,14 @@ function buildImportAssetStyleSpec(asset: WorkbenchAsset, projectStyleGuide = ""
   ]);
   return {
     ...defaultAssetStyleSpec(),
+    ...compilerStyleSpec,
+    ...incoming,
     ...(era ? { era, eraConstraint: era } : {}),
   };
 }
 
 function detectEraConstraint(values: unknown[]) {
-  const text = values.map((value) => String(value || "")).join(" ");
+  const text = values.map((value) => String(value || "")).filter(Boolean).join(" ");
   const explicitYear = text.match(/(19[0-9]{2}|20[0-9]{2})\s*(?:年|s)?/i);
   if (explicitYear) return `${explicitYear[1]} China`;
   if (/八十年代|八零年代|80年代|1980s|1980年代/i.test(text)) return "1980s China";
@@ -360,6 +379,13 @@ function detectEraConstraint(values: unknown[]) {
   if (/九十年代|90年代|1990s|1990年代/i.test(text)) return "1990s China";
   if (/民国|军阀|谍战|抗战/.test(text)) return "Republican-era China";
   if (/古代|古装|仙侠|武侠|宫廷|汉服/.test(text)) return "historical China";
+  return "";
+}
+
+function readRecordString(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
 }
 

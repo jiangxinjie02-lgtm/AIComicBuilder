@@ -185,6 +185,7 @@ function mapCharacter(asset: AssetAgentAsset): ImportedCharacter {
     tags: asset.tags,
     faceTemplate: asset.faceTemplate,
     promptMetadata: asset.promptMetadata,
+    styleSpec: asset.styleSpec,
   };
 }
 
@@ -209,6 +210,7 @@ function mapAsset(asset: AssetAgentAsset): ImportedAsset {
     mainImageName: asset.mainImageName,
     tags: asset.tags,
     promptMetadata: asset.promptMetadata,
+    styleSpec: asset.styleSpec,
   };
 }
 

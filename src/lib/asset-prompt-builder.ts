@@ -374,6 +374,17 @@ export function shouldRebuildAssetDisplayPrompt(prompt: unknown) {
   return looksLikeDialogueOrActionLeak(profileText);
 }
 
+export function shouldPreferCompiledDisplayPrompt(existingPrompt: unknown, compiledDisplayPrompt: unknown) {
+  const existing = normalizeAuthoritativePrompt(existingPrompt);
+  const compiled = normalizeAuthoritativePrompt(compiledDisplayPrompt);
+  if (!compiled) return false;
+  if (!existing) return true;
+  if (shouldRebuildAssetDisplayPrompt(existing)) return true;
+  if (hasSpecificEraSignal(compiled) && !hasSpecificEraSignal(existing)) return true;
+  if (hasGenericEraFallback(existing) && hasSpecificEraSignal(compiled)) return true;
+  return false;
+}
+
 function normalizeAuthoritativePrompt(prompt: unknown) {
   const text = clean(prompt)
     .replace(/\r\n/g, "\n")
@@ -439,6 +450,21 @@ function looksLikeTranslatedCompiledDisplayPrompt(text: string) {
 
 function hasUntranslatedCompilerResidue(text: string) {
   return /\b(stable character identity|story scene background|unrelated environment props|cropped head|cropped feet|dramatic action pose|natural skin texture|anime style|illustration style|no comic style)\b/i.test(text);
+}
+
+function hasGenericEraFallback(text: string) {
+  const value = clean(text);
+  return /realistic modern\/civilian China unless asset schema explicitly states otherwise/i.test(value)
+    || /现实主义现代\/平民中国，?除非资产结构明确指定其他时代/.test(value);
+}
+
+function hasSpecificEraSignal(text: string) {
+  const value = clean(text);
+  return /(19[0-9]{2}|20[0-9]{2})\s*(?:年|China)?/i.test(value)
+    || /(1970s|1980s|1990s|70s|80s|90s)\s*China/i.test(value)
+    || /(1970|1980|1990)年代中国|[七八九]十年代中国|[七八九]零年代中国/.test(value)
+    || /Republican-era China|historical China|post-apocalyptic wasteland China/i.test(value)
+    || /民国时期中国|古代中国|历史中国|中国末世废土|末世|废土/.test(value);
 }
 
 function looksLikeSpeakerDialogueLine(line: string) {
@@ -1093,11 +1119,11 @@ function faceTemplateText(asset: AssetPromptAsset) {
 function inferEraConstraint(values: unknown[]) {
   const joined = values.map((value) => clean(value)).filter(Boolean).join(" ");
   if (/末世|废土|末日|灾变|丧尸|避难所|重卡|荒凉/i.test(joined)) return "post-apocalyptic wasteland China";
+  const explicitYear = joined.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
+  if (explicitYear) return `${explicitYear[1]} China`;
   if (/八十年代|80年代|1980年代|1980s/i.test(joined)) return "1980s China";
   if (/七十年代|70年代|1970年代|1970s/i.test(joined)) return "1970s China";
   if (/九十年代|90年代|1990年代|1990s/i.test(joined)) return "1990s China";
-  const explicitYear = joined.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
-  if (explicitYear) return `${explicitYear[1]} China`;
   if (/民国/.test(joined)) return "Republican-era China";
   if (/古代|唐代|宋代|明代|清代|汉代|古风|仙侠|武侠/.test(joined)) return "historical China";
   if (/现代|当代|现实/.test(joined)) return "contemporary realistic China";

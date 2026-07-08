@@ -43,6 +43,7 @@ const { analyzeScriptAssets } = require("../src/lib/asset-agent/analyze-script-a
 const {
   buildAssetImagePrompt,
   buildCompiledAssetProviderPrompt,
+  shouldPreferCompiledDisplayPrompt,
   shouldRebuildAssetDisplayPrompt,
 } = require("../src/lib/asset-prompt-builder.ts");
 
@@ -260,5 +261,41 @@ const partialConstraintPrompt = "女主角真人模板；主图与全部变体�
 assert.equal(shouldRebuildAssetDisplayPrompt(partialConstraintPrompt), true, "constraint-only display prompt should be rebuilt");
 assert.equal(shouldRebuildAssetDisplayPrompt(displayPrompt), true, "legacy section display prompt should be rebuilt");
 assert.equal(shouldRebuildAssetDisplayPrompt(compiled.compiled_display_prompt), false, "compiled Chinese asset display prompt should be preserved");
+
+const genericEraDisplayPrompt = [
+  "中国女性，女主角",
+  "测试女主的资产参考图，现实主义中国短剧资产参考，现实主义现代/平民中国，除非资产结构明确指定其他时代。",
+  "外观：真人实拍摄影，自然皮肤纹理，准确全身比例。",
+].join("\n");
+const preciseEraCompiled = buildAssetImagePrompt({
+  asset: {
+    id: "test_precise_year",
+    type: "character",
+    name: "测试女主",
+    role: "女主角",
+    category: "characters",
+    prompt: genericEraDisplayPrompt,
+    description: "测试女主是剧本中的女主角。",
+    visualConstraints: "1980年代中国日常服装，但故事明确发生在1983年夏天。",
+    tags: ["女主角", "女性"],
+  },
+  styleSpec: {
+    era: "1983 China",
+    eraConstraint: "1983 China",
+    genre: "realistic Chinese short-drama asset reference",
+  },
+});
+assert.match(preciseEraCompiled.compiled_final_prompt, /1983 China/);
+assert.match(preciseEraCompiled.compiled_display_prompt, /1983年中国/);
+assert.equal(
+  shouldPreferCompiledDisplayPrompt(genericEraDisplayPrompt, preciseEraCompiled.compiled_display_prompt),
+  true,
+  "generic-era Chinese display prompt should be replaced by precise compiled era prompt",
+);
+assert.equal(
+  shouldPreferCompiledDisplayPrompt(preciseEraCompiled.compiled_display_prompt, preciseEraCompiled.compiled_display_prompt),
+  false,
+  "precise compiled Chinese display prompt should stay editable and be preserved",
+);
 
 console.log("Asset agent generalization checks passed.");

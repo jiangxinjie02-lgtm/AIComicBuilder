@@ -4,6 +4,7 @@ import {
   buildAssetImagePrompt,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
+  shouldPreferCompiledDisplayPrompt,
   shouldRebuildAssetDisplayPrompt,
   type AssetPromptType,
   type AssetStyleSpec,
@@ -496,7 +497,40 @@ function readRecordString(record: Record<string, unknown>, key: string) {
   return "";
 }
 
+function inferSpecificEraFromText(value: unknown) {
+  const text = cleanText(value);
+  const explicitYear = text.match(/\b(19[0-9]{2}|20[0-9]{2})\s*(?:年|China)?\b/i);
+  if (explicitYear) return `${explicitYear[1]} China`;
+  if (/(七十年代|七零年代|70年代|1970s|1970年代)/i.test(text)) return "1970s China";
+  if (/(八十年代|八零年代|80年代|1980s|1980年代)/i.test(text)) return "1980s China";
+  if (/(九十年代|九零年代|90年代|1990s|1990年代)/i.test(text)) return "1990s China";
+  if (/民国|军阀|谍战|抗战|Republican-era/i.test(text)) return "Republican-era China";
+  if (/古代|唐代|宋代|明代|清代|汉代|古风|仙侠|武侠|historical China/i.test(text)) return "historical China";
+  if (/末世|废土|末日|灾变|丧尸|post-apocalyptic|wasteland/i.test(text)) return "post-apocalyptic wasteland China";
+  return "";
+}
+
+function isGenericEraFallback(value: unknown) {
+  const text = cleanText(value);
+  return !text
+    || /confirmed script era and location/i.test(text)
+    || /realistic modern\/civilian China unless asset schema explicitly states otherwise/i.test(text)
+    || /现实主义现代\/平民中国，?除非资产结构明确指定其他时代/.test(text);
+}
+
+function pickBestEraCandidate(values: unknown[]) {
+  const cleaned = values.map((value) => cleanText(value)).filter(Boolean);
+  const explicit = cleaned.map(inferSpecificEraFromText).find(Boolean);
+  if (explicit) return explicit;
+  return cleaned.find((value) => !isGenericEraFallback(value)) || "";
+}
+
 function inferEraFromDraft(draft: ImportAssetDraft) {
+  const promptMetadata = asRecord(draft.promptMetadata);
+  const compilerIR = asRecord(promptMetadata.compilerIR);
+  const compilerConstraints = asRecord(compilerIR.constraints);
+  const compilerInput = asRecord(promptMetadata.compilerInput);
+  const compilerStyleSpec = asRecord(compilerInput.style_spec);
   const text = [
     draft.description,
     draft.visualHint,
@@ -504,13 +538,15 @@ function inferEraFromDraft(draft: ImportAssetDraft) {
     draft.prompt,
     ...(draft.tags || []),
   ].map((value) => cleanText(value)).filter(Boolean).join(" ");
-  const explicitYear = text.match(/\b(19[0-9]{2}|20[0-9]{2})\b/);
-  if (explicitYear) return `${explicitYear[1]} China`;
-  if (/\b(70s|1970s)\b/i.test(text)) return "1970s China";
-  if (/\b(80s|1980s)\b/i.test(text)) return "1980s China";
-  if (/\b(90s|1990s)\b/i.test(text)) return "1990s China";
-  if (/ancient|historical|period|republican/i.test(text)) return "period-accurate China";
-  if (/apocalypse|wasteland|disaster|survival/i.test(text)) return "survival or disaster world";
+  const era = pickBestEraCandidate([
+    readRecordString(compilerConstraints, "era"),
+    readRecordString(compilerStyleSpec, "eraConstraint"),
+    readRecordString(compilerStyleSpec, "era"),
+    promptMetadata.compiledFinalPrompt,
+    promptMetadata.compiledDisplayPrompt,
+    text,
+  ]);
+  if (era) return era;
   return "confirmed script era and location";
 }
 
@@ -518,21 +554,43 @@ function normalizeAssetStyleSpec(type: StoryAssetType, draft: ImportAssetDraft):
   const incoming = asRecord(draft.styleSpec);
   const visualSchema = asRecord(draft.visualSchema);
   const constraints = asRecord(visualSchema.constraints);
+  const promptMetadata = asRecord(draft.promptMetadata);
+  const compilerIR = asRecord(promptMetadata.compilerIR);
+  const compilerConstraints = asRecord(compilerIR.constraints);
+  const compilerInput = asRecord(promptMetadata.compilerInput);
+  const compilerStyleSpec = asRecord(compilerInput.style_spec);
   const base = defaultAssetStyleSpec();
-  const era = readRecordString(incoming, "era")
-    || readRecordString(incoming, "eraConstraint")
-    || readRecordString(constraints, "era")
-    || inferEraFromDraft(draft);
+  const era = pickBestEraCandidate([
+    readRecordString(incoming, "era"),
+    readRecordString(incoming, "eraConstraint"),
+    readRecordString(constraints, "era"),
+    readRecordString(compilerConstraints, "era"),
+    readRecordString(compilerStyleSpec, "eraConstraint"),
+    readRecordString(compilerStyleSpec, "era"),
+    promptMetadata.compiledFinalPrompt,
+    promptMetadata.compiledDisplayPrompt,
+    inferEraFromDraft(draft),
+  ]);
   const genre = readRecordString(incoming, "genre")
+    || readRecordString(compilerConstraints, "genre")
+    || readRecordString(compilerStyleSpec, "genre")
     || readRecordString(constraints, "genre")
     || base.genre
     || "realistic short-drama production asset";
 
   return {
     ...base,
+    ...compilerStyleSpec,
     ...incoming,
     era,
-    eraConstraint: readRecordString(incoming, "eraConstraint") || era,
+    eraConstraint: pickBestEraCandidate([
+      readRecordString(incoming, "eraConstraint"),
+      readRecordString(incoming, "era"),
+      readRecordString(compilerStyleSpec, "eraConstraint"),
+      readRecordString(compilerStyleSpec, "era"),
+      readRecordString(compilerConstraints, "era"),
+      era,
+    ]) || era,
     genre,
     style: readRecordString(incoming, "style") || base.style,
     lighting: readRecordString(incoming, "lighting") || base.lighting,
@@ -644,7 +702,10 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
     visualSpec: defaultAssetVisualSpec(assetPromptType(type), "1536x1024"),
     styleSpec,
   });
-  const displayPrompt = sourcePrompt || cleanText(built.compiled_display_prompt) || cleanText(draft.visualConstraints || draft.visualHint || description);
+  const builtDisplayPrompt = cleanText(built.compiled_display_prompt);
+  const displayPrompt = shouldPreferCompiledDisplayPrompt(sourcePrompt, builtDisplayPrompt)
+    ? builtDisplayPrompt
+    : sourcePrompt || builtDisplayPrompt || cleanText(draft.visualConstraints || draft.visualHint || description);
   const previousPromptMetadata = asRecord(draft.promptMetadata);
   const checklist = standardChecklist(type, {
     ...draft,
