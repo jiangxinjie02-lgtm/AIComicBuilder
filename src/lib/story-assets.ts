@@ -1,6 +1,14 @@
 import { and, asc, desc, eq } from "drizzle-orm";
 import { db, ensureAssetLibraryTables, ensureStoryPipelineTables } from "@/lib/db";
 import {
+  buildAssetImagePrompt,
+  defaultAssetStyleSpec,
+  defaultAssetVisualSpec,
+  type AssetPromptType,
+  type AssetStyleSpec,
+  type AssetVisualSchema,
+} from "@/lib/asset-prompt-builder";
+import {
   assets,
   assetCandidates,
   assetOccurrences,
@@ -118,6 +126,24 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value === "string") return parseJson<Record<string, unknown>>(value, {});
+  return {};
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((item) => cleanText(item)).filter(Boolean))];
+  }
+  if (typeof value === "string") {
+    if (value.trim().startsWith("[")) return normalizeStringList(parseJson<unknown>(value, []));
+    return [...new Set(value.split(/[,;\n]/).map((item) => item.trim()).filter(Boolean))];
+  }
+  return [];
+}
+
 function normalizeName(name: unknown) {
   return cleanText(name).replace(/\s+/g, " ");
 }
@@ -138,15 +164,17 @@ function normalizeAliases(value: unknown): string[] {
 }
 
 const CHARACTER_STATE_PATTERNS = [
-  "一身", "衣着", "衣衫", "身着", "穿着", "神情", "表情", "面容", "满身", "浑身",
+  "一身", "衣着", "衣衫", "身着", "穿着", "神情", "表情", "面容", "声音", "语气",
+  "视角", "旁白", "内心独白", "电话里", "满身", "浑身",
   "风尘满面", "衣衫褴褛", "狼狈便装", "硬朗冷峻", "坚毅冷峻", "壮实紧张",
-  "紧张", "冷峻", "坚毅", "疲惫", "虚弱", "受伤", "重伤", "断腿", "警觉", "惊恐", "愤怒",
+  "声音嘶哑", "紧张", "冷峻", "坚毅", "疲惫", "虚弱", "受伤", "重伤", "断腿", "警觉", "惊恐", "愤怒",
   "倒地", "眩晕倒地", "敬礼", "咆哮", "拍肩赞赏",
 ];
 
 const CHARACTER_NOISE_NAMES = new Set([
   "制作提示",
   "厘清场景归属",
+  "客观",
   "客观视角",
   "转场字幕",
   "监狱画面",
@@ -186,11 +214,13 @@ const PROP_BASE_KEYWORDS = [
 ];
 
 const SCENE_BASE_KEYWORDS = [
-  "军区一号会议室", "军区医院", "医院中医科", "医院楼顶", "高速服务区", "盘山公路",
-  "沈家客厅", "沈家厨房", "医院", "学校", "教室", "公司", "办公室", "客厅", "卧室", "厨房",
-  "地下室", "仓库", "工厂", "厂房", "实验室", "基地", "天台", "楼顶", "走廊", "街道", "公路",
-  "高速", "车站", "码头", "机场", "商场", "超市", "酒吧", "餐厅", "酒店", "旅馆", "警局", "牢房",
-  "森林", "荒野", "城堡", "避难所", "营地", "操场", "广场", "空间", "房间", "大厅", "屋顶", "据点",
+  "高速服务区", "证券交易所", "交易大厅", "盘山公路", "会议室", "指挥部", "派出所", "民政局",
+  "急诊室", "手术室", "审讯室", "拘留室", "交易所", "军区", "营房", "宿舍", "医院", "病房",
+  "诊室", "科室", "学校", "教室", "公司", "办公室", "客厅", "卧室", "厨房", "书房", "院子",
+  "庭院", "地下室", "仓库", "工厂", "厂房", "车间", "实验室", "基地", "天台", "楼顶", "走廊",
+  "街道", "公路", "高速", "车站", "码头", "机场", "商场", "超市", "酒吧", "餐厅", "酒店",
+  "旅馆", "警局", "法院", "法庭", "监狱", "牢房", "森林", "荒野", "山林", "河边", "城堡",
+  "王府", "宫殿", "客栈", "避难所", "营地", "操场", "广场", "空间", "房间", "大厅", "屋顶", "据点",
 ];
 
 function uniqueByCleanName<T extends { name?: string }>(items: T[]) {
@@ -319,7 +349,7 @@ function inferSceneVariantType(stateText: string) {
 function characterStateOnly(name: string) {
   const value = normalizeVariantStateText(name);
   if (!value) return false;
-  if (/^(神情|表情|面容|衣着|衣衫|身着|穿着|一身|满身|浑身)/.test(value)) return true;
+  if (/^(神情|表情|面容|声音|语气|视角|旁白|内心|电话里|敬礼|衣着|衣衫|身着|穿着|一身|满身|浑身)/.test(value)) return true;
   return CHARACTER_STATE_PATTERNS.some((pattern) => value === pattern);
 }
 
@@ -414,7 +444,7 @@ function normalizeNamedAssetDrafts(drafts: ImportAssetDraft[], type: "prop" | "s
       && rawName.length > baseName.length + 3
       && (type === "prop"
         ? /(取出|拿起|递出|伸手|制造|缓缓|他的|她的|被彻底|残骸)/.test(rawName)
-        : /(墙面|科幻|里面|外面|附近|门口|来到|进入|走进|冲进)/.test(rawName));
+        : /(墙面|科幻|里面|外面|附近|门口|来到|进入|走进|冲进|蜿蜒|延伸|通向|通往|穿过|横跨|坐落|矗立|映入|出现|远处|尽头|两侧|角落)/.test(rawName));
     const assetName = shouldFoldVariant || shouldFoldWrapper ? baseName : rawName;
     if (!assetName || assetName.length < 2 || assetName.length > 18) continue;
     const normalized: ImportAssetDraft = {
@@ -437,7 +467,7 @@ function normalizeNamedAssetDrafts(drafts: ImportAssetDraft[], type: "prop" | "s
 function looksLikeFalsePropHit(name: string, baseName: string) {
   if (!name || !baseName) return false;
   if (baseName === "剑" && /(剑拔弩张|如利剑|利剑般)/.test(name)) return true;
-  if (baseName.length === 1 && /(气氛|光柱|黑暗|弓身|伸手)/.test(name)) return true;
+  if (baseName.length === 1 && /(气氛|光柱|黑暗|弓身|弓着腰|弓背|微微弓身|侧身弓背|伸手)/.test(name)) return true;
   return false;
 }
 
@@ -450,6 +480,192 @@ function normalizeImportAssetsForSync(input: {
     characters: normalizeCharacterDrafts(input.characters || []),
     items: normalizeNamedAssetDrafts(input.items || [], "prop"),
     environments: normalizeNamedAssetDrafts(input.environments || [], "scene"),
+  };
+}
+
+function assetPromptType(type: StoryAssetType): AssetPromptType {
+  if (type === "character" || type === "scene" || type === "prop") return type;
+  return "prop";
+}
+
+function readRecordString(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function inferEraFromDraft(draft: ImportAssetDraft) {
+  const text = [
+    draft.description,
+    draft.visualHint,
+    draft.visualConstraints,
+    draft.prompt,
+    ...(draft.tags || []),
+  ].map((value) => cleanText(value)).filter(Boolean).join(" ");
+  const explicitYear = text.match(/\b(19[0-9]{2}|20[0-9]{2})\b/);
+  if (explicitYear) return `${explicitYear[1]} China`;
+  if (/\b(70s|1970s)\b/i.test(text)) return "1970s China";
+  if (/\b(80s|1980s)\b/i.test(text)) return "1980s China";
+  if (/\b(90s|1990s)\b/i.test(text)) return "1990s China";
+  if (/ancient|historical|period|republican/i.test(text)) return "period-accurate China";
+  if (/apocalypse|wasteland|disaster|survival/i.test(text)) return "survival or disaster world";
+  return "confirmed script era and location";
+}
+
+function normalizeAssetStyleSpec(type: StoryAssetType, draft: ImportAssetDraft): AssetStyleSpec {
+  const incoming = asRecord(draft.styleSpec);
+  const visualSchema = asRecord(draft.visualSchema);
+  const constraints = asRecord(visualSchema.constraints);
+  const base = defaultAssetStyleSpec();
+  const era = readRecordString(incoming, "era")
+    || readRecordString(incoming, "eraConstraint")
+    || readRecordString(constraints, "era")
+    || inferEraFromDraft(draft);
+  const genre = readRecordString(incoming, "genre")
+    || readRecordString(constraints, "genre")
+    || base.genre
+    || "realistic short-drama production asset";
+
+  return {
+    ...base,
+    ...incoming,
+    era,
+    eraConstraint: readRecordString(incoming, "eraConstraint") || era,
+    genre,
+    style: readRecordString(incoming, "style") || base.style,
+    lighting: readRecordString(incoming, "lighting") || base.lighting,
+    camera: readRecordString(incoming, "camera") || base.camera,
+    texture: readRecordString(incoming, "texture") || base.texture,
+    mustHave: normalizeStringList(incoming.mustHave).length
+      ? normalizeStringList(incoming.mustHave)
+      : [
+          type === "character" ? "stable character identity" : "",
+          type === "scene" ? "stable empty environment identity" : "",
+          type === "prop" ? "stable prop identity" : "",
+        ].filter(Boolean),
+    mustNotHave: normalizeStringList(incoming.mustNotHave),
+    forbiddenVisualElements: normalizeStringList(incoming.forbiddenVisualElements),
+  };
+}
+
+function normalizeAssetVisualSchema(draft: ImportAssetDraft): AssetVisualSchema | null {
+  const schema = asRecord(draft.visualSchema);
+  return Object.keys(schema).length ? schema as AssetVisualSchema : null;
+}
+
+function defaultAssetNegativeConstraints(type: StoryAssetType) {
+  const common = [
+    "text",
+    "logo",
+    "watermark",
+    "UI",
+    "subtitle",
+    "caption",
+    "low resolution",
+    "distorted anatomy",
+    "wrong era",
+    "wrong genre",
+    "unrelated branded object",
+  ];
+  if (type === "character") {
+    return [...common, "extra people", "duplicate character", "inconsistent face", "inconsistent clothing"].join(", ");
+  }
+  if (type === "scene") {
+    return [...common, "people", "human silhouette", "character portrait", "unrelated prop close-up"].join(", ");
+  }
+  return [...common, "people", "hands", "held object scene", "background environment", "reflected lettering"].join(", ");
+}
+
+function defaultAssetDescription(type: StoryAssetType, name: string) {
+  if (type === "character") return `${name} reusable character asset profile.`;
+  if (type === "scene") return `${name} reusable empty scene environment asset profile.`;
+  return `${name} reusable prop asset profile.`;
+}
+
+function standardChecklist(type: StoryAssetType, draft: ImportAssetDraft, built: ReturnType<typeof buildAssetImagePrompt>) {
+  const variants = Array.isArray(draft.variants) ? draft.variants : [];
+  const checks = {
+    canonicalName: Boolean(normalizeName(draft.name)),
+    taxonomy: type === "character" || type === "scene" || type === "prop",
+    description: Boolean(cleanText(draft.description)),
+    visualConstraints: Boolean(cleanText(draft.visualConstraints || draft.visualHint || draft.prompt)),
+    negativeConstraints: Boolean(cleanText(draft.negativePrompt)),
+    defaultVariant: true,
+    sourceEvidence: Boolean(cleanText(draft.description || draft.visualConstraints || draft.visualHint || draft.name)),
+    promptCompilerPassed: built.validation_report.passed,
+    variantsReviewed: variants.every((variant) => {
+      const record = asRecord(variant);
+      return Boolean(readRecordString(record, "name") || readRecordString(record, "description") || readRecordString(record, "state"));
+    }),
+  };
+  return {
+    ...checks,
+    readyForLock: Object.values(checks).every(Boolean),
+  };
+}
+
+function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDraft): ImportAssetDraft {
+  const name = normalizeName(draft.name);
+  if (!name) return draft;
+
+  const styleSpec = normalizeAssetStyleSpec(type, draft);
+  const visualSchema = normalizeAssetVisualSchema(draft);
+  const description = cleanText(draft.description || draft.visualHint || draft.visualConstraints || defaultAssetDescription(type, name));
+  const visualConstraints = cleanText(draft.visualConstraints || draft.visualHint || draft.prompt || description);
+  const negativePrompt = cleanText(draft.negativePrompt || defaultAssetNegativeConstraints(type));
+  const faceTemplate = asRecord(draft.faceTemplate);
+  const built = buildAssetImagePrompt({
+    asset: {
+      id: draft.assetId || name,
+      type: assetPromptType(type),
+      name,
+      role: draft.role || draft.roleKey || draft.scope || draft.category || "",
+      category: draft.category || type,
+      prompt: draft.prompt || "",
+      description,
+      visualHint: draft.visualHint || "",
+      visualConstraints,
+      negativeConstraints: negativePrompt,
+      tags: draft.tags || [],
+      faceTemplate: Object.keys(faceTemplate).length
+        ? {
+            label: cleanText(faceTemplate.label),
+            url: cleanText(faceTemplate.url),
+            note: cleanText(faceTemplate.note),
+          }
+        : null,
+      visualSchema,
+    },
+    visualSpec: defaultAssetVisualSpec(assetPromptType(type), "1536x1024"),
+    styleSpec,
+  });
+  const previousPromptMetadata = asRecord(draft.promptMetadata);
+  const checklist = standardChecklist(type, {
+    ...draft,
+    name,
+    description,
+    visualConstraints,
+    negativePrompt,
+  }, built);
+
+  return {
+    ...draft,
+    name,
+    description,
+    visualConstraints,
+    negativePrompt,
+    prompt: cleanText(draft.prompt) || built.compiled_final_prompt,
+    promptMetadata: {
+      ...previousPromptMetadata,
+      standardVersion: "asset_library_standard_v1",
+      compiler: built.compiler_ir.compiler,
+      compilerIR: built.compiler_ir,
+      validationReport: built.validation_report,
+      checklist,
+    },
+    styleSpec,
+    visualSchema,
   };
 }
 
@@ -555,9 +771,12 @@ async function createResolvedCandidate(
     mergedAssetId: assetId,
     metadata: {
       source: "import_asset_draft",
+      standardVersion: "asset_library_standard_v1",
       sourceAssetId: incomingSourceAssetId || previousMetadata.sourceAssetId || draft.assetId || "",
       episodes: draft.episodes || [],
       visualHint: draft.visualHint || "",
+      importanceLabel: importanceLabel(importanceScore(undefined, draft)),
+      promptMetadata: draft.promptMetadata || null,
     },
     updatedAt: now,
   };
@@ -591,8 +810,10 @@ async function createAssetOccurrence(
   const evidenceText = cleanText(draft.description || draft.visualConstraints || draft.visualHint || draft.name);
   const metadata = {
     source: "import_asset_draft",
+    standardVersion: "asset_library_standard_v1",
     episodes: draft.episodes || [],
     visualHint: draft.visualHint || "",
+    promptMetadata: draft.promptMetadata || null,
   };
   const existingRows = await db
     .select()
@@ -664,10 +885,15 @@ async function syncAssetVariants(
         assetName: draft.name,
         assetType: type,
         baseDescription: draft.description || "",
+        baseVisualConstraints: draft.visualConstraints || "",
+        baseNegativeConstraints: draft.negativePrompt || "",
+        styleSpec: draft.styleSpec || null,
+        visualSchema: draft.visualSchema || null,
       },
       changedTraits: variant.changedTraits ?? {
         prompt: variant.prompt || "",
         editInstruction: variant.editInstruction || "",
+        state: variant.state || variant.description || "",
       },
       visualConstraints: cleanText(variant.visualConstraints || variant.description || draft.visualConstraints || draft.visualHint || draft.description),
       negativeConstraints: cleanText(variant.negativePrompt || draft.negativePrompt),
@@ -675,9 +901,11 @@ async function syncAssetVariants(
       status: draft.confirmed ? "approved" as const : variant.imageUrl ? "generated" as const : "draft" as const,
       metadata: {
         source: "import_asset_draft",
+        standardVersion: "asset_library_standard_v1",
         sourceVariantId: variant.id || "",
         history: variant.history || [],
         visualSchema: variant.visualSchema || null,
+        promptMetadata: draft.promptMetadata || null,
       },
       updatedAt: now,
     };
@@ -754,12 +982,16 @@ function buildMetadata(type: StoryAssetType, draft: ImportAssetDraft, previous?:
   const incomingSourceAssetId = draft.assetId && draft.assetId !== previous?.id
     ? draft.assetId
     : "";
+  const role = cleanText(draft.role);
+  const isUnnamedCharacterRole = type === "character" && /无名配角|群体角色/.test(role);
   return {
     ...previousMetadata,
+    standardVersion: "asset_library_standard_v1",
+    lifecycleStage: draft.confirmed ? "approved_draft" : "draft_needs_review",
     sourceAssetId: incomingSourceAssetId || previousMetadata.sourceAssetId || draft.assetId || "",
     category: draft.category || previousMetadata.category || type,
     role: draft.role || previousMetadata.role || "",
-    roleKey: draft.roleKey || previousMetadata.roleKey || "",
+    roleKey: isUnnamedCharacterRole ? "" : draft.roleKey || previousMetadata.roleKey || "",
     scope: draft.scope || previousMetadata.scope || "",
     frequency: Number(draft.frequency ?? previousMetadata.frequency ?? 0),
     episodes: draft.episodes || previousMetadata.episodes || [],
@@ -772,8 +1004,13 @@ function buildMetadata(type: StoryAssetType, draft: ImportAssetDraft, previous?:
     imageHistory: draft.history || previousMetadata.imageHistory || [],
     mainImageName: draft.mainImageName || previousMetadata.mainImageName || "",
     tags: draft.tags || previousMetadata.tags || [],
-    faceTemplate: draft.faceTemplate || previousMetadata.faceTemplate || null,
+    faceTemplate: isUnnamedCharacterRole ? null : draft.faceTemplate || previousMetadata.faceTemplate || null,
     importanceLabel: importanceLabel(importanceScore(undefined, draft)),
+    review: {
+      confirmed: Boolean(draft.confirmed),
+      requiredBeforeLock: true,
+      checklist: asRecord(draft.promptMetadata).checklist || previousMetadata.review && asRecord(previousMetadata.review).checklist || null,
+    },
   };
 }
 
@@ -853,25 +1090,26 @@ export async function upsertStoryAsset(
   ensureAssetLibraryTables();
   ensureStoryPipelineTables();
 
-  const name = normalizeName(draft.name);
+  const standardizedDraft = standardizeImportAssetDraft(type, draft);
+  const name = normalizeName(standardizedDraft.name);
   if (!name) return null;
 
-  const existing = await findExistingAsset(projectId, type, name, draft.assetId);
+  const existing = await findExistingAsset(projectId, type, name, standardizedDraft.assetId);
   const now = new Date();
-  const score = importanceScore(undefined, draft);
-  const metadata = buildMetadata(type, draft, existing);
+  const score = importanceScore(undefined, standardizedDraft);
+  const metadata = buildMetadata(type, standardizedDraft, existing);
   const values = {
     projectId,
     type,
     name,
-    aliases: jsonString(normalizeAliases(draft.aliases)),
+    aliases: jsonString(normalizeAliases(standardizedDraft.aliases)),
     importance: score,
-    description: cleanText(draft.description),
-    visualConstraints: cleanText(draft.visualConstraints || draft.visualHint || draft.description),
-    negativeConstraints: cleanText(draft.negativePrompt),
-    firstAppearance: Array.isArray(draft.episodes) ? draft.episodes[0] ?? "" : "",
-    confirmed: draft.confirmed ? 1 : existing?.confirmed ?? 0,
-    referenceImage: draft.imageUrl || existing?.referenceImage || null,
+    description: cleanText(standardizedDraft.description),
+    visualConstraints: cleanText(standardizedDraft.visualConstraints || standardizedDraft.visualHint || standardizedDraft.description),
+    negativeConstraints: cleanText(standardizedDraft.negativePrompt),
+    firstAppearance: Array.isArray(standardizedDraft.episodes) ? standardizedDraft.episodes[0] ?? "" : "",
+    confirmed: standardizedDraft.confirmed ? 1 : existing?.confirmed ?? 0,
+    referenceImage: standardizedDraft.imageUrl || existing?.referenceImage || null,
     metadata,
     updatedAt: now,
   };
@@ -897,10 +1135,10 @@ export async function upsertStoryAsset(
       .returning();
   }
 
-  await syncSubtypeRow(record.id, type, draft, links);
-  const candidate = await createResolvedCandidate(projectId, type, draft, record.id);
-  const occurrence = await createAssetOccurrence(projectId, record.id, draft, candidate.id);
-  await syncAssetVariants(projectId, type, record.id, draft, {
+  await syncSubtypeRow(record.id, type, standardizedDraft, links);
+  const candidate = await createResolvedCandidate(projectId, type, standardizedDraft, record.id);
+  const occurrence = await createAssetOccurrence(projectId, record.id, standardizedDraft, candidate.id);
+  await syncAssetVariants(projectId, type, record.id, standardizedDraft, {
     candidateId: candidate.id,
     occurrenceId: occurrence.id,
   });

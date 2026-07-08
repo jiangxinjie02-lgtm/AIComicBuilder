@@ -189,6 +189,7 @@ const BANNED_CHARACTER_NAMES = new Set([
   "地点",
   "场景",
   "镜头",
+  "视觉",
   "内景",
   "外景",
   "旁白",
@@ -205,6 +206,11 @@ const BANNED_CHARACTER_NAMES = new Set([
   "画面",
   "黑屏",
   "转场",
+  "制作提示",
+  "转场字幕",
+  "监狱画面",
+  "客观",
+  "客观视角",
   "人物",
   "角色",
   "剧名",
@@ -323,24 +329,35 @@ const PROP_KEYWORDS: Array<{ keyword: string; type: string }> = [
 ];
 
 const SCENE_KEYWORDS: Array<{ keyword: string; type: string }> = [
-  { keyword: "军区一号会议室", type: "办公场景" },
-  { keyword: "军区医院", type: "医疗场景" },
-  { keyword: "医院中医科", type: "医疗场景" },
-  { keyword: "医院楼顶", type: "医疗场景" },
+  { keyword: "会议室", type: "办公场景" },
+  { keyword: "指挥部", type: "军事场景" },
+  { keyword: "军区", type: "军事场景" },
+  { keyword: "营房", type: "军事场景" },
+  { keyword: "宿舍", type: "居住空间" },
   { keyword: "医院", type: "医疗场景" },
+  { keyword: "病房", type: "医疗场景" },
+  { keyword: "诊室", type: "医疗场景" },
+  { keyword: "急诊室", type: "医疗场景" },
+  { keyword: "手术室", type: "医疗场景" },
+  { keyword: "科室", type: "医疗场景" },
   { keyword: "学校", type: "公共建筑" },
   { keyword: "教室", type: "公共建筑" },
   { keyword: "公司", type: "办公场景" },
   { keyword: "办公室", type: "办公场景" },
-  { keyword: "沈家客厅", type: "居住空间" },
-  { keyword: "沈家厨房", type: "居住空间" },
+  { keyword: "交易大厅", type: "商业空间" },
+  { keyword: "证券交易所", type: "商业空间" },
+  { keyword: "交易所", type: "商业空间" },
   { keyword: "客厅", type: "居住空间" },
   { keyword: "卧室", type: "居住空间" },
   { keyword: "厨房", type: "居住空间" },
+  { keyword: "书房", type: "居住空间" },
+  { keyword: "院子", type: "居住空间" },
+  { keyword: "庭院", type: "居住空间" },
   { keyword: "地下室", type: "封闭空间" },
   { keyword: "仓库", type: "工业空间" },
   { keyword: "工厂", type: "工业空间" },
   { keyword: "厂房", type: "工业空间" },
+  { keyword: "车间", type: "工业空间" },
   { keyword: "实验室", type: "科研空间" },
   { keyword: "基地", type: "据点" },
   { keyword: "天台", type: "屋顶空间" },
@@ -361,15 +378,34 @@ const SCENE_KEYWORDS: Array<{ keyword: string; type: string }> = [
   { keyword: "酒店", type: "住宿空间" },
   { keyword: "旅馆", type: "住宿空间" },
   { keyword: "警局", type: "公共机构" },
+  { keyword: "派出所", type: "公共机构" },
+  { keyword: "民政局", type: "公共机构" },
+  { keyword: "法院", type: "公共机构" },
+  { keyword: "法庭", type: "公共机构" },
+  { keyword: "审讯室", type: "公共机构" },
+  { keyword: "监狱", type: "禁闭空间" },
+  { keyword: "拘留室", type: "禁闭空间" },
   { keyword: "牢房", type: "禁闭空间" },
   { keyword: "森林", type: "自然外景" },
   { keyword: "荒野", type: "自然外景" },
+  { keyword: "山林", type: "自然外景" },
+  { keyword: "河边", type: "自然外景" },
   { keyword: "城堡", type: "幻想建筑" },
+  { keyword: "王府", type: "古装建筑" },
+  { keyword: "宫殿", type: "古装建筑" },
+  { keyword: "客栈", type: "古装建筑" },
   { keyword: "避难所", type: "据点" },
   { keyword: "营地", type: "据点" },
   { keyword: "操场", type: "公共空间" },
   { keyword: "广场", type: "公共空间" },
 ];
+
+const FEMALE_LEAD_MARKERS = /女主|女主人公|女一|女主角/;
+const MALE_LEAD_MARKERS = /男主|男主人公|男一|男主角/;
+const GENERAL_LEAD_MARKERS = /主角|主人公|核心人物|第一视角|主要人物/;
+const LEAD_RELATION_MARKERS = /结为夫妻|成婚|结婚|订婚|婚约|夫妻|伴侣|恋人|爱人/;
+const FEMALE_STATUS_MARKERS = /妻子|老婆|女友|未婚妻|夫人|太太|小姐|姑娘|少女|公主|王妃|女官/;
+const MALE_STATUS_MARKERS = /丈夫|老公|男友|未婚夫|夫君|郎君|先生|少爷|公子|王爷|世子|将军|少帅|总裁|总工|军官|军区高官|警官|首长|队长/;
 
 export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgentProject {
   const aspectRatio = input.aspectRatio || "16:9";
@@ -379,9 +415,14 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
   const lines = normalized.split("\n").map((line) => line.trim()).filter(Boolean);
   const episodes = extractEpisodes(normalized);
   const sceneBuckets = collectSceneBuckets(lines);
+  const storyMeta = normalizeStoryMeta(input.storyAnalysis?.storyMeta);
   const aiCharacterSeeds = buildCharacterSeedsFromAnalysis(input.storyAnalysis);
   const ruleCharacterSeeds = collectCharacterSeeds(lines, normalized);
-  const characterSeeds = normalizeCharacterSeeds(mergeCharacterSeeds(aiCharacterSeeds, ruleCharacterSeeds));
+  const characterSeeds = rebalanceCharacterRoles(
+    normalizeCharacterSeeds(mergeCharacterSeeds(aiCharacterSeeds, ruleCharacterSeeds)),
+    normalized,
+    storyMeta,
+  );
   const characterNames = characterSeeds.map((seed) => seed.name);
   const aiPropSeeds = buildPropSeedsFromAnalysis(input.storyAnalysis);
   const aiSceneSeeds = buildSceneSeedsFromAnalysis(input.storyAnalysis, characterNames);
@@ -390,7 +431,6 @@ export function analyzeScriptAssets(input: AnalyzeScriptAssetsInput): AssetAgent
   const propSeeds = normalizePropSeeds(mergeNamedSeeds(aiPropSeeds, rulePropSeeds));
   const sceneSeeds = normalizeSceneSeeds(mergeNamedSeeds(aiSceneSeeds, ruleSceneSeeds));
 
-  const storyMeta = normalizeStoryMeta(input.storyAnalysis?.storyMeta);
   const settings: AssetPromptSettings = {
     aspectRatio,
     targetSize,
@@ -573,6 +613,7 @@ function collectPropSeeds(lines: string[], text: string, characterNames: string[
   for (const line of lines) {
     for (const item of PROP_KEYWORDS) {
       if (!line.includes(item.keyword)) continue;
+      if (isInvalidPropKeywordUsage(line, item.keyword)) continue;
       const names = [item.keyword, ...extractNamesAroundKeyword(line, item.keyword)]
         .map(normalizePropName)
         .filter((name) => isProperPropAssetName(name) && !looksLikeCharacterName(name, characterNameSet));
@@ -618,6 +659,7 @@ function collectSceneSeeds(
   for (const line of lines) {
     for (const item of SCENE_KEYWORDS) {
       if (!line.includes(item.keyword)) continue;
+      if (isInvalidSceneKeywordUsage(line, item.keyword)) continue;
       const names = [item.keyword, ...extractNamesAroundKeyword(line, item.keyword)]
         .map((name) => normalizeSceneName(name, characterNameSet))
         .filter(isProperSceneAssetName);
@@ -678,6 +720,129 @@ function inferAssetGenreConstraint(meta: StoryMetaAnalysis | undefined) {
   return genre || "realistic Chinese short-drama asset reference";
 }
 
+function leadEvidenceText(storyMeta: StoryMetaAnalysis | undefined, script: string) {
+  return [
+    storyMeta?.background,
+    storyMeta?.genre,
+    storyMeta?.locationBackground,
+    script.slice(0, 8000),
+  ].filter(Boolean).join(" ");
+}
+
+function windowsAroundName(text: string, name: string, radius = 32) {
+  const windows: string[] = [];
+  if (!name) return windows;
+  let from = 0;
+  while (windows.length < 10) {
+    const index = text.indexOf(name, from);
+    if (index < 0) break;
+    windows.push(text.slice(Math.max(0, index - radius), Math.min(text.length, index + name.length + radius)));
+    from = index + name.length;
+  }
+  return windows;
+}
+
+function hasLeadMarkerNearName(text: string, name: string, gender: "male" | "female") {
+  const windows = windowsAroundName(text, name, 40).join(" ");
+  if (gender === "female") return FEMALE_LEAD_MARKERS.test(windows);
+  return MALE_LEAD_MARKERS.test(windows);
+}
+
+function hasMalePartnerMarkerNearName(text: string, name: string) {
+  const windows = windowsAroundName(text, name, 42).join(" ");
+  return LEAD_RELATION_MARKERS.test(windows) || MALE_STATUS_MARKERS.test(windows);
+}
+
+function isNamedLeadEligible(seed: CharacterSeed) {
+  return seed.assetKind !== "unnamed_support" && seed.assetKind !== "group" && isProperCharacterAssetName(seed.name);
+}
+
+function roleForGender(gender: string, lead: boolean) {
+  if (lead && gender === "男性") return "男主角";
+  if (lead && gender === "女性") return "女主角";
+  if (gender === "男性") return "男配角";
+  if (gender === "女性") return "女配角";
+  return lead ? "主角" : "配角";
+}
+
+function chooseLeadCandidate(
+  seeds: CharacterSeed[],
+  gender: "男性" | "女性",
+  source: string,
+  excludeName = "",
+) {
+  const scored = seeds
+    .filter((seed) => seed.name !== excludeName && isNamedLeadEligible(seed))
+    .map((seed) => {
+      const joined = `${seed.name} ${seed.contexts.join(" ")}`;
+      const windows = windowsAroundName(source, seed.name, 42).join(" ");
+      const inferredGender = inferGender(seed.name, `${joined} ${windows}`, seed.explicitRole || "");
+      if (inferredGender !== gender) return null;
+      let score = seed.score;
+      if (gender === "女性" && FEMALE_LEAD_MARKERS.test(windows)) score += 100;
+      if (gender === "男性" && MALE_LEAD_MARKERS.test(windows)) score += 100;
+      if (GENERAL_LEAD_MARKERS.test(windows)) score += 55;
+      if (LEAD_RELATION_MARKERS.test(windows)) score += 24;
+      if (gender === "女性" && FEMALE_STATUS_MARKERS.test(windows)) score += 14;
+      if (gender === "男性" && MALE_STATUS_MARKERS.test(windows)) score += 14;
+      if (/反派|陷害|诬告|伪造|害她|害他|仇人|阶下囚|监狱/.test(joined)) score -= 35;
+      return { seed, score };
+    })
+    .filter((item): item is { seed: CharacterSeed; score: number } => Boolean(item))
+    .sort((a, b) => b.score - a.score);
+  return scored[0]?.seed.name || "";
+}
+
+function rebalanceCharacterRoles(
+  seeds: CharacterSeed[],
+  script: string,
+  storyMeta?: StoryMetaAnalysis,
+) {
+  if (seeds.length === 0) return seeds;
+  const source = leadEvidenceText(storyMeta, script);
+  let femaleLeadName = seeds.find((seed) => isNamedLeadEligible(seed) && seed.explicitRole === "女主角")?.name || "";
+  let maleLeadName = seeds.find((seed) => isNamedLeadEligible(seed) && seed.explicitRole === "男主角")?.name || "";
+
+  for (const seed of seeds) {
+    if (!femaleLeadName && isNamedLeadEligible(seed) && hasLeadMarkerNearName(source, seed.name, "female")) {
+      femaleLeadName = seed.name;
+    }
+    if (!maleLeadName && isNamedLeadEligible(seed) && hasLeadMarkerNearName(source, seed.name, "male")) {
+      maleLeadName = seed.name;
+    }
+  }
+
+  if (!femaleLeadName) femaleLeadName = chooseLeadCandidate(seeds, "女性", source, maleLeadName);
+  if (!maleLeadName) {
+    const partner = seeds
+      .filter((seed) => seed.name !== femaleLeadName && isNamedLeadEligible(seed))
+      .find((seed) => {
+        const windows = windowsAroundName(source, seed.name, 60).join(" ");
+        return inferGender(seed.name, `${seed.name} ${seed.contexts.join(" ")} ${windows}`, seed.explicitRole || "") === "男性"
+          && hasMalePartnerMarkerNearName(source, seed.name);
+      });
+    maleLeadName = partner?.name || chooseLeadCandidate(seeds, "男性", source, femaleLeadName);
+  }
+
+  return seeds.map((seed) => {
+    const joined = `${seed.name} ${seed.contexts.join(" ")}`;
+    const evidence = windowsAroundName(source, seed.name, 60).join(" ");
+    const gender = inferGender(seed.name, `${joined} ${evidence}`, seed.explicitRole || "");
+    let role = seed.explicitRole || "";
+    if (seed.name === femaleLeadName) role = "女主角";
+    if (seed.name === maleLeadName) role = "男主角";
+    if (!role || (seed.assetKind !== "named" && /主角/.test(role))) {
+      role = seed.assetKind === "unnamed_support" || seed.assetKind === "group"
+        ? roleForCharacterKind(seed.assetKind, "")
+        : inferSupportRole(seed.name, seed.contexts);
+    }
+    if (!/主角|反派|无名配角|群体角色/.test(role)) {
+      role = roleForGender(gender, false);
+    }
+    return { ...seed, role };
+  }).sort((a, b) => b.score - a.score);
+}
+
 function mergeCharacterSeeds(primary: CharacterSeed[], fallback: CharacterSeed[]) {
   const merged = new Map<string, CharacterSeed>();
 
@@ -722,7 +887,7 @@ function normalizeCharacterSeeds(seeds: CharacterSeed[]) {
       name: normalizedName,
       score: Math.max(1, source.score - (source.name === normalizedName ? 0 : 1)),
       role,
-      explicitRole: source.explicitRole || role,
+      explicitRole: source.explicitRole || "",
       contexts: source.contexts.slice(0, 12),
       variantHints: [],
       assetKind: kind,
@@ -735,7 +900,7 @@ function normalizeCharacterSeeds(seeds: CharacterSeed[]) {
     const name = cleanCharacterName(seed.name);
     const split = splitCompositeCharacterStateName(name);
     if (split) {
-      const kind = isGroupCharacterName(split.assetName) ? "group" : "named";
+      const kind = inferCharacterAssetKind(split.assetName);
       const baseSeed = ensureBaseSeed(split.assetName, seed, kind);
       if (baseSeed) {
         pendingHints.push({ seed, targetName: baseSeed.name, hint: buildCharacterVariantHint(baseSeed.name, split.stateText, seed.contexts) });
@@ -784,7 +949,7 @@ function roleForCharacterKind(kind: CharacterSeed["assetKind"], fallback = "") {
 
 function inferCharacterAssetKind(name: string): CharacterSeed["assetKind"] {
   if (isGroupCharacterName(name)) return "group";
-  if (/(老头|老人|男子|女人|女孩|男孩|司机|保镖|守卫|战士|士兵|医生|护士|警察|看门|老板|店员|下属|领导)$/.test(name)) {
+  if (/(老头|老人|男子|男人|女人|女孩|男孩|司机|保安|保镖|守卫|战士|士兵|医生|护士|护工|军医|宪兵|摄影师|地勤|警察|首长|纪委干事|警察队长|看门|老板|店员|下属|领导|女工[甲乙丙丁]?|阔太太[甲乙丙丁]?)$/.test(name)) {
     return "unnamed_support";
   }
   return "named";
@@ -801,7 +966,7 @@ function isGroupCharacterName(name: string) {
 function splitCompositeCharacterStateName(name: string) {
   const value = cleanCharacterName(name);
   if (!value || isCharacterStateOnlyPhrase(value)) return null;
-  const match = value.match(/^([\u4e00-\u9fa5A-Za-z0-9·]{2,6}?)(一身.+|衣着.+|衣衫.+|身着.+|穿着.+|神情.+|表情.+|面容.+|满身.+|浑身.+|风尘满面|衣衫褴褛|狼狈便装|硬朗冷峻|坚毅冷峻|壮实紧张|紧张|冷峻|坚毅|疲惫|虚弱|受伤|警觉|惊恐|愤怒|倒地|眩晕倒地)$/);
+  const match = value.match(/^([\u4e00-\u9fa5A-Za-z0-9·]{2,6}?)(一身.+|衣着.+|衣衫.+|身着.+|穿着.+|神情.+|表情.+|面容.+|声音.+|语气.+|视角|旁白|内心独白|电话里|敬礼|满身.+|浑身.+|风尘满面|衣衫褴褛|狼狈便装|硬朗冷峻|坚毅冷峻|壮实紧张|声音嘶哑|紧张|冷峻|坚毅|疲惫|虚弱|受伤|警觉|惊恐|愤怒|倒地|眩晕倒地)$/);
   if (!match) return null;
   const assetName = cleanCharacterName(match[1]);
   const stateText = cleanAssetName(match[2]);
@@ -814,7 +979,7 @@ function splitCompositeCharacterStateName(name: string) {
 function isCharacterStateOnlyPhrase(name: string) {
   const value = cleanCharacterName(name);
   if (!value) return false;
-  if (/^(神情|表情|面容|衣着|衣衫|身着|穿着|一身|满身|浑身)/.test(value)) return true;
+  if (/^(神情|表情|面容|声音|语气|视角|旁白|内心|电话里|敬礼|衣着|衣衫|身着|穿着|一身|满身|浑身)/.test(value)) return true;
   if (/(坚毅|冷峻|紧张|惊恐|愤怒|疲惫|虚弱|受伤|狼狈|风尘满面|衣衫褴褛|便装|作战装束|警觉|倒地|眩晕)$/.test(value)
     && !/(老头|老人|男子|女人|女孩|男孩|战士|士兵|丧尸|伤员|守卫)$/.test(value)) {
     return true;
@@ -983,7 +1148,7 @@ function normalizeSceneSeeds(seeds: NamedSeed[]) {
     target.score = Math.max(target.score, pending.seed.score);
   }
 
-  return [...byName.values()].sort((a, b) => b.score - a.score);
+  return mergeContainedSceneSeeds([...byName.values()]).sort((a, b) => b.score - a.score);
 }
 
 function appendNamedVariantHint(seed: NamedSeed, hint: AssetVariantHint) {
@@ -991,6 +1156,47 @@ function appendNamedVariantHint(seed: NamedSeed, hint: AssetVariantHint) {
   const existing = seed.variantHints || [];
   if (!name || existing.some((item) => normalizeNameForCompare(item.name) === name)) return;
   seed.variantHints = [...existing, hint].slice(0, 10);
+}
+
+function mergeContainedSceneSeeds(seeds: NamedSeed[]) {
+  const sorted = [...seeds].sort((a, b) => {
+    const scoreDelta = b.score - a.score;
+    if (scoreDelta) return scoreDelta;
+    return b.name.length - a.name.length;
+  });
+  const results: NamedSeed[] = [];
+
+  for (const seed of sorted) {
+    const contained = results.find((existing) =>
+      existing.name !== seed.name
+      && (existing.name.includes(seed.name) || seed.name.includes(existing.name))
+      && Math.min(existing.name.length, seed.name.length) <= 4
+    );
+    if (!contained) {
+      results.push(seed);
+      continue;
+    }
+
+    const specific = contained.name.length >= seed.name.length ? contained : seed;
+    const generic = contained.name.length >= seed.name.length ? seed : contained;
+    const targetIndex = results.indexOf(contained);
+    const merged: NamedSeed = {
+      ...specific,
+      score: Math.max(specific.score, generic.score),
+      type: specific.type || generic.type,
+      contexts: [...new Set([...specific.contexts, ...generic.contexts])].slice(0, 10),
+      times: [...new Set([...(specific.times || []), ...(generic.times || [])])],
+      variantHints: [...(specific.variantHints || []), ...(generic.variantHints || [])].slice(0, 10),
+    };
+
+    if (targetIndex >= 0) {
+      results[targetIndex] = merged;
+    } else {
+      results.push(merged);
+    }
+  }
+
+  return results;
 }
 
 function splitCompositePropStateName(name: string) {
@@ -1104,16 +1310,18 @@ function sceneVariantLabelFromState(stateText: string, times: string[] = []) {
 function buildCharacterSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null): CharacterSeed[] {
   const seen = new Set<string>();
   return (analysis?.assets?.characters || [])
-    .map((item, index): CharacterSeed | null => {
+    .map((item): CharacterSeed | null => {
       const name = cleanCharacterName(item.name);
       if (!isProperCharacterAssetName(name) || seen.has(name)) return null;
       seen.add(name);
-      const role = normalizeRoleFromAnalysis(item.role || "", index);
+      const rawRole = compactText(item.role || "", 20);
+      const role = normalizeRoleFromAnalysis(rawRole);
+      const isExplicitRole = /男主|女主|男一|女一|男配|女配|男反|女反|反派/.test(rawRole);
       return {
         name,
-        score: role.includes("主") ? 90 : 50,
+        score: role.includes("主") ? 80 : 50,
         role,
-        explicitRole: role,
+        explicitRole: isExplicitRole ? role : "",
         contexts: [item.description || item.role || ""].filter(Boolean),
       };
     })
@@ -1155,14 +1363,14 @@ function buildSceneSeedsFromAnalysis(analysis?: StoryAssetAnalysis | null, chara
     .filter((item): item is NamedSeed => item !== null);
 }
 
-function normalizeRoleFromAnalysis(role: string, index: number) {
+function normalizeRoleFromAnalysis(role: string) {
   if (/男主|男一/.test(role)) return "男主角";
   if (/女主|女一/.test(role)) return "女主角";
   if (/主角/.test(role)) return "主角";
   if (/反派/.test(role)) return "反派角色";
   if (/男配/.test(role)) return "男配角";
   if (/女配/.test(role)) return "女配角";
-  return index < 2 ? "主角" : "配角";
+  return "配角";
 }
 
 function makeCharacterAsset(
@@ -1437,20 +1645,31 @@ function buildSummary(
 }
 
 function isSceneHeading(line: string) {
+  const normalized = normalizeSceneHeadingLine(line);
   return (
-    /^(第\s*[0-9一二两三四五六七八九十百]+\s*场|场景|地点|内景|外景|INT\.?|EXT\.?)/i.test(line) ||
-    /[日夜晨昏]\s*[内外]$/.test(line) ||
-    /^[0-9]+[.、]\s*.{2,24}(内|外|日|夜)$/.test(line)
+    /^(第\s*[0-9一二两三四五六七八九十百]+\s*场|场景\s*[0-9一二两三四五六七八九十百]*|地点|内景|外景|INT\.?|EXT\.?)/i.test(normalized) ||
+    /[日夜晨昏]\s*[内外]$/.test(normalized) ||
+    /^[0-9]+[.、]\s*.{2,24}(内|外|日|夜)$/.test(normalized)
   );
 }
 
+function normalizeSceneHeadingLine(line: string) {
+  return String(line || "")
+    .trim()
+    .replace(/^[【\[]\s*/, "")
+    .replace(/[】\]]\s*$/, "")
+    .trim();
+}
+
 function cleanSceneName(line: string) {
-  return cleanAssetName(
-    line
-      .replace(/^(第\s*[0-9一二两三四五六七八九十百]+\s*场|场景|地点|内景|外景|INT\.?|EXT\.?)[：:\s-]*/i, "")
-      .replace(/[日夜晨昏]\s*[内外]?$/g, "")
-      .replace(/^[0-9]+[.、]\s*/, "")
-  );
+  const normalized = normalizeSceneHeadingLine(line);
+  const scenePrefix = /^(第\s*[0-9一二两三四五六七八九十百]+\s*场|场景\s*[0-9一二两三四五六七八九十百]*|地点|内景|外景|INT\.?|EXT\.?)[：:\s-]*(.+)$/i;
+  const body = normalized.match(scenePrefix)?.[2] || normalized;
+  const primary = body
+    .split(/[\/／|｜,，。；;]/)[0]
+    .replace(/[日夜晨昏]\s*[内外]?$/g, "")
+    .replace(/^[0-9]+[.、]\s*/, "");
+  return cleanAssetName(primary);
 }
 
 function extractTimeTags(line: string) {
@@ -1464,24 +1683,8 @@ function extractTimeTags(line: string) {
 }
 
 function assignCharacterRoles(ranked: Array<Omit<CharacterSeed, "role">>) {
-  let maleLeadIndex = ranked.findIndex((seed) => seed.explicitRole === "男主角");
-  let femaleLeadIndex = ranked.findIndex((seed) => seed.explicitRole === "女主角");
-
-  if (maleLeadIndex < 0) {
-    maleLeadIndex = ranked.findIndex((seed) => /男主|丈夫|先生|哥哥|弟弟|父亲|军官|警官|队长|少年|他/.test(`${seed.name} ${seed.contexts.join(" ")}`));
-  }
-  if (femaleLeadIndex < 0) {
-    femaleLeadIndex = ranked.findIndex((seed, index) =>
-      index !== maleLeadIndex && /女主|妻子|小姐|姐姐|妹妹|母亲|姑娘|少女|她/.test(`${seed.name} ${seed.contexts.join(" ")}`)
-    );
-  }
-  if (maleLeadIndex < 0 && femaleLeadIndex < 0 && ranked[0]) maleLeadIndex = 0;
-  if (femaleLeadIndex < 0) femaleLeadIndex = ranked.findIndex((_, index) => index !== maleLeadIndex);
-
-  return ranked.map((seed, index): CharacterSeed => {
+  return ranked.map((seed): CharacterSeed => {
     let role = seed.explicitRole || "";
-    if (!role && index === maleLeadIndex) role = "男主角";
-    if (!role && index === femaleLeadIndex) role = "女主角";
     if (!role) role = inferSupportRole(seed.name, seed.contexts);
     return { ...seed, role };
   });
@@ -1489,9 +1692,10 @@ function assignCharacterRoles(ranked: Array<Omit<CharacterSeed, "role">>) {
 
 function inferSupportRole(name: string, contexts: string[]) {
   const joined = `${name} ${contexts.join(" ")}`;
+  const gender = inferGender(name, joined, "");
   if (/反派|敌人|仇人|背叛|阴谋/.test(joined)) return "反派角色";
-  if (/男|父|哥|弟|军|警|先生|丈夫|他/.test(joined)) return "男配角";
-  if (/女|母|姐|妹|小姐|妻子|她/.test(joined)) return "女配角";
+  if (gender === "男性") return "男配角";
+  if (gender === "女性") return "女配角";
   return "配角";
 }
 
@@ -1515,6 +1719,7 @@ function normalizeRole(role: string) {
 }
 
 function roleKeyFromRole(role: string, gender = "") {
+  if (/无名配角|群体角色/.test(role)) return "";
   if (/男主/.test(role)) return "maleLead";
   if (/女主/.test(role)) return "femaleLead";
   if (/男配/.test(role)) return "maleSupport";
@@ -1555,6 +1760,7 @@ function looksLikeNonCharacterAssetName(name: string) {
   if (!value) return true;
   if (isGroupCharacterName(value)) return false;
   if (BANNED_CHARACTER_NAMES.has(value)) return true;
+  if (/^(景\d+|场\d+|制作提示|转场字幕|监狱画面|画面提示|镜头提示|字幕提示)$/.test(value)) return true;
   if (/^(今生|前世|重生前|重生后|前期|初期|中期|后期|高潮|开端|结尾|尾声|背景|性格|人设|设定|剧情|简介|梗概|主题|主线|支线|卖点|看点|题材标签|核心看点|人物弧光|角色弧光|性格反差|高光时刻)$/.test(value)) return true;
   if (/(标签|看点|弧光|反差|时刻|阶段|背景|设定|剧情|简介|梗概|主题|主线|支线|卖点|金手指)$/.test(value)) return true;
   if (/^(男主角?|女主角?|男一|女一|男配|女配|主角|配角|反派|黄金配角|渣男前夫)$/.test(value)) return true;
@@ -1564,17 +1770,31 @@ function looksLikeNonCharacterAssetName(name: string) {
 }
 
 function normalizePropName(name: string) {
-  return cleanAssetName(name)
+  const cleaned = cleanAssetName(name)
     .replace(/^(一把|一支|一个|一辆|这辆|那辆|把|将|用|拿|拿起|握着|掏出|取出|举起|递出|打开|放下|装着|带着|开着|驾驶)/, "")
     .replace(/(放在|放到|拿到|递给|交给|扔进|丢进|放进|放入|放上|用来|用于|冲进|来到|进入|走进|呼救|求救|上|里|中|内|旁|前|后|的时候).*$/, "");
+  const keyword = findLongestKeyword(cleaned, PROP_KEYWORDS.map((item) => item.keyword));
+  if (keyword && /(缓缓|慢慢|迅速|立刻|突然|直接|随手|伸手|拿|取出|拿出|掏出|递出|握着|举起|打开|放下|装着|带着)/.test(cleaned)) {
+    return keyword;
+  }
+  return cleaned;
 }
 
 function normalizeSceneName(name: string, characterNameSet = new Set<string>()) {
   let cleaned = cleanAssetName(name)
     .replace(/^(一间|一个|一座|这间|那间|这座|那座|来到|回到|进入|走进|冲进|离开|赶往|开着|驾驶)/, "")
-    .replace(/(门口|里面|外面|之中|附近).*$/, "$1");
+    .replace(/(门口|里面|外面|之中|附近|角落里|角落|一角|内部).*$/, "");
   for (const characterName of characterNameSet) {
     cleaned = cleaned.replaceAll(characterName, "");
+  }
+  const descriptorMatch = cleaned.match(/^(狭长|宽敞|昏暗|明亮|空旷|废弃|破旧|老式|巨大|狭窄|温馨|惨白|冷清)([\u4e00-\u9fa5A-Za-z0-9·]{2,10})$/);
+  if (descriptorMatch) {
+    const specific = findLongestKeyword(descriptorMatch[2], SCENE_KEYWORDS.map((item) => item.keyword));
+    if (specific) cleaned = specific;
+  }
+  const embeddedKeyword = findLongestKeyword(cleaned, SCENE_KEYWORDS.map((item) => item.keyword));
+  if (embeddedKeyword && looksLikeSceneDescriptorPhrase(cleaned, embeddedKeyword)) {
+    return embeddedKeyword;
   }
   if (/(把|将|放在|放到|来到|进入|走进|冲进|开着|驾驶|用|拿|呼救|求救)/.test(cleaned) || cleaned.length > 14) {
     const keyword = findLongestKeyword(cleaned, SCENE_KEYWORDS.map((item) => item.keyword));
@@ -1591,12 +1811,32 @@ function normalizeSceneAssetCandidate(name: string, characterNameSet = new Set<s
   if (exactKeyword && exactKeyword === value) return exactKeyword;
 
   const matchedKeyword = findLongestKeyword(value, SCENE_KEYWORDS.map((item) => item.keyword));
-  if (matchedKeyword && (looksLikePlotEventName(value) || value.length > matchedKeyword.length + 4)) {
+  if (matchedKeyword && (looksLikePlotEventName(value) || value.length >= matchedKeyword.length + 4)) {
     return matchedKeyword;
   }
 
   if (looksLikePlotEventName(value)) return "";
   return value;
+}
+
+function isInvalidSceneKeywordUsage(line: string, keyword: string) {
+  if (keyword === "城堡" && /积木|玩具|搭城堡|堆城堡/.test(line)) return true;
+  return false;
+}
+
+function looksLikeSceneDescriptorPhrase(value: string, keyword: string) {
+  if (value === keyword) return false;
+  if (/^(雨夜|雪夜|清晨|早晨|上午|中午|午后|黄昏|傍晚|深夜|凌晨|白天|夜晚|废弃|破败|烧毁|封锁|拥挤|空旷|昏暗|明亮)/.test(value)) {
+    return false;
+  }
+  const tail = value.slice(value.indexOf(keyword) + keyword.length);
+  return /(蜿蜒|延伸|通向|通往|穿过|横跨|坐落|矗立|映入|出现|空无一人|灯火通明|人来人往|车流|远处|尽头|两侧|旁边|附近|之中|里面|外面|门口)/.test(value)
+    || /^(里|内|外|中|前|后|旁|边|上|下)/.test(tail);
+}
+
+function isInvalidPropKeywordUsage(line: string, keyword: string) {
+  if (keyword === "弓" && /弓身|弓着腰|弓背|微微弓身|侧身弓背/.test(line)) return true;
+  return false;
 }
 
 function cleanAssetName(value: string) {
@@ -1722,11 +1962,43 @@ function looksLikeNonScene(name: string) {
   return /(时候|身边|眼前|心里|手里|声音|电话|镜头|画面|男人|女人|孩子)$/.test(name);
 }
 
+function inferGenderFromName(name: string) {
+  const value = cleanCharacterName(name);
+  if (!value) return "";
+  if (/(女|母|妈|姐|妹|嫂|婶|姨|姑|妻|太太|夫人|小姐|姑娘|少女|丫头|公主|娘娘|女儿)/.test(value)) {
+    return "女性";
+  }
+  if (/(婉|娟|婷|娜|玲|丽|芳|霞|媛|妍|倩|珊|莉|兰|梅|莲|燕|颖|瑶|琳|妮|薇|萱|晴|雪|雅|柔|娇|静|洁|慧|敏|怡|悦|彤|佳|诗|梦|琪|儿)$/.test(value)) {
+    return "女性";
+  }
+  if (/(男|父|爸|哥|弟|叔|伯|爷|夫|先生|少爷|公子|王爷|世子|少帅|将军|队长|首长|警官|军医|宪兵|总裁|总工)/.test(value)) {
+    return "男性";
+  }
+  if (/(强|刚|伟|勇|峰|锋|杰|磊|鹏|龙|虎|军|斌|涛|辉|浩|宇|凯|超|健|国|建|华|明|阳|霆|骁|远|川|泽|辰)$/.test(value)) {
+    return "男性";
+  }
+  return "";
+}
+
+function countMatches(text: string, pattern: RegExp) {
+  return [...text.matchAll(pattern)].length;
+}
+
 function inferGender(name: string, context: string, role = "") {
   if (/男主|男配/.test(role)) return "男性";
   if (/女主|女配/.test(role)) return "女性";
-  if (/(女性|女人|女主|女配|妻子|母亲|小姐|姐姐|妹妹|姑娘|少女|她)/.test(`${name} ${context}`)) return "女性";
-  if (/(男性|男人|男主|男配|丈夫|父亲|先生|哥哥|弟弟|军官|警官|他)/.test(`${name} ${context}`)) return "男性";
+  const nameGender = inferGenderFromName(name);
+  if (nameGender) return nameGender;
+
+  const source = `${name} ${context}`;
+  let femaleScore = 0;
+  let maleScore = 0;
+  femaleScore += countMatches(source, /女性|女人|女主|女配|妻子|母亲|妈妈|小姐|姐姐|妹妹|姑娘|少女|夫人|太太/g) * 3;
+  maleScore += countMatches(source, /男性|男人|男主|男配|丈夫|父亲|爸爸|先生|哥哥|弟弟|军官|警官|首长|队长/g) * 3;
+  femaleScore += countMatches(source, /她|她的/g);
+  maleScore += countMatches(source, /他|他的/g);
+  if (femaleScore >= maleScore + 2) return "女性";
+  if (maleScore >= femaleScore + 2) return "男性";
   return "性别未定";
 }
 
@@ -1803,22 +2075,56 @@ function buildProjectStyleGuide(meta: StoryMetaAnalysis | undefined, script: str
     fallbackStyle,
     script.slice(0, 500),
   ].filter(Boolean).join("，");
+  const eraAnchor = buildEraStyleAnchor(seed);
+  let baseStyle = "";
   if (/古装|宫廷|权谋|武侠|仙侠|玄幻|修仙|江湖/.test(seed)) {
-    return "整体画风：古装写实影视画风，东方古代服饰、建筑、器物、光影与色彩保持统一。";
+    baseStyle = "整体画风：古装写实影视画风，东方古代服饰、建筑、器物、光影与色彩保持统一。";
+    return [baseStyle, eraAnchor].filter(Boolean).join("\n");
   }
   if (/末世|废土|丧尸|灾变|避难所|重卡|荒凉|末日/.test(seed)) {
-    return "整体画风：末世废土写实画风，荒凉废墟、钢铁载具、冷酷战斗、生存压迫感保持统一。";
+    baseStyle = "整体画风：末世废土写实画风，荒凉废墟、钢铁载具、冷酷战斗、生存压迫感保持统一。";
+    return [baseStyle, eraAnchor].filter(Boolean).join("\n");
   }
   if (/民国|年代|军阀|谍战|抗战/.test(seed)) {
-    return "整体画风：年代写实影视画风，服装、建筑、道具、色彩和光影保持时代质感统一。";
+    baseStyle = "整体画风：年代写实影视画风，服装、建筑、道具、色彩和光影保持时代质感统一。";
+    return [baseStyle, eraAnchor].filter(Boolean).join("\n");
   }
   if (/校园|青春|学生|学校/.test(seed)) {
-    return "整体画风：青春校园写实画风，人物、场景、服装和道具保持清爽真实的校园质感。";
+    baseStyle = "整体画风：青春校园写实画风，人物、场景、服装和道具保持清爽真实的校园质感。";
+    return [baseStyle, eraAnchor].filter(Boolean).join("\n");
   }
   if (/都市|豪门|总裁|职场|商业|婚恋/.test(seed)) {
-    return "整体画风：都市短剧写实画风，人物造型、室内外空间和物品质感保持现代真实。";
+    baseStyle = "整体画风：都市短剧写实画风，人物造型、室内外空间和物品质感保持现代真实。";
+    return [baseStyle, eraAnchor].filter(Boolean).join("\n");
   }
-  return "整体画风：真人短剧写实画风，角色、场景、物品保持同一剧本世界观和视觉风格。";
+  baseStyle = "整体画风：真人短剧写实画风，角色、场景、物品保持同一剧本世界观和视觉风格。";
+  return [baseStyle, eraAnchor].filter(Boolean).join("\n");
+}
+
+function buildEraStyleAnchor(seed: string) {
+  const year = seed.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
+  if (year) {
+    return `时代约束：${year[1]}年，服装、发型、建筑、交通工具、道具、电器和广告字体必须符合该年份，不出现明显跨时代物件。`;
+  }
+  if (/八十年代|80年代|1980年代|1980s/i.test(seed)) {
+    return "时代约束：1980年代中国，服装、发型、建筑、交通工具、生活电器和道具必须符合80年代质感。";
+  }
+  if (/七十年代|70年代|1970年代|1970s/i.test(seed)) {
+    return "时代约束：1970年代中国，服装、发型、建筑、交通工具、生活电器和道具必须符合70年代质感。";
+  }
+  if (/九十年代|90年代|1990年代|1990s/i.test(seed)) {
+    return "时代约束：1990年代中国，服装、发型、建筑、交通工具、生活电器和道具必须符合90年代质感。";
+  }
+  if (/民国/.test(seed)) {
+    return "时代约束：民国时期中国，服饰、建筑、街景、车辆和器物避免现代化元素。";
+  }
+  if (/古代|架空古代|古风|唐代|宋代|明代|清代|汉代/.test(seed)) {
+    return "时代约束：古代或架空古代中国，服饰、建筑、器物、灯具和纹样避免现代工业元素。";
+  }
+  if (/现代|当代|都市|职场|商业/.test(seed)) {
+    return "时代约束：现代中国，服装、空间、电子设备和交通工具保持当代真实质感。";
+  }
+  return "";
 }
 
 function joinPromptSections(sections: Array<[string, string | string[]]>) {
@@ -1956,7 +2262,7 @@ function buildPropImagePrompt(name: string, type: string, description: string, p
   const assetType = type || "剧情道具";
   const propSource = String(description || "").replace(/\s+/g, " ").trim();
   const propFallback = `${name}是剧本中的${assetType}，需体现核心功能、材质结构和关键识别特征。`;
-  const propDescription = propSource.length > 150 || /剧名|人设|第\d+集|陆铮|沈念|赵衡/.test(propSource)
+  const propDescription = propSource.length > 150 || /剧名|人设|第\d+集/.test(propSource)
     ? propFallback
     : propSource || propFallback;
   const assetDescription = ensureSentenceEnd(
@@ -1981,7 +2287,7 @@ function buildSceneImagePrompt(name: string, type: string, description: string, 
   const timeText = times.length ? `可扩展为${times.map((time) => `${time}景`).join("、")}。` : "";
   const sceneSource = String(description || "").replace(/\s+/g, " ").trim();
   const sceneFallback = `${name}是剧本中的${sceneType}，需要建立稳定的空间结构、环境氛围和可复用方位关系。`;
-  const sceneBase = sceneSource.length > 170 || /剧名|人设|第\d+集|陆铮|沈念|赵衡/.test(sceneSource)
+  const sceneBase = sceneSource.length > 170 || /剧名|人设|第\d+集/.test(sceneSource)
     ? sceneFallback
     : sceneSource || sceneFallback;
   const sceneDescription = ensureSentenceEnd(

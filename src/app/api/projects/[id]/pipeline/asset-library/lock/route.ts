@@ -12,6 +12,7 @@ export async function POST(
 
   const body = await request.json().catch(() => ({})) as {
     confirmedScriptVersionId?: string;
+    assetIds?: string[];
     reviewSummary?: unknown;
   };
 
@@ -19,6 +20,7 @@ export async function POST(
     const version = await lockAssetLibraryVersion({
       projectId,
       confirmedScriptVersionId: body.confirmedScriptVersionId,
+      assetIds: Array.isArray(body.assetIds) ? body.assetIds : undefined,
       reviewSummary: body.reviewSummary,
       userId: project.userId,
     });

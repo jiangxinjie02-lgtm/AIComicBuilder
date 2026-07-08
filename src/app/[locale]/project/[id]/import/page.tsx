@@ -112,6 +112,7 @@ interface IntakeJobStatus {
   candidate_text?: string;
   error_message?: string;
   confirmed_script_version_id?: string;
+  story_analysis?: StoryAssetAnalysis | null;
   issue_summary?: {
     total?: number;
     high?: number;
@@ -129,14 +130,28 @@ interface IntakeJobStatus {
       message?: string;
       text?: string;
       suggestion?: string;
+      lineNumber?: number;
+      episodeTitle?: string;
+      sceneTitle?: string;
+      context?: string;
     }>;
     result?: unknown;
     error_message?: string;
   }>;
 }
 
+function isActiveIntakeStatus(status?: IntakeJobStatus | null) {
+  return status?.status === "queued" || status?.status === "running";
+}
+
 type AssetTab = "characters" | "items" | "environments" | "voices";
 type WorkbenchAsset = ExtractedAsset & { scope?: "main" | "guest" };
+type SyncedProjectAsset = {
+  id: string;
+  type: "character" | "prop" | "scene" | string;
+  name: string;
+  metadata?: Record<string, unknown>;
+};
 type StepStatus = Record<Step, "idle" | "running" | "done" | "error">;
 
 const CHARACTER_FACE_TEMPLATES: Record<string, NonNullable<ExtractedCharacter["faceTemplate"]>> = {
@@ -823,6 +838,12 @@ interface StoryReviewIssue {
   replacement: string;
   replaceMode?: "first" | "all";
   applied?: boolean;
+  waived?: boolean;
+  waiverNote?: string;
+  lineNumber?: number;
+  episodeTitle?: string;
+  sceneTitle?: string;
+  context?: string;
 }
 
 function categoryFromIntakeIssue(stage: string, category?: string): StoryReviewIssue["category"] {
@@ -854,6 +875,10 @@ function intakeIssuesToStoryIssues(status: IntakeJobStatus, sourceText: string):
         suggestion: suggestion || "请人工复查后确认是否修改。",
         replacement: hasSourceQuote && suggestion ? suggestion : exactQuote,
         replaceMode: "first" as const,
+        lineNumber: Number.isFinite(Number(issue.lineNumber)) ? Number(issue.lineNumber) : undefined,
+        episodeTitle: String(issue.episodeTitle || ""),
+        sceneTitle: String(issue.sceneTitle || ""),
+        context: String(issue.context || ""),
       };
     })
   );
@@ -885,6 +910,25 @@ interface StoryAssetAnalysis {
 function storyMetaOnlyAnalysis(analysis?: StoryAssetAnalysis | null): StoryAssetAnalysis | null {
   if (!analysis?.storyMeta) return null;
   return { storyMeta: analysis.storyMeta };
+}
+
+function storyAnalysisFromStatus(status?: IntakeJobStatus | null): StoryAssetAnalysis | null {
+  return storyMetaOnlyAnalysis(status?.story_analysis ?? null);
+}
+
+const REQUIRED_STORY_META_FIELDS: Array<[keyof NonNullable<StoryAssetAnalysis["storyMeta"]>, string]> = [
+  ["time", "时间/年代"],
+  ["background", "世界观/背景"],
+  ["visualStyleBase", "统一视觉风格"],
+  ["genre", "题材类型"],
+  ["locationBackground", "地域/空间背景"],
+];
+
+function missingStoryMetaLabels(analysis?: StoryAssetAnalysis | null) {
+  const meta = analysis?.storyMeta || {};
+  return REQUIRED_STORY_META_FIELDS
+    .filter(([field]) => !String(meta[field] || "").trim())
+    .map(([, label]) => label);
 }
 
 interface PersistedAssetVariant {
@@ -924,6 +968,52 @@ function asRecord(value: unknown): Record<string, unknown> {
     }
   }
   return {};
+}
+
+interface IntakeRevisionSummary {
+  stage: string;
+  label: string;
+  beforeHash: string;
+  afterHash: string;
+  charDelta: number;
+  changedLineCount: number;
+  changedSamples: Array<{ lineNumber: number; before: string; after: string }>;
+}
+
+const INTAKE_STAGE_LABELS: Record<string, string> = {
+  script_visual_enrichment: "视觉细节补全",
+  text_compliance_review: "文本合规改写",
+};
+
+function shortHash(value: unknown) {
+  const text = String(value || "");
+  return text ? text.slice(0, 10) : "";
+}
+
+function collectIntakeRevisionSummaries(status?: IntakeJobStatus | null): IntakeRevisionSummary[] {
+  return (status?.stages || []).flatMap((stage) => {
+    const revision = asRecord(asRecord(stage.result).revision);
+    if (revision.changed !== true) return [];
+    const rawSamples = Array.isArray(revision.changedSamples)
+      ? revision.changedSamples
+      : Array.isArray(revision.samples) ? revision.samples : [];
+    return [{
+      stage: stage.stage,
+      label: INTAKE_STAGE_LABELS[stage.stage] || stage.stage,
+      beforeHash: shortHash(revision.beforeHash),
+      afterHash: shortHash(revision.afterHash),
+      charDelta: Number(revision.charDelta || 0),
+      changedLineCount: Number(revision.changedLineCount || 0),
+      changedSamples: rawSamples.map((sample) => {
+        const item = asRecord(sample);
+        return {
+          lineNumber: Number(item.lineNumber || 0),
+          before: String(item.before || ""),
+          after: String(item.after || ""),
+        };
+      }).filter((sample) => sample.before || sample.after).slice(0, 3),
+    }];
+  });
 }
 
 function asStringArray(value: unknown): string[] {
@@ -1144,6 +1234,7 @@ export default function ImportPage({
   const [intakeJobStatus, setIntakeJobStatus] = useState<IntakeJobStatus | null>(null);
   const [confirmedScriptVersionId, setConfirmedScriptVersionId] = useState<string | null>(null);
   const [assetLibraryVersionId, setAssetLibraryVersionId] = useState<string | null>(null);
+  const [assetLibraryLocking, setAssetLibraryLocking] = useState(false);
   const intakePollingRef = useRef(false);
   const persistedAssetsHydratedRef = useRef(false);
 
@@ -1311,6 +1402,21 @@ export default function ImportPage({
     assetLibraryVersionId: null,
   }), []);
 
+  const syncReviewFromIntakeStatus = useCallback((status: IntakeJobStatus, options?: { preserveExistingIssues?: boolean }) => {
+    const candidateText = status.candidate_text || "";
+    const statusStoryAnalysis = storyAnalysisFromStatus(status);
+    if (statusStoryAnalysis) setStoryAnalysis(statusStoryAnalysis);
+    if (candidateText.trim()) {
+      const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+      setFullText(candidateText);
+      setReviewIssues((prev) => options?.preserveExistingIssues && prev.length > 0 ? prev : intakeReviewIssues);
+      enrichedTextRef.current = candidateText;
+      visualEnrichmentRef.current = null;
+      return { candidateText, intakeReviewIssues, statusStoryAnalysis };
+    }
+    return { candidateText, intakeReviewIssues: [] as StoryReviewIssue[], statusStoryAnalysis };
+  }, []);
+
   if (draftHydratedRef.current) {
     latestDraftPayloadRef.current = buildDraftPayload();
     hasPendingDraftSaveRef.current = true;
@@ -1445,13 +1551,8 @@ export default function ImportPage({
           if (intakeRes.ok) {
             const status = await intakeRes.json() as IntakeJobStatus;
             setIntakeJobStatus(status);
-            const candidateText = status.candidate_text || "";
+            const { candidateText } = syncReviewFromIntakeStatus(status, { preserveExistingIssues: true });
             if ((status.status === "awaiting_review" || status.status === "confirmed") && candidateText.trim()) {
-              const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
-              setFullText(candidateText);
-              setReviewIssues((prev) => prev.length > 0 ? prev : intakeReviewIssues);
-              enrichedTextRef.current = candidateText;
-              visualEnrichmentRef.current = null;
               detailSupplementedRef.current = true;
               setDetailSupplemented(true);
               if (draftCurrentStepValue < 2) {
@@ -1472,7 +1573,81 @@ export default function ImportPage({
       }
     }
     loadDraftAndLogs();
-  }, [projectId]);
+  }, [projectId, syncReviewFromIntakeStatus]);
+
+  useEffect(() => {
+    if (!draftHydrated || !intakeJobId || !isActiveIntakeStatus(intakeJobStatus)) return;
+    if (intakePollingRef.current) return;
+
+    let active = true;
+    intakePollingRef.current = true;
+
+    async function pollRestoredIntake() {
+      while (active && intakePollingRef.current && intakeJobId) {
+        try {
+          const statusRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}`);
+          if (!statusRes.ok) {
+            const errData = await statusRes.json().catch(() => ({}));
+            throw new Error(errData.error || `HTTP ${statusRes.status}`);
+          }
+
+          const status = await statusRes.json() as IntakeJobStatus;
+          setIntakeJobStatus(status);
+          const { candidateText, intakeReviewIssues, statusStoryAnalysis } = syncReviewFromIntakeStatus(status, {
+            preserveExistingIssues: isActiveIntakeStatus(status),
+          });
+
+          if (status.status === "failed" || status.status === "cancelled") {
+            setStepStatus((prev) => ({ ...prev, 1: "error" }));
+            intakePollingRef.current = false;
+            return;
+          }
+
+          if (status.status === "awaiting_review" || status.status === "confirmed") {
+            if (!candidateText.trim()) throw new Error("Script intake finished without candidate text");
+            detailSupplementedRef.current = true;
+            setDetailSupplemented(true);
+            setCurrentStep(2);
+            setStepStatus((prev) => ({ ...prev, 1: "done", 2: "idle" }));
+            if (status.confirmed_script_version_id) {
+              setConfirmedScriptVersionId(status.confirmed_script_version_id);
+            }
+            await saveDraft({
+              ...resetDraftPayload(),
+              currentStep: 2,
+              stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+              fullText: candidateText,
+              reviewIssues: intakeReviewIssues,
+              storyAnalysis: statusStoryAnalysis,
+              intakeJobId,
+              confirmedScriptVersionId: status.confirmed_script_version_id || null,
+              assetLibraryVersionId: null,
+            });
+            intakePollingRef.current = false;
+            return;
+          }
+        } catch (error) {
+          console.error("Restored script intake polling error:", error);
+        }
+
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+      }
+    }
+
+    void pollRestoredIntake();
+    return () => {
+      active = false;
+      intakePollingRef.current = false;
+    };
+  }, [
+    draftHydrated,
+    intakeJobId,
+    intakeJobStatus,
+    projectId,
+    resetDraftPayload,
+    saveDraft,
+    syncReviewFromIntakeStatus,
+  ]);
 
   useEffect(() => {
     if (!draftHydrated || !forceAssetWorkbench) return;
@@ -1807,9 +1982,11 @@ export default function ImportPage({
         const candidateText = status.candidate_text || "";
         if (!candidateText.trim()) throw new Error("Script intake finished without candidate text");
         const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+        const statusStoryAnalysis = storyAnalysisFromStatus(status);
 
         setFullText(candidateText);
         setReviewIssues(intakeReviewIssues);
+        setStoryAnalysis(statusStoryAnalysis);
         enrichedTextRef.current = candidateText;
         visualEnrichmentRef.current = null;
         setDetailSupplementReady(true);
@@ -1825,10 +2002,12 @@ export default function ImportPage({
           stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
           fullText: candidateText,
           reviewIssues: intakeReviewIssues,
+          storyAnalysis: statusStoryAnalysis,
           intakeJobId: jobId,
           confirmedScriptVersionId: status.confirmed_script_version_id || null,
           assetLibraryVersionId: null,
         });
+        intakePollingRef.current = false;
         return;
       }
 
@@ -1911,9 +2090,11 @@ export default function ImportPage({
       const status = await intakeRes.json() as IntakeJobStatus;
       const candidateText = status.candidate_text || text;
       const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+      const statusStoryAnalysis = storyAnalysisFromStatus(status);
       setIntakeJobStatus(status);
       setFullText(candidateText);
       setReviewIssues(intakeReviewIssues);
+      if (statusStoryAnalysis) setStoryAnalysis(statusStoryAnalysis);
       setDetailSupplementReady(status.status === "awaiting_review" || status.status === "confirmed");
       setStepStatus((prev) => ({ ...prev, 2: "idle" }));
       addLog(2, "done", `剧本标准化审阅结果已刷新，发现 ${intakeReviewIssues.length} 个问题`);
@@ -1923,6 +2104,7 @@ export default function ImportPage({
         stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
         fullText: candidateText,
         reviewIssues: intakeReviewIssues,
+        storyAnalysis: statusStoryAnalysis ?? storyAnalysis,
         intakeJobId,
         confirmedScriptVersionId: status.confirmed_script_version_id || confirmedScriptVersionId,
       });
@@ -2021,8 +2203,8 @@ export default function ImportPage({
 
   function applyStoryIssue(index: number) {
     const issue = reviewIssues[index];
-    if (!issue || issue.applied) return;
-    if (!fullText.includes(issue.exactQuote)) {
+    if (!issue || issue.applied || issue.waived) return;
+    if (!issue.exactQuote || !fullText.includes(issue.exactQuote)) {
       toast.error(t("reviewQuoteMissing"));
       return;
     }
@@ -2042,7 +2224,7 @@ export default function ImportPage({
     const targets = new Set(indexes);
     let nextText = fullText;
     const nextIssues = reviewIssues.map((issue, index) => {
-      if (!targets.has(index) || issue.applied || !nextText.includes(issue.exactQuote)) return issue;
+      if (!targets.has(index) || issue.applied || issue.waived || !issue.exactQuote || !nextText.includes(issue.exactQuote)) return issue;
       nextText = issue.replaceMode === "all"
         ? nextText.split(issue.exactQuote).join(issue.replacement)
         : nextText.replace(issue.exactQuote, issue.replacement);
@@ -2061,7 +2243,7 @@ export default function ImportPage({
     const indexes = Array.from(selectedIssueIndexes)
       .filter((index) => {
         const issue = reviewIssues[index];
-        return issue && !issue.applied && fullText.includes(issue.exactQuote);
+        return issue && !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote);
       })
       .sort((a, b) => a - b);
     if (indexes.length === 0) {
@@ -2073,6 +2255,76 @@ export default function ImportPage({
 
   function applyAllStoryIssues() {
     applyStoryIssueIndexes(reviewIssues.map((_, index) => index));
+  }
+
+  function resolveHighRiskStoryIssues(options?: { waiveRemaining?: boolean }) {
+    let nextText = fullText;
+    let appliedCount = 0;
+    let waivedCount = 0;
+    const nextIssues = reviewIssues.map((issue) => {
+      if (issue.severity !== "high" || issue.applied || issue.waived) return issue;
+      if (issue.exactQuote && nextText.includes(issue.exactQuote)) {
+        nextText = issue.replaceMode === "all"
+          ? nextText.split(issue.exactQuote).join(issue.replacement)
+          : nextText.replace(issue.exactQuote, issue.replacement);
+        appliedCount += 1;
+        return { ...issue, applied: true };
+      }
+      if (options?.waiveRemaining) {
+        waivedCount += 1;
+        return {
+          ...issue,
+          waived: true,
+          waiverNote: "manual_release_before_asset_intake",
+        };
+      }
+      return issue;
+    });
+
+    setFullText(nextText);
+    setReviewIssues(nextIssues);
+    setSelectedIssueIndexes(new Set());
+
+    if (appliedCount || waivedCount) {
+      toast.success(`已处理高危问题：自动替换 ${appliedCount} 项，人工确认 ${waivedCount} 项`);
+    } else {
+      toast.error("没有可自动处理的高危问题");
+    }
+
+    return { nextText, nextIssues, appliedCount, waivedCount };
+  }
+
+  function applyResolvableHighRiskIssues() {
+    resolveHighRiskStoryIssues();
+  }
+
+  async function resolveHighRisksAndConfirmStory() {
+    const unresolvedHighCount = reviewIssues.filter((issue) =>
+      issue.severity === "high" && !issue.applied && !issue.waived
+    ).length;
+    if (unresolvedHighCount === 0) {
+      await confirmStoryReview();
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `将按行业审阅规则处理 ${unresolvedHighCount} 个高危问题：可定位文本会自动替换，无法自动定位的问题将标记为人工确认后放行，并写入确认版本审阅记录。是否继续？`,
+    );
+    if (!confirmed) return;
+
+    const { nextText, nextIssues } = resolveHighRiskStoryIssues({ waiveRemaining: true });
+    await confirmStoryReview({ content: nextText, reviewIssues: nextIssues });
+  }
+
+  function waiveStoryIssue(index: number) {
+    setReviewIssues((prev) => prev.map((issue, idx) =>
+      idx === index ? { ...issue, waived: true, waiverNote: "manual_single_issue_release" } : issue
+    ));
+    setSelectedIssueIndexes((prev) => {
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
   }
 
   function toggleIssueSelection(index: number) {
@@ -2090,27 +2342,45 @@ export default function ImportPage({
   function toggleAllIssueSelection() {
     const selectableIndexes = reviewIssues
       .map((issue, index) => ({ issue, index }))
-      .filter(({ issue }) => !issue.applied && fullText.includes(issue.exactQuote))
+      .filter(({ issue }) => !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote))
       .map(({ index }) => index);
     const allSelected = selectableIndexes.length > 0 && selectableIndexes.every((index) => selectedIssueIndexes.has(index));
 
     setSelectedIssueIndexes(allSelected ? new Set() : new Set(selectableIndexes));
   }
 
-  async function ensureConfirmedScriptVersion() {
+  function validateStoryReviewReady(nextIssues = reviewIssues) {
+    const missingMeta = missingStoryMetaLabels(storyAnalysis);
+    if (missingMeta.length > 0) {
+      toast.error(`请先补全故事设定：${missingMeta.join("、")}`);
+      return false;
+    }
+    const unresolvedHigh = nextIssues.filter((issue) =>
+      issue.severity === "high" && !issue.applied && !issue.waived
+    );
+    if (unresolvedHigh.length > 0) {
+      toast.error(`请先处理或豁免 ${unresolvedHigh.length} 个高危审阅问题`);
+      return false;
+    }
+    return true;
+  }
+
+  async function ensureConfirmedScriptVersion(options?: { content?: string; reviewIssues?: StoryReviewIssue[] }) {
     if (confirmedScriptVersionId) return confirmedScriptVersionId;
     if (!intakeJobId) {
       throw new Error("请先完成剧本标准化，再确认正文");
     }
 
     addLog(2, "running", "正在生成人工确认剧本版本...");
+    const content = options?.content ?? fullText;
+    const issuesForReview = options?.reviewIssues ?? reviewIssues;
     const res = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        content: fullText,
+        content,
         reviewNotes: {
-          reviewIssues,
+          reviewIssues: issuesForReview,
           storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis),
         },
       }),
@@ -2130,7 +2400,8 @@ export default function ImportPage({
     addLog(2, "done", `已生成确认剧本版本: ${versionId}`);
     await saveDraft({
       ...buildDraftPayload(),
-      fullText,
+      fullText: content,
+      reviewIssues: issuesForReview,
       intakeJobId,
       confirmedScriptVersionId: versionId,
       assetLibraryVersionId: null,
@@ -2138,11 +2409,17 @@ export default function ImportPage({
     return versionId;
   }
 
-  async function confirmStoryReview() {
-    if (!fullText.trim()) return;
+  async function confirmStoryReview(options?: { content?: string; reviewIssues?: StoryReviewIssue[] }) {
+    const content = options?.content ?? fullText;
+    const issuesForReview = options?.reviewIssues ?? reviewIssues;
+    if (!content.trim()) return;
+    if (!validateStoryReviewReady(issuesForReview)) return;
     let activeConfirmedScriptVersionId: string;
     try {
-      activeConfirmedScriptVersionId = await ensureConfirmedScriptVersion();
+      activeConfirmedScriptVersionId = await ensureConfirmedScriptVersion({
+        content,
+        reviewIssues: issuesForReview,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "确认失败";
       addLog(2, "error", `确认剧本版本失败: ${msg}`);
@@ -2156,19 +2433,19 @@ export default function ImportPage({
       body: JSON.stringify({
         step: 2,
         status: "done",
-        message: `剧情审阅通过，共 ${fullText.length} 字`,
-        metadata: { charCount: fullText.length, preview: fullText.slice(0, 2000), text: fullText, storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis) },
+        message: `剧情审阅通过，共 ${content.length} 字`,
+        metadata: { charCount: content.length, preview: content.slice(0, 2000), text: content, storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis) },
       }),
     });
     setCurrentStep(3);
     setStepStatus((prev) => ({ ...prev, 2: "done" }));
-    addLog(2, "done", `剧情审阅通过，共 ${fullText.length} 字`);
+    addLog(2, "done", `剧情审阅通过，共 ${content.length} 字`);
     await saveDraft({
       ...buildDraftPayload(),
       currentStep: 3,
       stepStatus: { ...stepStatus, 2: "done" },
-      fullText,
-      reviewIssues,
+      fullText: content,
+      reviewIssues: issuesForReview,
       storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis),
     });
     await runCharacterExtract(activeConfirmedScriptVersionId);
@@ -2250,15 +2527,121 @@ export default function ImportPage({
     await runCharacterExtract();
   }
 
+  function syncedAssetsByType(assets: SyncedProjectAsset[], type: "character" | "prop" | "scene") {
+    return assets.filter((asset) => asset.type === type);
+  }
+
+  function mergeSyncedAssetIds<T extends WorkbenchAsset>(
+    source: T[],
+    syncedAssets: SyncedProjectAsset[],
+    type: "character" | "prop" | "scene",
+  ): T[] {
+    const candidates = syncedAssetsByType(syncedAssets, type);
+    const byId = new Map(candidates.map((asset) => [asset.id, asset]));
+    const byName = new Map(candidates.map((asset) => [asset.name.trim().toLowerCase(), asset]));
+
+    return source.map((asset, index) => {
+      const synced = (asset.assetId ? byId.get(asset.assetId) : undefined)
+        ?? byName.get(asset.name.trim().toLowerCase())
+        ?? candidates[index];
+      return synced?.id ? { ...asset, assetId: synced.id } as T : asset;
+    });
+  }
+
+  async function syncAndLockAssetLibraryVersion() {
+    if (!confirmedScriptVersionId) {
+      toast.error("请先确认剧本正文，再锁定资产库");
+      return null;
+    }
+    if (assetLibraryVersionId) return assetLibraryVersionId;
+
+    setAssetLibraryLocking(true);
+    addLog(3, "running", "正在同步并锁定资产库版本...");
+
+    try {
+      const syncRes = await apiFetch(`/api/projects/${projectId}/assets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ characters, items, environments }),
+      });
+      const syncData = await syncRes.json().catch(() => ({})) as { assets?: SyncedProjectAsset[]; error?: string };
+      if (!syncRes.ok) {
+        throw new Error(syncData.error || `HTTP ${syncRes.status}`);
+      }
+
+      const syncedAssets = Array.isArray(syncData.assets) ? syncData.assets : [];
+      const nextCharacters = mergeSyncedAssetIds(characters, syncedAssets, "character") as ExtractedCharacter[];
+      const nextItems = mergeSyncedAssetIds(items, syncedAssets, "prop") as ExtractedAsset[];
+      const nextEnvironments = mergeSyncedAssetIds(environments, syncedAssets, "scene") as ExtractedAsset[];
+      const assetIds = [...nextCharacters, ...nextItems, ...nextEnvironments]
+        .map((asset) => asset.assetId)
+        .filter((id): id is string => Boolean(id));
+      if (assetIds.length === 0) {
+        throw new Error("没有可锁定的角色、道具或场景资产");
+      }
+
+      setCharacters(nextCharacters);
+      setItems(nextItems);
+      setEnvironments(nextEnvironments);
+
+      const lockRes = await apiFetch(`/api/projects/${projectId}/pipeline/asset-library/lock`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmedScriptVersionId,
+          assetIds,
+          reviewSummary: {
+            source: "asset_review_before_split",
+            characterCount: nextCharacters.length,
+            itemCount: nextItems.length,
+            environmentCount: nextEnvironments.length,
+            voiceCount: voices.length,
+          },
+        }),
+      });
+      const lockData = await lockRes.json().catch(() => ({})) as {
+        asset_library_version?: { id?: string };
+        error?: string;
+      };
+      if (!lockRes.ok) {
+        throw new Error(lockData.error || `HTTP ${lockRes.status}`);
+      }
+
+      const versionId = lockData.asset_library_version?.id;
+      if (!versionId) throw new Error("锁定接口没有返回 asset_library_version.id");
+
+      setAssetLibraryVersionId(versionId);
+      addLog(3, "done", `资产库已锁定为版本 ${versionId}`);
+      await saveDraft({
+        ...buildDraftPayload(),
+        characters: nextCharacters,
+        items: nextItems,
+        environments: nextEnvironments,
+        assetLibraryVersionId: versionId,
+      });
+      return versionId;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "资产库锁定失败";
+      addLog(3, "error", `资产库锁定失败: ${msg}`);
+      toast.error(msg);
+      return null;
+    } finally {
+      setAssetLibraryLocking(false);
+    }
+  }
+
   // ── Step 4: Split (triggered by user after reviewing asset settings) ──
   async function runSplit() {
-    if (splitRunningRef.current || stepStatus[4] === "running") return;
+    if (splitRunningRef.current || stepStatus[4] === "running" || assetLibraryLocking) return;
     const assets = [...characters, ...items, ...environments, ...voices];
-    const unconfirmedAssets = assets.filter((asset) => asset.confirmed === false);
+    const unconfirmedAssets = assets.filter((asset) => asset.confirmed !== true);
     if (!assets.length || unconfirmedAssets.length > 0) {
       toast.error(`请先确认全部资产（${assets.length - unconfirmedAssets.length}/${assets.length}）`);
       return;
     }
+
+    const lockedAssetLibraryVersionId = await syncAndLockAssetLibraryVersion();
+    if (!lockedAssetLibraryVersionId) return;
 
     splitRunningRef.current = true;
     setCurrentStep(4);
@@ -2285,7 +2668,7 @@ export default function ImportPage({
       setEpisodes(data.episodes);
       setExpandedEpisodeIndexes(new Set());
       setConfirmedEpisodeIndexes(new Set());
-      addLog(4, "done", `分集完成，共 ${data.episodes.length} 集`);
+      addLog(4, "done", `分集完成，共 ${data.episodes.length} 集，使用资产库版本 ${lockedAssetLibraryVersionId}`);
       setStepStatus((prev) => ({ ...prev, 4: "done" }));
       await saveDraft({
         ...buildDraftPayload(),
@@ -2293,6 +2676,7 @@ export default function ImportPage({
         stepStatus: { ...stepStatus, 4: "done" },
         episodes: data.episodes,
         confirmedEpisodeIndexes: [],
+        assetLibraryVersionId: lockedAssetLibraryVersionId,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Split failed";
@@ -2313,10 +2697,14 @@ export default function ImportPage({
       toast.error("请先确认剧本正文，再生成项目内容");
       return;
     }
+    if (!assetLibraryVersionId) {
+      toast.error("请先确认资产并锁定资产库版本，再生成项目内容");
+      return;
+    }
 
     setCurrentStep(5);
     setStepStatus((prev) => ({ ...prev, 5: "running" }));
-    addLog(5, "running", `创建 ${episodes.length} 集、角色并锁定资产库...`);
+    addLog(5, "running", `创建 ${episodes.length} 集、角色并复用资产库版本 ${assetLibraryVersionId}...`);
 
     try {
       const res = await apiFetch(`/api/projects/${projectId}/import/generate`, {
@@ -2330,6 +2718,7 @@ export default function ImportPage({
           voices,
           relationships,
           confirmedScriptVersionId,
+          assetLibraryVersionId,
         }),
       });
       if (!res.ok) {
@@ -2526,10 +2915,29 @@ export default function ImportPage({
   const enrichmentRunning = Boolean(enrichmentJobStatus && (enrichmentJobStatus.status === "queued" || enrichmentJobStatus.status === "running"));
   const reviewRunning = stepStatus[2] === "running" && !enrichmentRunning;
   const stepTwoBusy = enrichmentRunning || reviewRunning;
-  const unappliedIssueCount = reviewIssues.filter((issue) => !issue.applied).length;
+  const unresolvedIssueCount = reviewIssues.filter((issue) => !issue.applied && !issue.waived).length;
+  const unresolvedHighIssueCount = reviewIssues.filter((issue) =>
+    issue.severity === "high" && !issue.applied && !issue.waived
+  ).length;
+  const storyReviewMissingMetaLabels = missingStoryMetaLabels(storyAnalysis);
+  const intakeReviewRunning = isActiveIntakeStatus(intakeJobStatus);
+  const storyReviewGateWarnings = [
+    intakeReviewRunning ? `剧本标准化仍在运行：${intakeJobStatus?.current_stage || intakeJobStatus?.status || "处理中"} ${Math.round(intakeJobStatus?.progress || 0)}%` : "",
+    storyReviewMissingMetaLabels.length > 0 ? `故事设定待补全：${storyReviewMissingMetaLabels.join("、")}` : "",
+    unresolvedHighIssueCount > 0 ? `高危问题待处理：${unresolvedHighIssueCount} 项` : "",
+  ].filter(Boolean);
+  const intakeRevisionSummaries = collectIntakeRevisionSummaries(intakeJobStatus);
+  const storyReviewHardGateWarnings = [
+    intakeReviewRunning ? "intake_running" : "",
+    storyReviewMissingMetaLabels.length > 0 ? "missing_story_meta" : "",
+  ].filter(Boolean);
+  const unresolvedHighAutoIssueCount = reviewIssues.filter((issue) =>
+    issue.severity === "high" && !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote)
+  ).length;
+  const unresolvedHighManualIssueCount = Math.max(0, unresolvedHighIssueCount - unresolvedHighAutoIssueCount);
   const selectableIssueIndexes = reviewIssues
     .map((issue, index) => ({ issue, index }))
-    .filter(({ issue }) => !issue.applied && fullText.includes(issue.exactQuote))
+    .filter(({ issue }) => !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote))
     .map(({ index }) => index);
   const selectedApplicableIssueCount = selectableIssueIndexes.filter((index) => selectedIssueIndexes.has(index)).length;
   const allSelectableIssuesSelected = selectableIssueIndexes.length > 0
@@ -2566,8 +2974,13 @@ export default function ImportPage({
     }
   }, [activeAssetKey, activeAssetList, activeAssetTab]);
 
+  function invalidateAssetLibraryVersion() {
+    if (assetLibraryVersionId) setAssetLibraryVersionId(null);
+  }
+
   function updateActiveWorkbenchAsset(patch: Partial<WorkbenchAsset>) {
     if (activeWorkbenchAssetIndex < 0) return;
+    invalidateAssetLibraryVersion();
     if (activeAssetTab === "characters") {
       setCharacters((prev) => prev.map((asset, index) => index === activeWorkbenchAssetIndex ? { ...asset, ...patch } as ExtractedCharacter : asset));
     } else if (activeAssetTab === "items") {
@@ -2650,6 +3063,7 @@ export default function ImportPage({
     options?: { persist?: boolean },
   ) {
     if (options?.persist) immediateDraftSaveRef.current = true;
+    invalidateAssetLibraryVersion();
     const setter = getAssetSetter(tab);
     setter((prev) => prev.map((asset, index) => index === assetIndex ? patcher(asset) : asset));
   }
@@ -2719,6 +3133,7 @@ export default function ImportPage({
     if (!window.confirm(`确定删除「${asset.name}」吗？`)) return;
     const key = getAssetKey(asset, assetIndex, tab);
     const setter = getAssetSetter(tab);
+    invalidateAssetLibraryVersion();
     setter((prev) => prev.filter((_, index) => index !== assetIndex));
     setActiveAssetKey((current) => (current === key ? "" : current));
     toast.success("已删除资产");
@@ -3401,12 +3816,14 @@ export default function ImportPage({
     } else {
       setVoices((prev) => [...prev, asset]);
     }
+    invalidateAssetLibraryVersion();
     setActiveAssetTab(tab);
     setActiveAssetKey(key);
     toast.success(`已添加${assetTabInfo(tab).label}`);
   }
 
   function confirmAllWorkbenchAssets() {
+    invalidateAssetLibraryVersion();
     setCharacters((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
     setItems((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
     setEnvironments((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
@@ -3453,6 +3870,8 @@ export default function ImportPage({
     ["time", "时间", storyAnalysis?.storyMeta?.time],
     ["background", "背景", storyAnalysis?.storyMeta?.background],
     ["visualStyleBase", "风格", storyAnalysis?.storyMeta?.visualStyleBase],
+    ["genre", "题材", storyAnalysis?.storyMeta?.genre],
+    ["locationBackground", "地域/空间", storyAnalysis?.storyMeta?.locationBackground],
   ] as const;
 
   const confirmedEpisodeCount = confirmedEpisodeIndexes.size;
@@ -3463,7 +3882,7 @@ export default function ImportPage({
   });
   const episodePendingDelete = episodeDeleteIndex === null ? null : episodes[episodeDeleteIndex];
   const allWorkbenchAssets = [...characters, ...items, ...environments, ...voices];
-  const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed !== false).length;
+  const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed === true).length;
   const allAssetsConfirmed = allWorkbenchAssets.length > 0 && confirmedAssetCount === allWorkbenchAssets.length;
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-[--surface]">
@@ -3635,14 +4054,91 @@ export default function ImportPage({
                   {enrichmentRunning ? "AI补全中" : intakeJobId ? "刷新审阅结果" : "需重新标准化"}
                 </Button>
                 <Button
-                  onClick={confirmStoryReview}
-                  disabled={stepTwoBusy || !fullText.trim() || (!intakeJobId && !confirmedScriptVersionId)}
+                  onClick={() => confirmStoryReview()}
+                  disabled={
+                    stepTwoBusy
+                    || !fullText.trim()
+                    || (!intakeJobId && !confirmedScriptVersionId)
+                    || storyReviewHardGateWarnings.length > 0
+                  }
                   className="rounded-xl"
                 >
                   {t("confirmStoryReview")}
                 </Button>
               </div>
             </div>
+
+            {storyReviewGateWarnings.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-800">
+                <span className="font-semibold">确认前需完成</span>
+                {storyReviewGateWarnings.map((warning) => (
+                  <span key={warning} className="rounded-lg bg-white px-2 py-1">
+                    {warning}
+                  </span>
+                ))}
+                {unresolvedHighIssueCount > 0 && (
+                  <div className="ml-auto flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={applyResolvableHighRiskIssues}
+                      disabled={stepTwoBusy || unresolvedHighAutoIssueCount === 0}
+                      className="h-8 rounded-lg border-amber-300 bg-white text-amber-800 hover:bg-amber-100"
+                    >
+                      自动替换可定位高危 {unresolvedHighAutoIssueCount}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={resolveHighRisksAndConfirmStory}
+                      disabled={stepTwoBusy || storyReviewHardGateWarnings.length > 0}
+                      className="h-8 rounded-lg"
+                    >
+                      处理高危并进入资产设定
+                      {unresolvedHighManualIssueCount > 0 ? `（人工确认 ${unresolvedHighManualIssueCount}）` : ""}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {intakeRevisionSummaries.length > 0 && (
+              <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[--text-primary]">AI 修改追踪</div>
+                    <div className="text-xs text-[--text-muted]">
+                      {intakeRevisionSummaries.length} 个阶段产生文本改动
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {intakeRevisionSummaries.map((revision) => (
+                    <div key={revision.stage} className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <div className="text-xs font-bold text-[--text-primary]">{revision.label}</div>
+                        <div className="text-[10px] font-semibold text-[--text-muted]">
+                          {revision.changedLineCount} 行 · {revision.charDelta >= 0 ? "+" : ""}{revision.charDelta} 字
+                        </div>
+                      </div>
+                      <div className="mb-2 text-[10px] text-[--text-muted]">
+                        {revision.beforeHash} → {revision.afterHash}
+                      </div>
+                      <div className="space-y-2">
+                        {revision.changedSamples.map((sample) => (
+                          <div key={`${revision.stage}:${sample.lineNumber}`} className="space-y-1 text-[11px] leading-5">
+                            <div className="font-semibold text-[--text-muted]">第 {sample.lineNumber} 行</div>
+                            {sample.before && <div className="rounded bg-red-50 px-2 py-1 text-red-900">{sample.before}</div>}
+                            {sample.after && <div className="rounded bg-emerald-50 px-2 py-1 text-emerald-900">{sample.after}</div>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {enrichmentJobStatus && !detailSupplemented && (
               <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
@@ -3759,27 +4255,41 @@ export default function ImportPage({
                     </div>
                   )}
 
-                  {!reviewRunning && !storyAnalysis && (
-                    <div className="rounded-lg bg-emerald-50 p-3 text-sm leading-relaxed text-emerald-700">
-                      AI 审阅通过并确认剧情后，会自动提取人物、场景、物品，并写入同一份资产草稿库。
+                  {!reviewRunning && (
+                    <div className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <div className="text-xs font-bold text-[--text-secondary]">故事设定</div>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          storyReviewMissingMetaLabels.length > 0
+                            ? "bg-amber-50 text-amber-700"
+                            : "bg-emerald-50 text-emerald-700"
+                        }`}>
+                          {storyReviewMissingMetaLabels.length > 0 ? `待补 ${storyReviewMissingMetaLabels.length}` : "完整"}
+                        </span>
+                      </div>
+                      <div className="space-y-2">
+                        {storyMetaRows.map(([field, label, value]) => {
+                          const missing = !String(value || "").trim();
+                          return (
+                            <div key={field} className="space-y-1">
+                              <label className="text-[10px] font-semibold text-[--text-muted]">{label}</label>
+                              <Textarea
+                                value={value || ""}
+                                onChange={(e) => updateStoryMetaField(field, e.target.value)}
+                                className={`min-h-16 resize-none rounded-lg text-xs leading-relaxed ${
+                                  missing ? "border-amber-200 bg-amber-50/40" : "bg-white"
+                                }`}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
 
-                  {!reviewRunning && storyAnalysis && (
-                    <div className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
-                      <div className="mb-2 text-xs font-bold text-[--text-secondary]">故事设定</div>
-                      <div className="space-y-2">
-                        {storyMetaRows.map(([field, label, value]) => (
-                          <div key={field} className="space-y-1">
-                            <label className="text-[10px] font-semibold text-[--text-muted]">{label}</label>
-                            <Textarea
-                              value={value || ""}
-                              onChange={(e) => updateStoryMetaField(field, e.target.value)}
-                              className="min-h-16 resize-none rounded-lg bg-white text-xs leading-relaxed"
-                            />
-                          </div>
-                        ))}
-                      </div>
+                  {!reviewRunning && reviewAssetTotal === 0 && (
+                    <div className="rounded-lg bg-emerald-50 p-3 text-sm leading-relaxed text-emerald-700">
+                      AI 审阅通过并确认剧情后，会自动提取人物、场景、物品，并写入同一份资产草稿库。
                     </div>
                   )}
 
@@ -3837,7 +4347,7 @@ export default function ImportPage({
                     <div className="text-xs text-[--text-muted]">
                       {reviewRunning
                         ? t("aiReviewRunning")
-                        : `${t("aiReviewIssueCount", { count: reviewIssues.length })} · 已选 ${selectedApplicableIssueCount}`}
+                        : `${t("aiReviewIssueCount", { count: reviewIssues.length })} · 未处理 ${unresolvedIssueCount} · 已选 ${selectedApplicableIssueCount}`}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -3861,7 +4371,7 @@ export default function ImportPage({
                       variant="outline"
                       size="sm"
                       onClick={applyAllStoryIssues}
-                      disabled={reviewRunning || unappliedIssueCount === 0}
+                      disabled={reviewRunning || selectableIssueIndexes.length === 0}
                     >
                       {t("applyAllSuggestions")}
                     </Button>
@@ -3884,7 +4394,7 @@ export default function ImportPage({
 
                   {!reviewRunning && reviewIssues.map((issue, idx) => {
                     const isSelected = selectedIssueIndexes.has(idx);
-                    const canApply = !issue.applied && fullText.includes(issue.exactQuote);
+                    const canApply = !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote);
                     return (
                       <div
                         key={`${issue.exactQuote}:${idx}`}
@@ -3927,38 +4437,71 @@ export default function ImportPage({
                                 已替换
                               </span>
                             )}
+                            {issue.waived && (
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600">
+                                已豁免
+                              </span>
+                            )}
                           </div>
+                          {(issue.lineNumber || issue.sceneTitle || issue.episodeTitle) && (
+                            <div className="mt-1 text-[10px] text-[--text-muted]">
+                              {[issue.episodeTitle, issue.sceneTitle, issue.lineNumber ? `第 ${issue.lineNumber} 行` : ""].filter(Boolean).join(" / ")}
+                            </div>
+                          )}
                         </div>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            applyStoryIssue(idx);
-                          }}
-                          disabled={issue.applied || !canApply}
-                        >
-                          {issue.applied ? t("appliedSuggestion") : t("applySuggestion")}
-                        </Button>
-                      </div>
-                      <div className="space-y-2 text-xs">
-                        <div>
-                          <div className="mb-1 font-medium text-[--text-secondary]">{t("originalText")}</div>
-                          <button
-                            type="button"
+                        <div className="flex shrink-0 gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
                             onClick={(e) => {
                               e.stopPropagation();
-                              scrollAndSelectQuote(issue, idx);
+                              applyStoryIssue(idx);
                             }}
-                            className="w-full rounded bg-red-50/70 p-2 text-left text-red-900 transition-colors hover:bg-red-100"
+                            disabled={issue.applied || issue.waived || !canApply}
                           >
-                            {issue.exactQuote}
-                          </button>
+                            {issue.applied ? t("appliedSuggestion") : t("applySuggestion")}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              waiveStoryIssue(idx);
+                            }}
+                            disabled={issue.applied || issue.waived}
+                          >
+                            豁免
+                          </Button>
                         </div>
-                        <div>
-                          <div className="mb-1 font-medium text-[--text-secondary]">{t("replacementText")}</div>
-                          <div className="rounded bg-emerald-50 p-2 text-emerald-900">#{idx} {issue.replacement}</div>
-                        </div>
+                      </div>
+                      <div className="space-y-2 text-xs">
+                        {issue.context && !issue.exactQuote && (
+                          <div>
+                            <div className="mb-1 font-medium text-[--text-secondary]">定位上下文</div>
+                            <div className="rounded bg-[--surface] p-2 text-[--text-secondary]">{issue.context}</div>
+                          </div>
+                        )}
+                        {issue.exactQuote && (
+                          <div>
+                            <div className="mb-1 font-medium text-[--text-secondary]">{t("originalText")}</div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                scrollAndSelectQuote(issue, idx);
+                              }}
+                              className="w-full rounded bg-red-50/70 p-2 text-left text-red-900 transition-colors hover:bg-red-100"
+                            >
+                              {issue.exactQuote}
+                            </button>
+                          </div>
+                        )}
+                        {issue.replacement && (
+                          <div>
+                            <div className="mb-1 font-medium text-[--text-secondary]">{t("replacementText")}</div>
+                            <div className="rounded bg-emerald-50 p-2 text-emerald-900">#{idx} {issue.replacement}</div>
+                          </div>
+                        )}
                         {issue.explanation && (
                           <p className="leading-relaxed text-[--text-muted]">{issue.explanation}</p>
                         )}
@@ -4024,11 +4567,11 @@ export default function ImportPage({
                 </Button>
                 <Button
                   onClick={runSplit}
-                  disabled={stepStatus[4] === "running" || !allAssetsConfirmed}
+                  disabled={stepStatus[4] === "running" || assetLibraryLocking || !allAssetsConfirmed}
                   className="rounded-xl"
                 >
-                  {stepStatus[4] === "running" && <Loader2 className="size-4 animate-spin" />}
-                  {t("confirmAndSplit")}
+                  {(stepStatus[4] === "running" || assetLibraryLocking) && <Loader2 className="size-4 animate-spin" />}
+                  {assetLibraryLocking ? "锁定资产库" : t("confirmAndSplit")}
                 </Button>
               </div>
             </div>
@@ -4113,7 +4656,7 @@ export default function ImportPage({
                             </span>
                           </button>
                           <div className="flex items-center gap-1">
-                            <span className={`mr-1 h-2 w-2 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
+                            <span className={`mr-1 h-2 w-2 rounded-full ${asset.confirmed === true ? "bg-emerald-500" : "bg-amber-400"}`} />
                             <Button
                               type="button"
                               size="icon-xs"
@@ -4160,15 +4703,15 @@ export default function ImportPage({
                       </div>
                       <button
                         type="button"
-                        onClick={() => updateActiveWorkbenchAsset({ confirmed: activeWorkbenchAsset.confirmed === false })}
+                        onClick={() => updateActiveWorkbenchAsset({ confirmed: activeWorkbenchAsset.confirmed !== true })}
                         className={`flex h-11 shrink-0 items-center gap-2 rounded-xl border px-4 text-sm font-bold transition-colors ${
-                          activeWorkbenchAsset.confirmed !== false
+                          activeWorkbenchAsset.confirmed === true
                             ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
                             : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
                         }`}
                       >
                         <Check className="size-4" />
-                        {activeWorkbenchAsset.confirmed !== false ? "已确认" : "确认资产"}
+                        {activeWorkbenchAsset.confirmed === true ? "已确认" : "确认资产"}
                       </button>
                     </div>
 

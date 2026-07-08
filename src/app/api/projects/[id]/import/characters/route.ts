@@ -35,6 +35,8 @@ interface ImportedAsset {
   mainImageName?: string;
   tags?: string[];
   promptMetadata?: AssetAgentAsset["promptMetadata"];
+  styleSpec?: unknown;
+  visualSchema?: unknown;
 }
 
 interface ImportedCharacter extends ImportedAsset {
@@ -95,6 +97,7 @@ function mapPersistedVariant(variant: Record<string, unknown>) {
     imageUrl: String(variant.referenceImage || ""),
     history: Array.isArray(metadata.history) ? metadata.history as Array<Record<string, unknown>> : [],
     editInstruction: String(changedTraits.editInstruction || ""),
+    visualSchema: metadata.visualSchema ?? null,
   };
 }
 
@@ -140,6 +143,8 @@ function hydrateAssetFromLibrary<T extends ImportedAsset>(
     mainImageName: String(metadata.mainImageName || draft.mainImageName || persisted.name),
     tags: asStringArray(metadata.tags).length ? asStringArray(metadata.tags) : draft.tags,
     promptMetadata: asRecord(metadata.promptMetadata).compilerIR ? metadata.promptMetadata as AssetAgentAsset["promptMetadata"] : draft.promptMetadata,
+    styleSpec: metadata.styleSpec ?? draft.styleSpec ?? null,
+    visualSchema: metadata.visualSchema ?? draft.visualSchema ?? null,
   };
 }
 

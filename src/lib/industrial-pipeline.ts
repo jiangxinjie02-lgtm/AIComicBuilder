@@ -15,7 +15,12 @@ import {
   visualAssetVersions,
   visualAssets,
 } from "@/lib/db/schema";
-import { buildAssetImagePrompt, type AssetPromptType } from "@/lib/asset-prompt-builder";
+import {
+  buildAssetImagePrompt,
+  type AssetPromptType,
+  type AssetStyleSpec,
+  type AssetVisualSchema,
+} from "@/lib/asset-prompt-builder";
 import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
 import { id as genId } from "@/lib/id";
 import {
@@ -94,6 +99,11 @@ function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
 }
 
+function toOptionalRecord<T = Record<string, unknown>>(value: unknown): T | null {
+  const record = toRecord(value);
+  return Object.keys(record).length ? record as T : null;
+}
+
 function readString(record: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     const value = record[key];
@@ -115,6 +125,51 @@ function readStringArray(record: Record<string, unknown>, keys: string[]) {
     }
   }
   return [];
+}
+
+function lockedAssetReviewSummary(assetsToLock: AssetRow[], excludedAssets: AssetRow[], variantsToLock: AssetVariantRow[]) {
+  const missingVisual = assetsToLock
+    .filter((asset) => !String(asset.visualConstraints || asset.description || "").trim())
+    .map((asset) => ({ id: asset.id, name: asset.name, type: asset.type }));
+  const missingNegative = assetsToLock
+    .filter((asset) => !String(asset.negativeConstraints || "").trim())
+    .map((asset) => ({ id: asset.id, name: asset.name, type: asset.type }));
+  const variantAssetIds = new Set(variantsToLock.map((variant) => variant.assetId));
+  const missingVariants = assetsToLock
+    .filter((asset) => !variantAssetIds.has(asset.id))
+    .map((asset) => ({ id: asset.id, name: asset.name, type: asset.type }));
+
+  return {
+    standardVersion: "asset_library_standard_v1",
+    lockedAssetCount: assetsToLock.length,
+    lockedVariantCount: variantsToLock.length,
+    excludedUnconfirmedAssetCount: excludedAssets.length,
+    excludedUnconfirmedAssets: excludedAssets.map((asset) => ({
+      id: asset.id,
+      name: asset.name,
+      type: asset.type,
+    })),
+    checks: {
+      allLockedAssetsConfirmed: assetsToLock.every((asset) => asset.confirmed === 1),
+      visualConstraintsPresent: missingVisual.length === 0,
+      negativeConstraintsPresent: missingNegative.length === 0,
+      variantsPresent: missingVariants.length === 0,
+    },
+    issues: {
+      missingVisual,
+      missingNegative,
+      missingVariants,
+    },
+  };
+}
+
+function assertAssetLibraryLockable(summary: ReturnType<typeof lockedAssetReviewSummary>) {
+  if (summary.lockedAssetCount === 0) {
+    throw new Error("Cannot lock asset library: no confirmed assets are available");
+  }
+  if (summary.issues.missingVisual.length > 0) {
+    throw new Error(`Cannot lock asset library: ${summary.issues.missingVisual.length} confirmed asset(s) are missing visual constraints`);
+  }
 }
 
 async function nextAssetLibraryVersion(projectId: string) {
@@ -372,6 +427,7 @@ async function ensureBaseVariant(projectId: string, asset: AssetRow) {
 export async function lockAssetLibraryVersion(input: {
   projectId: string;
   confirmedScriptVersionId?: string | null;
+  assetIds?: string[];
   userId?: string;
   reviewSummary?: unknown;
 }) {
@@ -390,8 +446,22 @@ export async function lockAssetLibraryVersion(input: {
     throw new Error("Cannot lock asset library: no assets have been created");
   }
 
-  const confirmedAssets = assetRows.filter((asset) => asset.confirmed === 1);
-  const selectedAssets = confirmedAssets.length > 0 ? confirmedAssets : assetRows;
+  const requestedAssetIds = new Set((input.assetIds ?? []).map((id) => String(id || "").trim()).filter(Boolean));
+  const assetsInRelease = requestedAssetIds.size > 0
+    ? assetRows.filter((asset) => requestedAssetIds.has(asset.id))
+    : assetRows;
+  if (requestedAssetIds.size > 0 && assetsInRelease.length !== requestedAssetIds.size) {
+    throw new Error("Cannot lock asset library: one or more selected assets are missing from the project");
+  }
+
+  const confirmedAssets = assetsInRelease.filter((asset) => asset.confirmed === 1);
+  const selectedAssets = confirmedAssets;
+  const excludedAssets = assetRows.filter((asset) =>
+    requestedAssetIds.size > 0 ? !requestedAssetIds.has(asset.id) || asset.confirmed !== 1 : asset.confirmed !== 1
+  );
+  if (selectedAssets.length === 0) {
+    throw new Error("Cannot lock asset library: no confirmed assets are available");
+  }
   for (const asset of selectedAssets) {
     await ensureBaseVariant(input.projectId, asset);
   }
@@ -416,6 +486,8 @@ export async function lockAssetLibraryVersion(input: {
     list.push(occurrence.id);
     sourceIdsByAsset.set(occurrence.assetId, list);
   }
+  const standardReviewSummary = lockedAssetReviewSummary(selectedAssets, excludedAssets, selectedVariants);
+  assertAssetLibraryLockable(standardReviewSummary);
 
   await db
     .update(assets)
@@ -447,7 +519,10 @@ export async function lockAssetLibraryVersion(input: {
       status: "locked",
       assetsJson: selectedAssets.map((asset) => snapshotAsset(asset, sourceIdsByAsset.get(asset.id) ?? [])),
       variantsJson: selectedVariants.map(snapshotVariant),
-      reviewSummary: input.reviewSummary ?? {},
+      reviewSummary: {
+        ...(toRecord(input.reviewSummary)),
+        assetLibraryStandard: standardReviewSummary,
+      },
       lockedBy: input.userId ?? "",
       createdAt: now(),
     })
@@ -511,14 +586,23 @@ export async function compileVisualAssetVersion(input: {
   const items = [];
   for (const asset of targetAssets) {
     const variant = variantForAsset(asset.id, libraryVariants);
+    const assetMetadata = toRecord(asset.metadata);
+    const variantAttributes = toRecord(variant?.attributes);
+    const variantMetadata = toRecord(variantAttributes.metadata);
     const prompt = buildAssetImagePrompt({
       asset: {
         id: asset.id,
         type: assetPromptType(asset.type),
         name: asset.name,
+        role: readString(assetMetadata, ["role", "roleKey", "scope"]),
+        category: readString(assetMetadata, ["category"]),
         description: asset.canonicalDescription,
+        prompt: readString(assetMetadata, ["prompt"]),
         visualConstraints: asset.visualConstraints,
         negativeConstraints: asset.negativeConstraints,
+        tags: readStringArray(assetMetadata, ["tags"]),
+        faceTemplate: toOptionalRecord(assetMetadata.faceTemplate),
+        visualSchema: toOptionalRecord<AssetVisualSchema>(assetMetadata.visualSchema),
       },
       variant: variant ? {
         id: variant.id,
@@ -529,7 +613,9 @@ export async function compileVisualAssetVersion(input: {
         negativeConstraints: String(variant.attributes?.negativeConstraints || ""),
         lockedTraits: variant.attributes?.lockedTraits,
         changedTraits: variant.attributes?.changedTraits,
+        visualSchema: toOptionalRecord<Partial<AssetVisualSchema>>(variantMetadata.visualSchema),
       } : null,
+      styleSpec: toOptionalRecord<AssetStyleSpec>(assetMetadata.styleSpec),
     });
 
     const [visualAsset] = await db

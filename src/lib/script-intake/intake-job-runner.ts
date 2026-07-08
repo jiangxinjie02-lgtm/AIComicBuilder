@@ -51,12 +51,13 @@ export const INTAKE_STAGES = [
   { stage: "document_cleaner", sequence: 8, progress: 48 },
   { stage: "parse_dialogue_action_emotion", sequence: 9, progress: 54 },
   { stage: "structured_script_json", sequence: 10, progress: 60 },
-  { stage: "ai_structure_review", sequence: 11, progress: 66 },
-  { stage: "script_visual_enrichment", sequence: 12, progress: 76 },
-  { stage: "enrichment_validation", sequence: 13, progress: 82 },
-  { stage: "text_compliance_review", sequence: 14, progress: 90 },
-  { stage: "human_review", sequence: 15, progress: 94 },
-  { stage: "confirmed_script_version", sequence: 16, progress: 100 },
+  { stage: "story_visual_bible", sequence: 11, progress: 64 },
+  { stage: "ai_structure_review", sequence: 12, progress: 68 },
+  { stage: "script_visual_enrichment", sequence: 13, progress: 78 },
+  { stage: "enrichment_validation", sequence: 14, progress: 84 },
+  { stage: "text_compliance_review", sequence: 15, progress: 90 },
+  { stage: "human_review", sequence: 16, progress: 94 },
+  { stage: "confirmed_script_version", sequence: 17, progress: 100 },
 ] as const;
 
 const SCRIPT_INTAKE_AI_TIMEOUT_MS = Math.max(
@@ -70,6 +71,10 @@ const SCRIPT_INTAKE_STALE_RUNNING_MS = Math.max(
 const SCRIPT_INTAKE_MAX_AI_CONCURRENCY = Math.max(
   1,
   Math.min(8, Number.parseInt(process.env.SCRIPT_INTAKE_AI_CONCURRENCY ?? "", 10) || 4),
+);
+const SCRIPT_INTAKE_AI_PER_KEY_CONCURRENCY = Math.max(
+  1,
+  Math.min(4, Number.parseInt(process.env.SCRIPT_INTAKE_AI_PER_KEY_CONCURRENCY ?? "", 10) || 1),
 );
 const SCRIPT_INTAKE_AI_FALLBACKS_PER_CHUNK = Math.max(
   1,
@@ -99,6 +104,25 @@ type IntakeIssue = {
   message: string;
   text?: string;
   suggestion?: string;
+  lineNumber?: number;
+  characterOffset?: number;
+  episodeId?: string;
+  episodeTitle?: string;
+  sceneId?: string;
+  sceneTitle?: string;
+  context?: string;
+};
+
+type StoryMetaAnalysis = {
+  time?: string;
+  background?: string;
+  visualStyleBase?: string;
+  genre?: string;
+  locationBackground?: string;
+};
+
+type StoryAssetAnalysis = {
+  storyMeta?: StoryMetaAnalysis;
 };
 
 interface IntakeOptions {
@@ -163,12 +187,30 @@ function compact(value: unknown, maxLength = 240) {
   return text.length > maxLength ? `${text.slice(0, maxLength).trim()}...` : text;
 }
 
+function cleanMetaText(value: unknown, maxLength = 160) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
 function getAiConfigs(options: IntakeOptions) {
   return resolveLanguageModelConfigs(options.modelConfig?.text);
 }
 
 function getAiConcurrency(configs: ProviderConfig[], itemCount: number) {
-  return Math.max(1, Math.min(SCRIPT_INTAKE_MAX_AI_CONCURRENCY, configs.length || 1, itemCount || 1));
+  const keyCount = Math.max(1, configs.length || 1);
+  const keyLimitedConcurrency = keyCount * SCRIPT_INTAKE_AI_PER_KEY_CONCURRENCY;
+  return Math.max(1, Math.min(SCRIPT_INTAKE_MAX_AI_CONCURRENCY, keyLimitedConcurrency, itemCount || 1));
+}
+
+function getAiConcurrencyMeta(configs: ProviderConfig[], itemCount: number) {
+  return {
+    concurrency: getAiConcurrency(configs, itemCount),
+    keyCount: configs.length,
+    perKeyConcurrency: SCRIPT_INTAKE_AI_PER_KEY_CONCURRENCY,
+    maxConcurrency: SCRIPT_INTAKE_MAX_AI_CONCURRENCY,
+  };
 }
 
 function rotateConfigs(configs: ProviderConfig[], offset: number) {
@@ -179,6 +221,171 @@ function rotateConfigs(configs: ProviderConfig[], offset: number) {
 
 function selectChunkConfigs(configs: ProviderConfig[], offset: number) {
   return rotateConfigs(configs, offset).slice(0, Math.min(configs.length, SCRIPT_INTAKE_AI_FALLBACKS_PER_CHUNK));
+}
+
+function lineNumberAt(text: string, offset: number) {
+  if (offset < 0) return undefined;
+  return text.slice(0, offset).split("\n").length;
+}
+
+function contextAround(text: string, offset: number, length: number) {
+  if (offset < 0) return "";
+  const start = Math.max(0, offset - 80);
+  const end = Math.min(text.length, offset + Math.max(length, 1) + 80);
+  return compact(text.slice(start, end), 220);
+}
+
+function annotateIssuesWithScriptContext(issues: IntakeIssue[], sourceText: string) {
+  if (!issues.length || !sourceText.trim()) return issues;
+  const structured = structureScriptText(sourceText);
+  return issues.map((issue) => {
+    if (issue.lineNumber || issue.sceneId || !issue.text?.trim()) return issue;
+    const quote = issue.text.trim();
+    const offset = sourceText.indexOf(quote);
+    if (offset < 0) return issue;
+    const scene = structured.scenes.find((item) => offset >= item.startIndex && offset < item.endIndex);
+    const episode = structured.episodes.find((item) => offset >= item.startIndex && offset < item.endIndex);
+    return {
+      ...issue,
+      characterOffset: offset,
+      lineNumber: lineNumberAt(sourceText, offset),
+      episodeId: episode?.id,
+      episodeTitle: episode?.title,
+      sceneId: scene?.id,
+      sceneTitle: scene?.title,
+      context: contextAround(sourceText, offset, quote.length),
+    };
+  });
+}
+
+function summarizeTextRevision(before: string, after: string, source: string) {
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+  const changedSamples: Array<{ lineNumber: number; before: string; after: string }> = [];
+  const maxLines = Math.max(beforeLines.length, afterLines.length);
+  let changedLineCount = 0;
+  for (let index = 0; index < maxLines; index += 1) {
+    const beforeLine = beforeLines[index] ?? "";
+    const afterLine = afterLines[index] ?? "";
+    if (beforeLine === afterLine) continue;
+    changedLineCount += 1;
+    if (changedSamples.length < 8) {
+      changedSamples.push({
+        lineNumber: index + 1,
+        before: compact(beforeLine, 160),
+        after: compact(afterLine, 160),
+      });
+    }
+  }
+  return {
+    source,
+    changed: before !== after,
+    beforeHash: hashText(before),
+    afterHash: hashText(after),
+    beforeCharCount: before.length,
+    afterCharCount: after.length,
+    charDelta: after.length - before.length,
+    changedLineCount,
+    changedSamples,
+    samples: changedSamples,
+  };
+}
+
+function normalizeStoryAnalysis(value: unknown): StoryAssetAnalysis | null {
+  const meta = toRecord(toRecord(value).storyMeta);
+  const storyMeta: StoryMetaAnalysis = {
+    time: cleanMetaText(meta.time, 120),
+    background: cleanMetaText(meta.background, 180),
+    visualStyleBase: cleanMetaText(meta.visualStyleBase, 220),
+    genre: cleanMetaText(meta.genre, 80),
+    locationBackground: cleanMetaText(meta.locationBackground, 120),
+  };
+  return Object.values(storyMeta).some(Boolean) ? { storyMeta } : null;
+}
+
+function detectStoryEra(text: string) {
+  const year = text.match(/(19[0-9]{2}|20[0-9]{2})\s*年?/);
+  if (year) return `${year[1]} 年代中国`;
+  if (/八十年代|80年代|1980年代|1980s/i.test(text)) return "1980年代中国";
+  if (/七十年代|70年代|1970年代|1970s/i.test(text)) return "1970年代中国";
+  if (/九十年代|90年代|1990年代|1990s/i.test(text)) return "1990年代中国";
+  if (/民国|军阀|谍战|抗战/.test(text)) return "民国/近代中国";
+  if (/古代|唐代|宋代|明代|清代|汉代|古装|仙侠|武侠|宫廷/.test(text)) return "古代中国";
+  if (/末世|废土|末日|灾变|丧尸|避难所/.test(text)) return "近未来末世/废土中国";
+  return "当代现实中国";
+}
+
+function detectStoryGenre(text: string) {
+  if (/末世|废土|丧尸|灾变|避难所/.test(text)) return "末世生存短剧";
+  if (/古装|宫廷|权谋|武侠|仙侠|玄幻|修仙|江湖/.test(text)) return "古装/东方幻想短剧";
+  if (/民国|军阀|谍战|抗战/.test(text)) return "年代/民国短剧";
+  if (/校园|青春|学生|学校/.test(text)) return "青春校园短剧";
+  if (/豪门|总裁|公司|职场|商业|婚恋|离婚|复仇/.test(text)) return "都市情感短剧";
+  if (/医院|医生|护士|急救|手术/.test(text)) return "医疗情感短剧";
+  return "现实主义短剧";
+}
+
+function detectLocationBackground(text: string, structured: StructuredScript) {
+  const sceneTitles = structured.scenes
+    .map((scene) => cleanMetaText(scene.title, 32))
+    .filter((title) => title && !/^Full script$/i.test(title));
+  const uniqueTitles = [...new Set(sceneTitles)].slice(0, 6);
+  if (uniqueTitles.length) return uniqueTitles.join("、");
+  const candidates = ["医院", "公司", "学校", "别墅", "办公室", "客厅", "街道", "酒店", "警局", "避难所", "基地", "宫殿"]
+    .filter((item) => text.includes(item));
+  return [...new Set(candidates)].slice(0, 6).join("、") || "主要场景待人工确认";
+}
+
+function buildLocalStoryAnalysis(text: string): StoryAssetAnalysis {
+  const structured = structureScriptText(text);
+  const time = detectStoryEra(text);
+  const genre = detectStoryGenre(text);
+  const locationBackground = detectLocationBackground(text, structured);
+  const background = [
+    genre,
+    locationBackground ? `主要空间：${locationBackground}` : "",
+    `剧本结构：${structured.summary.episodeCount} 集/段、${structured.summary.sceneCount} 场`,
+  ].filter(Boolean).join("；");
+  const visualStyleBase = [
+    time,
+    genre,
+    "真人实拍短剧写实风格",
+    "服装、建筑、道具、色彩、光线必须服从同一时代和世界观",
+  ].join("；");
+  return {
+    storyMeta: {
+      time,
+      background,
+      visualStyleBase,
+      genre,
+      locationBackground,
+    },
+  };
+}
+
+function validateStoryBible(storyAnalysis: StoryAssetAnalysis | null): IntakeIssue[] {
+  const meta = storyAnalysis?.storyMeta || {};
+  const required: Array<[keyof StoryMetaAnalysis, string]> = [
+    ["time", "故事时间/年代"],
+    ["background", "世界观/社会背景"],
+    ["visualStyleBase", "统一视觉风格"],
+    ["genre", "题材类型"],
+    ["locationBackground", "主要地域/空间背景"],
+  ];
+  return required
+    .filter(([key]) => !cleanMetaText(meta[key]))
+    .map(([, label]) => ({
+      stage: "story_visual_bible",
+      severity: "high" as const,
+      category: "story_bible_required",
+      message: `锁稿前必须确认${label}。`,
+      suggestion: `请在故事设定中补全${label}，再确认剧本。`,
+      text: "",
+    }));
+}
+
+function hasApprovedStoryBible(value: unknown) {
+  return validateStoryBible(normalizeStoryAnalysis(value)).length === 0;
 }
 
 async function mapConcurrent<T, R>(
@@ -331,6 +538,11 @@ async function getLatestCandidateText(jobId: string) {
     if (typeof value === "string" && value.trim()) return value;
   }
   return "";
+}
+
+async function getStoryAnalysisForJob(jobId: string) {
+  const storyBible = await loadStageResult<{ storyAnalysis?: StoryAssetAnalysis }>(jobId, "story_visual_bible");
+  return normalizeStoryAnalysis(storyBible.storyAnalysis);
 }
 
 function summarizeStructure(structured: StructuredScript) {
@@ -644,11 +856,19 @@ async function aiStructureReview(
 ) {
   const configs = getAiConfigs(options);
   if (configs.length === 0) {
-    return { skipped: true, issues: [] as IntakeIssue[], message: "No text model configured" };
+    return {
+      skipped: true,
+      issues: [] as IntakeIssue[],
+      message: "No text model configured",
+      concurrency: 0,
+      keyCount: 0,
+      perKeyConcurrency: SCRIPT_INTAKE_AI_PER_KEY_CONCURRENCY,
+      maxConcurrency: SCRIPT_INTAKE_MAX_AI_CONCURRENCY,
+    };
   }
 
   const chunks = chunkText(text, 5000);
-  const concurrency = getAiConcurrency(configs, chunks.length);
+  const { concurrency, keyCount, perKeyConcurrency, maxConcurrency } = getAiConcurrencyMeta(configs, chunks.length);
   const chunkIssues = await mapConcurrent(chunks, concurrency, async (chunk, index) => {
     await onChunkStart?.(index + 1, chunks.length);
     let parsed: unknown;
@@ -658,7 +878,8 @@ async function aiStructureReview(
         system: [
           "You are a script intake structure reviewer.",
           "Review only the supplied episode/scene chunk.",
-          "Return strict JSON: {\"issues\":[{\"severity\":\"low|medium|high\",\"category\":\"structure|continuity|format\",\"message\":\"\",\"text\":\"\",\"suggestion\":\"\"}]}",
+          "Return strict JSON: {\"issues\":[{\"severity\":\"low|medium|high\",\"category\":\"structure|continuity|format\",\"message\":\"\",\"text\":\"exact source quote when possible\",\"suggestion\":\"\",\"lineNumber\":0,\"sceneTitle\":\"\"}]}",
+          "Every issue should include the shortest exact source quote in text so production can locate it before lock.",
           "Do not rewrite the script in this stage.",
         ].join("\n"),
         prompt: `Chunk ${index + 1}/${chunks.length}:\n${chunk}`,
@@ -684,12 +905,22 @@ async function aiStructureReview(
         message: String(record.message || "Structure issue"),
         text: String(record.text || ""),
         suggestion: String(record.suggestion || ""),
+        lineNumber: Number.isFinite(Number(record.lineNumber)) ? Number(record.lineNumber) : undefined,
+        sceneTitle: String(record.sceneTitle || ""),
       });
     }
     return issues;
   });
 
-  return { skipped: false, issues: chunkIssues.flat(), message: `Reviewed ${chunks.length} chunks with concurrency ${concurrency}` };
+  return {
+    skipped: false,
+    issues: chunkIssues.flat(),
+    message: `Reviewed ${chunks.length} chunks with concurrency ${concurrency} across ${keyCount} key(s)`,
+    concurrency,
+    keyCount,
+    perKeyConcurrency,
+    maxConcurrency,
+  };
 }
 
 async function aiComplianceRewrite(
@@ -699,11 +930,21 @@ async function aiComplianceRewrite(
 ) {
   const configs = getAiConfigs(options);
   if (configs.length === 0 || options.allowAiOverwrite === false) {
-    return { skipped: true, text, issues: [] as IntakeIssue[], rewrittenChunks: 0, chunkCount: 0, concurrency: 0 };
+    return {
+      skipped: true,
+      text,
+      issues: [] as IntakeIssue[],
+      rewrittenChunks: 0,
+      chunkCount: 0,
+      concurrency: 0,
+      keyCount: configs.length,
+      perKeyConcurrency: SCRIPT_INTAKE_AI_PER_KEY_CONCURRENCY,
+      maxConcurrency: SCRIPT_INTAKE_MAX_AI_CONCURRENCY,
+    };
   }
 
   const chunks = chunkText(text, 4500);
-  const concurrency = getAiConcurrency(configs, chunks.length);
+  const { concurrency, keyCount, perKeyConcurrency, maxConcurrency } = getAiConcurrencyMeta(configs, chunks.length);
   const chunkResults = await mapConcurrent(chunks, concurrency, async (chunk, index) => {
     await onChunkStart?.(index + 1, chunks.length);
     let parsed: unknown;
@@ -762,6 +1003,9 @@ async function aiComplianceRewrite(
     rewrittenChunks: chunkResults.filter((result) => result.changed).length,
     chunkCount: chunks.length,
     concurrency,
+    keyCount,
+    perKeyConcurrency,
+    maxConcurrency,
   };
 }
 
@@ -836,9 +1080,16 @@ async function runStage(
     if (!(await context.isCurrent())) {
       throw new StaleStageRunError(stageName);
     }
+    const issueSourceText = String(
+      output.result?.candidateText
+      || output.result?.cleanedText
+      || output.result?.rawText
+      || await getLatestCandidateText(job.id).catch(() => "")
+    );
+    const annotatedIssues = annotateIssuesWithScriptContext(output.issues ?? [], issueSourceText);
     await updateStage(stage.id, output.skip ? "skipped" : "completed", {
       resultJson: output.result ?? {},
-      issuesJson: output.issues ?? [],
+      issuesJson: annotatedIssues,
       logsJson: {
         runId,
         finishedAt: now().toISOString(),
@@ -849,7 +1100,7 @@ async function runStage(
     await addJobLog(job, stageName, output.skip ? "warn" : "info", `Stage finished: ${stageName}`, {
       runId,
       skipped: Boolean(output.skip),
-      issueCount: output.issues?.length ?? 0,
+      issueCount: annotatedIssues.length,
     });
     await updateJob(job.id, { issueSummary: await collectIssueSummary(job.id) });
     return true;
@@ -1051,10 +1302,52 @@ async function runStructuredScriptJson(job: IntakeJob) {
   };
 }
 
+async function runStoryVisualBible(job: IntakeJob) {
+  const text = await getLatestCandidateText(job.id);
+  const localAnalysis = buildLocalStoryAnalysis(text);
+  const configs = getAiConfigs(readOptions(job));
+  let storyAnalysis: StoryAssetAnalysis | null = localAnalysis;
+  let source = "local_rules";
+  let aiError = "";
+
+  if (configs.length > 0) {
+    try {
+      const parsed = await callJsonModel({
+        configs,
+        system: [
+          "You are a production bible editor for short-drama, animation, and AI visual asset pipelines.",
+          "Extract only stable, non-spoiler story metadata that every later character, scene, prop, and variant prompt must inherit.",
+          "Return strict JSON: {\"storyMeta\":{\"time\":\"\",\"background\":\"\",\"visualStyleBase\":\"\",\"genre\":\"\",\"locationBackground\":\"\"}}",
+          "If the script is ambiguous, write a concise production-safe assumption and mark it as needing human confirmation.",
+        ].join("\n"),
+        prompt: `Script for story/visual bible extraction:\n${text.slice(0, 16000)}`,
+        maxOutputTokens: 1800,
+      });
+      storyAnalysis = normalizeStoryAnalysis(parsed) || localAnalysis;
+      source = "ai_story_visual_bible";
+    } catch (error) {
+      aiError = error instanceof Error ? error.message : String(error);
+      storyAnalysis = localAnalysis;
+      source = "local_rules_after_ai_failure";
+    }
+  }
+
+  const issues = validateStoryBible(storyAnalysis);
+  return {
+    result: {
+      storyAnalysis,
+      source,
+      aiError,
+      requiredFields: ["time", "background", "visualStyleBase", "genre", "locationBackground"],
+    },
+    issues,
+  };
+}
+
 async function runAiStructureReview(job: IntakeJob, _stage: IntakeStage, context: StageRunContext) {
   const text = await getLatestCandidateText(job.id);
   const result = await aiStructureReview(text, readOptions(job), async (chunkIndex, totalChunks) => {
-    const progress = 66 + Math.floor(((chunkIndex - 1) / Math.max(totalChunks, 1)) * 8);
+    const progress = 68 + Math.floor(((chunkIndex - 1) / Math.max(totalChunks, 1)) * 9);
     await context.updateProgress(progress);
     await addJobLog(job, "ai_structure_review", "info", `AI structure review chunk ${chunkIndex}/${totalChunks}`);
   });
@@ -1063,6 +1356,10 @@ async function runAiStructureReview(job: IntakeJob, _stage: IntakeStage, context
       skipped: result.skipped,
       issueCount: result.issues.length,
       message: result.message,
+      concurrency: result.concurrency,
+      keyCount: result.keyCount,
+      perKeyConcurrency: result.perKeyConcurrency,
+      maxConcurrency: result.maxConcurrency,
     },
     issues: result.issues,
     skip: result.skipped,
@@ -1102,7 +1399,7 @@ async function runScriptVisualEnrichment(job: IntakeJob, _stage: IntakeStage, co
     .where(eq(scriptChunks.scriptId, scriptId))
     .orderBy(asc(scriptChunks.chunkIndex));
   let completedChunks = 0;
-  const concurrency = getAiConcurrency(configs, rows.length);
+  const { concurrency, keyCount, perKeyConcurrency, maxConcurrency } = getAiConcurrencyMeta(configs, rows.length);
   const chunkResults = await mapConcurrent(rows, concurrency, async (chunk, index) => {
     const metadata = toRecord(chunk.metadata);
     await addJobLog(job, "script_visual_enrichment", "info", `Visual enrichment chunk ${index + 1}/${rows.length}`);
@@ -1141,14 +1438,14 @@ async function runScriptVisualEnrichment(job: IntakeJob, _stage: IntakeStage, co
         });
       }
       completedChunks += 1;
-      await context.updateProgress(76 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
+      await context.updateProgress(78 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
       return {
         patches: result.validation.accepted_patches,
         issues,
       };
     } catch (error) {
       completedChunks += 1;
-      await context.updateProgress(76 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
+      await context.updateProgress(78 + Math.floor((completedChunks / Math.max(rows.length, 1)) * 5));
       return {
         patches: [] as EnrichmentPatch[],
         issues: [{
@@ -1167,6 +1464,7 @@ async function runScriptVisualEnrichment(job: IntakeJob, _stage: IntakeStage, co
 
   const currentText = await getLatestCandidateText(job.id);
   const applied = applyEnrichmentPatchesToText(currentText, acceptedPatches);
+  const revision = summarizeTextRevision(currentText, applied.text, "script_visual_enrichment");
   const raw = await loadStageResult<{ rawText?: string }>(job.id, "extract_raw_text");
   if (applied.appliedCount > 0) {
     if (!(await context.isCurrent())) throw new StaleStageRunError("script_visual_enrichment");
@@ -1190,6 +1488,10 @@ async function runScriptVisualEnrichment(job: IntakeJob, _stage: IntakeStage, co
       skippedPatchCount: applied.skippedCount,
       chunkCount: rows.length,
       concurrency,
+      keyCount,
+      perKeyConcurrency,
+      maxConcurrency,
+      revision,
     },
     issues,
   };
@@ -1248,6 +1550,7 @@ async function runTextComplianceReview(job: IntakeJob, _stage: IntakeStage, cont
       status: "chunked",
     });
   }
+  const revision = summarizeTextRevision(currentText, rewrite.text, "text_compliance_review");
 
   return {
     result: {
@@ -1256,8 +1559,12 @@ async function runTextComplianceReview(job: IntakeJob, _stage: IntakeStage, cont
       rewrittenChunks: rewrite.rewrittenChunks,
       chunkCount: rewrite.chunkCount,
       concurrency: rewrite.concurrency,
+      keyCount: rewrite.keyCount,
+      perKeyConcurrency: rewrite.perKeyConcurrency,
+      maxConcurrency: rewrite.maxConcurrency,
       localIssueCount: localIssues.length,
       aiIssueCount: rewrite.issues.length,
+      revision,
     },
     issues: [...localIssues, ...rewrite.issues],
     skip: rewrite.skipped && localIssues.length === 0,
@@ -1283,10 +1590,23 @@ async function markAwaitingHumanReview(jobId: string) {
   await updateJob(jobId, {
     status: "awaiting_review",
     currentStage: "human_review",
-    progress: 92,
+    progress: 94,
     issueSummary,
   });
   await addJobLog(job, "human_review", "info", "Intake job is waiting for human review");
+}
+
+function unresolvedHighReviewIssues(reviewNotes: unknown) {
+  const notes = toRecord(reviewNotes);
+  const issues = Array.isArray(notes.reviewIssues) ? notes.reviewIssues : [];
+  return issues
+    .map((item) => toRecord(item))
+    .filter((issue) =>
+      issue.severity === "high"
+      && issue.applied !== true
+      && issue.waived !== true
+      && issue.resolved !== true
+    );
 }
 
 export async function startScriptIntakeJob(input: StartScriptIntakeJobInput) {
@@ -1442,6 +1762,7 @@ export async function runScriptIntakeJob(jobId: string) {
     document_cleaner: runDocumentCleaner,
     parse_dialogue_action_emotion: runParseDialogueActionEmotion,
     structured_script_json: runStructuredScriptJson,
+    story_visual_bible: runStoryVisualBible,
     ai_structure_review: runAiStructureReview,
     light_compliance_precheck: runLightCompliancePrecheck,
     script_visual_enrichment: runScriptVisualEnrichment,
@@ -1488,9 +1809,10 @@ export async function getScriptIntakeJobStatus(projectId: string, jobId: string)
     .where(eq(intakeJobLogs.jobId, jobId))
     .orderBy(desc(intakeJobLogs.createdAt))
     .limit(40);
-  const candidateText = job.status === "awaiting_review" || job.status === "confirmed"
-    ? await getLatestCandidateText(jobId)
-    : "";
+  const candidateText = job.status === "queued" || job.status === "failed" || job.status === "cancelled"
+    ? ""
+    : await getLatestCandidateText(jobId);
+  const storyAnalysis = await getStoryAnalysisForJob(jobId);
 
   return {
     job_id: job.id,
@@ -1503,6 +1825,7 @@ export async function getScriptIntakeJobStatus(projectId: string, jobId: string)
     error_message: job.errorMessage || "",
     confirmed_script_version_id: job.confirmedScriptVersionId || "",
     candidate_text: candidateText,
+    story_analysis: storyAnalysis,
     stages: stages.map((stage) => ({
       id: stage.id,
       stage: stage.stage,
@@ -1532,8 +1855,16 @@ export async function confirmScriptIntakeJob(input: ConfirmScriptIntakeInput) {
     .from(intakeJobs)
     .where(and(eq(intakeJobs.id, input.jobId), eq(intakeJobs.projectId, input.projectId)));
   if (!job) throw new Error("Intake job not found");
-  if (job.status !== "awaiting_review" && job.status !== "running") {
+  if (job.status !== "awaiting_review") {
     throw new Error(`Intake job is not ready for confirmation: ${job.status}`);
+  }
+  const unresolvedHigh = unresolvedHighReviewIssues(input.reviewNotes);
+  if (unresolvedHigh.length > 0) {
+    throw new Error(`Cannot confirm script: ${unresolvedHigh.length} high-severity review issue(s) must be applied or waived`);
+  }
+  const reviewNotes = toRecord(input.reviewNotes);
+  if (!hasApprovedStoryBible(reviewNotes.storyAnalysis)) {
+    throw new Error("Cannot confirm script: story/visual bible must include time, background, visual style, genre, and location background");
   }
 
   const candidateText = cleanScriptText(input.content || await getLatestCandidateText(input.jobId));
