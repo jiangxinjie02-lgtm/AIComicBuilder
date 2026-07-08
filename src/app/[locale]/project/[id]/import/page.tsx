@@ -27,6 +27,7 @@ import {
   buildAssetImagePrompt,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
+  shouldRebuildAssetDisplayPrompt,
   type AssetPromptType,
   type AssetStyleSpec,
   type AssetVisualSchema,
@@ -301,7 +302,7 @@ function compileImportAssetPrompt(
 
 function resolveDisplayAssetPrompt(prompt: unknown, fallback: string) {
   const existingPrompt = String(prompt || "").trim();
-  if (!existingPrompt || isCompiledEnglishAssetPrompt(existingPrompt)) return fallback;
+  if (shouldRebuildAssetDisplayPrompt(existingPrompt)) return fallback;
   return existingPrompt;
 }
 
@@ -673,7 +674,9 @@ function buildExpectedCharacterVariants(
 }
 
 function sanitizeCharacterProfile(character: ExtractedCharacter) {
-  const promptProfile = extractCharacterSubject(character.prompt || "");
+  const promptProfile = shouldRebuildAssetDisplayPrompt(character.prompt)
+    ? ""
+    : extractCharacterSubject(character.prompt || "");
   const source = promptProfile || character.description || `${character.name || "角色"}是剧本中的${character.role || "角色"}`;
   const cleaned = String(source)
     .replace(/人物：[^。！？!?]*/g, "")
@@ -1088,6 +1091,7 @@ function persistedAssetToWorkbench(asset: PersistedStoryAsset): WorkbenchAsset {
     .map(persistedVariantToWorkbench);
   const role = String(metadata.role || metadata.roleKey || "");
   const scope = metadata.scope === "main" || /男主|女主|主角/.test(role) ? "main" as const : "guest" as const;
+  const metadataPrompt = String(metadata.prompt || asset.visualConstraints || "");
   return {
     name: asset.name,
     frequency: Number(metadata.frequency ?? asset.importance ?? 1),
@@ -1100,7 +1104,7 @@ function persistedAssetToWorkbench(asset: PersistedStoryAsset): WorkbenchAsset {
     role,
     roleKey: String(metadata.roleKey || ""),
     episodes: asStringArray(metadata.episodes),
-    prompt: String(metadata.prompt || asset.visualConstraints || ""),
+    prompt: shouldRebuildAssetDisplayPrompt(metadataPrompt) ? asset.visualConstraints || "" : metadataPrompt,
     negativePrompt: asset.negativeConstraints || "",
     variants,
     imageUrl: asset.referenceImage || "",

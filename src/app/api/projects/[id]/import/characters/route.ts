@@ -12,6 +12,7 @@ import {
   type AssetAgentProject,
   type StoryAssetAnalysis,
 } from "@/lib/asset-agent/analyze-script-assets";
+import { shouldRebuildAssetDisplayPrompt } from "@/lib/asset-prompt-builder";
 
 export const maxDuration = 300;
 
@@ -122,6 +123,11 @@ function hydrateAssetFromLibrary<T extends ImportedAsset>(
 
   const metadata = asRecord(persisted.metadata);
   const variants = mapPersistedVariants(persisted);
+  const persistedPrompt = String(metadata.prompt || "");
+  const usePersistedPrompt = Boolean(persistedPrompt && !shouldRebuildAssetDisplayPrompt(persistedPrompt));
+  const persistedPromptMetadata = asRecord(metadata.promptMetadata).compilerIR
+    ? metadata.promptMetadata as AssetAgentAsset["promptMetadata"]
+    : null;
   return {
     ...draft,
     name: persisted.name || draft.name,
@@ -135,14 +141,14 @@ function hydrateAssetFromLibrary<T extends ImportedAsset>(
     role: String(metadata.role || draft.role || ""),
     roleKey: String(metadata.roleKey || draft.roleKey || ""),
     episodes: asStringArray(metadata.episodes).length ? asStringArray(metadata.episodes) : draft.episodes,
-    prompt: String(metadata.prompt || draft.prompt || ""),
+    prompt: usePersistedPrompt ? persistedPrompt : draft.prompt || "",
     negativePrompt: persisted.negativeConstraints || draft.negativePrompt,
     variants: variants.length ? variants : draft.variants,
     imageUrl: persisted.referenceImage || draft.imageUrl,
     history: Array.isArray(metadata.imageHistory) ? metadata.imageHistory as Array<Record<string, unknown>> : draft.history,
     mainImageName: String(metadata.mainImageName || draft.mainImageName || persisted.name),
     tags: asStringArray(metadata.tags).length ? asStringArray(metadata.tags) : draft.tags,
-    promptMetadata: asRecord(metadata.promptMetadata).compilerIR ? metadata.promptMetadata as AssetAgentAsset["promptMetadata"] : draft.promptMetadata,
+    promptMetadata: usePersistedPrompt && persistedPromptMetadata ? persistedPromptMetadata : draft.promptMetadata,
     styleSpec: metadata.styleSpec ?? draft.styleSpec ?? null,
     visualSchema: metadata.visualSchema ?? draft.visualSchema ?? null,
   };

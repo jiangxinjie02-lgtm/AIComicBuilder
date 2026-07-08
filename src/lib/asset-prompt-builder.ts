@@ -355,12 +355,73 @@ export function buildCompiledAssetProviderPrompt(input: {
   ].filter(Boolean).join("\n\n");
 }
 
+export function shouldRebuildAssetDisplayPrompt(prompt: unknown) {
+  const text = normalizeAuthoritativePrompt(prompt);
+  if (!text) return true;
+  if (/Asset reference sheet|Reusable prop asset reference|Reusable empty scene environment reference|STRUCTURED ENGLISH IMAGE PROMPT/i.test(text)) {
+    return true;
+  }
+  const profileText = extractDisplayPromptSection(text, ["角色档案", "物品档案", "环境档案"]) || text;
+  return looksLikeDialogueOrActionLeak(profileText);
+}
+
 function normalizeAuthoritativePrompt(prompt: unknown) {
   const text = clean(prompt)
     .replace(/\r\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return text.length > 8000 ? `${text.slice(0, 8000).trim()}\n...` : text;
+}
+
+function extractDisplayPromptSection(prompt: string, titles: string[]) {
+  for (const title of titles) {
+    const marker = `【${title}】`;
+    const start = prompt.indexOf(marker);
+    if (start < 0) continue;
+    const rest = prompt.slice(start + marker.length).trim();
+    const next = rest.search(/\n【/);
+    return (next >= 0 ? rest.slice(0, next) : rest).trim();
+  }
+  return "";
+}
+
+function looksLikeDialogueOrActionLeak(text: string) {
+  const value = clean(text);
+  if (!value) return false;
+  const lines = value.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  if (lines.some(looksLikeSpeakerDialogueLine)) return true;
+  if (/第\s*[0-9一二两三四五六七八九十百]+\s*[集场幕章]/.test(value)) return true;
+
+  const pronounCount = (value.match(/[我你他她]/g) || []).length;
+  const dialoguePunctuationCount = (value.match(/[？！?!]/g) || []).length;
+  const actionLeak = /(说道|问道|喊道|冷笑|声音|语气|看见|看着|推到|抬头|转身|站在|坐在|握紧|拿起|递给|走到|回头|皱眉|哭|笑)/.test(value);
+  if (pronounCount >= 4 && (dialoguePunctuationCount > 0 || actionLeak)) return true;
+  if (pronounCount >= 2 && actionLeak) return true;
+  return false;
+}
+
+function looksLikeSpeakerDialogueLine(line: string) {
+  const match = line.match(/^([\u4e00-\u9fa5A-Za-z0-9·]{1,12})(?:[（(][^）)]{1,24}[）)])?[：:]\s*(.+)$/);
+  if (!match) return false;
+  const label = match[1];
+  const body = match[2] || "";
+  const promptLabels = new Set([
+    "主体",
+    "类型",
+    "空间类型",
+    "变体名称",
+    "变体生成要求",
+    "参考模板",
+    "模板约束",
+    "身份约束",
+    "上衣",
+    "下装",
+    "发型",
+    "鞋",
+    "配饰",
+  ]);
+  if (promptLabels.has(label)) return false;
+  return /[我你他她]|[？！?!]|说|问|喊|没事|为什么|怎么|回来|听说/.test(body);
 }
 
 function promptRelationRules(category: string, mode?: "main" | "variant" | "edit") {

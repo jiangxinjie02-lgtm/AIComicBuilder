@@ -4,6 +4,7 @@ import {
   buildAssetImagePrompt,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
+  shouldRebuildAssetDisplayPrompt,
   type AssetPromptType,
   type AssetStyleSpec,
   type AssetVisualSchema,
@@ -614,6 +615,8 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
   const description = cleanText(draft.description || draft.visualHint || draft.visualConstraints || defaultAssetDescription(type, name));
   const visualConstraints = cleanText(draft.visualConstraints || draft.visualHint || draft.prompt || description);
   const negativePrompt = cleanText(draft.negativePrompt || defaultAssetNegativeConstraints(type));
+  const displayPrompt = cleanText(shouldRebuildAssetDisplayPrompt(draft.prompt) ? "" : draft.prompt)
+    || cleanText(draft.visualConstraints || draft.visualHint || description);
   const faceTemplate = asRecord(draft.faceTemplate);
   const built = buildAssetImagePrompt({
     asset: {
@@ -622,7 +625,7 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
       name,
       role: draft.role || draft.roleKey || draft.scope || draft.category || "",
       category: draft.category || type,
-      prompt: draft.prompt || "",
+      prompt: displayPrompt,
       description,
       visualHint: draft.visualHint || "",
       visualConstraints,
@@ -655,7 +658,7 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
     description,
     visualConstraints,
     negativePrompt,
-    prompt: cleanText(draft.prompt) || cleanText(draft.visualConstraints || draft.visualHint || description),
+    prompt: displayPrompt,
     promptMetadata: {
       ...previousPromptMetadata,
       standardVersion: "asset_library_standard_v1",

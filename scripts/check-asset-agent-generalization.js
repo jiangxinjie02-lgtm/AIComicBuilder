@@ -43,6 +43,7 @@ const { analyzeScriptAssets } = require("../src/lib/asset-agent/analyze-script-a
 const {
   buildAssetImagePrompt,
   buildCompiledAssetProviderPrompt,
+  shouldRebuildAssetDisplayPrompt,
 } = require("../src/lib/asset-prompt-builder.ts");
 
 const fixtures = [
@@ -241,5 +242,9 @@ const providerPrompt = buildCompiledAssetProviderPrompt({
 assert.match(providerPrompt, /STRUCTURED ENGLISH IMAGE PROMPT/i);
 assert.match(providerPrompt, /COMPILED VISUAL PROMPT/i);
 assert.doesNotMatch(providerPrompt, /AUTHORITATIVE USER IMAGE PROMPT|The following Chinese image prompt/i);
+
+const pollutedDisplayPrompt = "【角色档案】\n测试女主是剧本中的女主角。陆少，听说你缺个端茶倒水的。巧了，我刚好不想努力了。这婚，我结。你回来怎么不出声？你能感觉到我吃的味道？没事。";
+assert.equal(shouldRebuildAssetDisplayPrompt(pollutedDisplayPrompt), true, "dialogue-polluted display prompt should be rebuilt");
+assert.equal(shouldRebuildAssetDisplayPrompt(displayPrompt), false, "clean Chinese display prompt should be preserved");
 
 console.log("Asset agent generalization checks passed.");
