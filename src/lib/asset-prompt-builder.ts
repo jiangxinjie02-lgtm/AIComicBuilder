@@ -249,7 +249,7 @@ export function buildAssetImagePrompt(input: {
   const validationReport = validateCompilerIR(compilerIR);
   const compiledFinalPrompt = compileFinalPrompt(compilerIR);
   const compiledNegativePrompt = compileNegativePrompt(compilerIR);
-  const compiledDisplayPrompt = compileDisplayPrompt(compilerIR);
+  const compiledDisplayPrompt = compileDisplayPrompt(compiledFinalPrompt);
 
   return {
     compiler_input: compilerInput,
@@ -367,7 +367,8 @@ export function shouldRebuildAssetDisplayPrompt(prompt: unknown) {
     return true;
   }
   if (looksLikeLegacyDisplayPrompt(text)) return true;
-  if (looksLikeCompiledChineseDisplayPrompt(text)) return hasUntranslatedCompilerResidue(text);
+  if (looksLikeOldCompiledChineseDisplayPrompt(text)) return true;
+  if (looksLikeTranslatedCompiledDisplayPrompt(text)) return hasUntranslatedCompilerResidue(text);
   if (looksLikeConstraintOnlyPrompt(text)) return true;
   const profileText = extractDisplayPromptSection(text, ["角色档案", "物品档案", "环境档案"]) || text;
   return looksLikeDialogueOrActionLeak(profileText);
@@ -422,15 +423,22 @@ function looksLikeLegacyDisplayPrompt(text: string) {
   return /【(?:整体美学|画面规格|角色档案|物品档案|环境档案|职业与画风锚点|模板锁定|排除项)】/.test(clean(text));
 }
 
-function looksLikeCompiledChineseDisplayPrompt(text: string) {
+function looksLikeOldCompiledChineseDisplayPrompt(text: string) {
   const value = clean(text);
   const hasAssetHeader = /(资产参考设定图|可复用物品资产参考图|可复用空场景环境参考图)/.test(value);
-  const hasCompiledSections = /(外貌|服装|物品设计|环境设计|构图|风格|必须满足|排除项)：/.test(value);
-  return hasAssetHeader && hasCompiledSections;
+  const hasOldSections = /(外貌|构图|必须满足|排除项)：/.test(value);
+  return hasAssetHeader && hasOldSections;
+}
+
+function looksLikeTranslatedCompiledDisplayPrompt(text: string) {
+  const value = clean(text);
+  const hasAssetHeader = /(资产参考图|可复用物品资产参考图|可复用空场景环境参考图)/.test(value);
+  const hasMirrorSections = /(外观|服装|物品设计|环境设计|排版布局|风格|必需的视觉约束)：/.test(value);
+  return hasAssetHeader && hasMirrorSections;
 }
 
 function hasUntranslatedCompilerResidue(text: string) {
-  return /\b(stable character identity|story scene background|unrelated environment props|cropped head|cropped feet|dramatic action pose)\b/i.test(text);
+  return /\b(stable character identity|story scene background|unrelated environment props|cropped head|cropped feet|dramatic action pose|natural skin texture|anime style|illustration style|no comic style)\b/i.test(text);
 }
 
 function looksLikeSpeakerDialogueLine(line: string) {
@@ -919,70 +927,55 @@ function compileNegativePrompt(ir: AssetCompilerIR) {
   return renderNegativePrompt(ir.constraints.visual_must_not_have);
 }
 
-function compileDisplayPrompt(ir: AssetCompilerIR) {
-  if (ir.asset_type === "character") return compileCharacterDisplayPrompt(ir);
-  if (ir.asset_type === "prop") return compilePropDisplayPrompt(ir);
-  return compileSceneDisplayPrompt(ir);
+function compileDisplayPrompt(compiledFinalPrompt: string) {
+  return compiledFinalPrompt
+    .split(/\n+/)
+    .map((line) => translateCompiledPromptLine(line))
+    .filter(Boolean)
+    .join("\n");
 }
 
-function compileCharacterDisplayPrompt(ir: AssetCompilerIR) {
-  return displayLines([
-    joinDisplayValues([ir.identity.subject, ir.identity.age_range, ir.identity.role_identity]),
-    finishZhSentence(`${slotDisplayValue(ir.identity.name) || "角色"}资产参考设定图，${joinDisplayText([ir.constraints.genre, ir.constraints.era])}`),
-    displaySection("外貌", [
-      ir.appearance.face_shape,
-      ir.appearance.skin_tone,
-      ir.appearance.body_proportion,
-      ir.appearance.hairstyle,
-      ir.appearance.expression,
-    ]),
-    displaySection("服装", [
-      ir.clothing.top,
-      ir.clothing.bottom,
-      ir.clothing.shoes,
-      ir.clothing.outerwear,
-      ir.clothing.accessories,
-    ]),
-    displaySection("构图", [
-      ir.pose_layout.background,
-      ir.pose_layout.layout,
-      ir.pose_layout.camera,
-      ir.pose_layout.framing,
-      ir.pose_layout.consistency,
-    ]),
-    displaySection("风格", [
-      ir.style.visual_style,
-      ir.style.lighting,
-      ir.style.camera,
-      ir.style.texture,
-      ir.style.aspect_ratio,
-      ir.style.size,
-    ]),
-    displayTextSection("必须满足", ir.constraints.must_have),
-    displayTextSection("排除项", ir.constraints.visual_must_not_have),
-  ]);
+function translateCompiledPromptLine(line: string) {
+  const text = clean(line).replace(/\.$/, "");
+  if (!text) return "";
+
+  const characterHeader = text.match(/^Asset reference sheet for (.+?),\s*(.+)$/i);
+  if (characterHeader) {
+    return `${toChinesePromptValue(characterHeader[1])}的资产参考图，${sentence(toChinesePromptValue(characterHeader[2]))}`;
+  }
+
+  const propHeader = text.match(/^Reusable prop asset reference for (.+?),\s*(.+)$/i);
+  if (propHeader) {
+    return `${toChinesePromptValue(propHeader[1])}的可复用物品资产参考图，${sentence(toChinesePromptValue(propHeader[2]))}`;
+  }
+
+  const sceneHeader = text.match(/^Reusable empty scene environment reference for (.+?),\s*(.+)$/i);
+  if (sceneHeader) {
+    return `${toChinesePromptValue(sceneHeader[1])}的可复用空场景环境参考图，${sentence(toChinesePromptValue(sceneHeader[2]))}`;
+  }
+
+  const labeledLine = text.match(/^([A-Za-z ]+):\s*(.+)$/);
+  if (labeledLine) {
+    const label = COMPILED_DISPLAY_LABELS[labeledLine[1].trim().toLowerCase()] || labeledLine[1].trim();
+    return `${label}：${sentence(toChinesePromptValue(labeledLine[2]))}`;
+  }
+
+  return cleanupChineseList(toChinesePromptValue(text));
 }
 
-function compilePropDisplayPrompt(ir: AssetCompilerIR) {
-  return displayLines([
-    finishZhSentence(`${slotDisplayValue(ir.identity.name) || "物品"}可复用物品资产参考图，${joinDisplayText([ir.identity.category?.value, ir.constraints.genre, ir.constraints.era])}`),
-    displaySection("物品设计", [ir.prop.shape_material, ir.prop.condition]),
-    displaySection("构图", [ir.pose_layout.background, ir.pose_layout.layout, ir.pose_layout.camera, ir.pose_layout.framing]),
-    displaySection("风格", [ir.style.visual_style, ir.style.lighting, ir.style.texture, ir.style.aspect_ratio, ir.style.size]),
-    displayTextSection("必须满足", ir.constraints.must_have),
-    displayTextSection("排除项", ir.constraints.visual_must_not_have),
-  ]);
-}
+const COMPILED_DISPLAY_LABELS: Record<string, string> = {
+  appearance: "外观",
+  clothing: "服装",
+  layout: "排版布局",
+  style: "风格",
+  "required visual constraints": "必需的视觉约束",
+  "prop design": "物品设计",
+  "environment design": "环境设计",
+};
 
-function compileSceneDisplayPrompt(ir: AssetCompilerIR) {
-  return displayLines([
-    finishZhSentence(`${slotDisplayValue(ir.identity.name) || "场景"}可复用空场景环境参考图，${joinDisplayText([ir.identity.category?.value, ir.constraints.genre, ir.constraints.era])}`),
-    displaySection("环境设计", [ir.scene.environment_design]),
-    displaySection("构图", [ir.pose_layout.background, ir.pose_layout.layout, ir.pose_layout.camera, ir.pose_layout.framing]),
-    displaySection("风格", [ir.style.visual_style, ir.style.lighting, ir.style.texture, ir.style.aspect_ratio, ir.style.size]),
-    displayTextSection("必须满足", ir.constraints.must_have),
-    displayTextSection("排除项", ir.constraints.visual_must_not_have),
-  ]);
+function sentence(text: string) {
+  const value = cleanupChineseList(text).replace(/[，,；;.。]+$/g, "").trim();
+  return value ? `${value}。` : "";
 }
 
 function bindingsFor(assetType: AssetPromptType, asset: AssetPromptAsset, variant: AssetPromptVariant | null) {
@@ -1182,6 +1175,8 @@ const ZH_VISUAL_PROMPT_TERMS: Array<[string, string]> = [
   ["真人实拍摄影质感", "realistic live-action photography"],
   ["自然皮肤毛孔与织物纹理", "natural skin pores and fabric texture"],
   ["自然皮肤纹理", "natural skin texture"],
+  ["不要漫画风", "no comic style"],
+  ["夸张美型或换脸感", "exaggerated beauty styling or face-swap look"],
   ["影棚级光影", "studio-grade lighting"],
   ["35mm 胶片质地", "35mm film texture"],
   ["年代写实影视画风", "period realistic cinematic style"],
@@ -1406,6 +1401,16 @@ const EN_VISUAL_PROMPT_TERMS: Array<[string, string]> = [
   ["natural Chinese skin tone", "自然中国肤色"],
   ["accurate full-body proportions", "准确全身比例"],
   ["neutral calm expression for reusable character reference", "中性平静表情，便于复用角色参考"],
+  ["exaggerated beauty styling or face-swap look", "夸张美型或换脸感"],
+  ["natural skin texture", "自然皮肤纹理"],
+  ["no comic style", "不要漫画风"],
+  ["anime style", "二次元"],
+  ["illustration style", "插画风"],
+  ["red cotton-padded jacket", "红色棉袄"],
+  ["short hair", "短发"],
+  ["long hair", "长发"],
+  ["updo hairstyle", "盘发"],
+  ["braided hair", "辫子"],
   ["practical post-apocalyptic hairstyle with realistic dust or fatigue when fitting the role", "实用末世发型，可按角色状态加入真实灰尘或疲惫感"],
   ["simple 1980s China everyday hairstyle", "1980年代中国日常简洁发型"],
   ["realistic everyday hairstyle consistent across all views", "现实日常发型，各视图保持一致"],
@@ -1455,9 +1460,15 @@ const EN_VISUAL_PROMPT_TERMS: Array<[string, string]> = [
   ["right back view full body", "右侧背面全身"],
   ["eye-level camera", "平视镜头"],
   ["consistent face", "脸部一致"],
+  ["bottom clothing", "下装"],
   ["hairstyle", "发型"],
   ["clothing", "服装"],
   ["skin tone", "肤色"],
+  ["outerwear", "外套"],
+  ["accessories", "配饰"],
+  ["bottom", "下装"],
+  ["shoes", "鞋"],
+  ["top", "上衣"],
   ["body shape across all views", "各视图身形一致"],
   ["stable prop shape, material, color, scale, and surface texture", "稳定的物品形状、材质、颜色、比例和表面质感"],
   ["base reusable prop state", "基础可复用物品状态"],
@@ -1542,7 +1553,7 @@ function toChinesePromptValue(value: unknown) {
 
   for (const [source, target] of EN_VISUAL_PROMPT_TERMS.slice().sort((a, b) => b[0].length - a[0].length)) {
     const isShortToken = source.length <= 4 && !/\s/.test(source);
-    const pattern = new RegExp(isShortToken ? `^${escapeRegExp(source)}$` : escapeRegExp(source), "gi");
+    const pattern = new RegExp(isShortToken ? `\\b${escapeRegExp(source)}\\b` : escapeRegExp(source), "gi");
     text = text.replace(pattern, target);
   }
 
@@ -1555,7 +1566,17 @@ function toChinesePromptValue(value: unknown) {
     .replace(/([，；。：])\s+/g, "$1")
     .replace(/\s+([，；。：])/g, "$1")
     .trim();
-  return normalized.replace(/[，；。：,.]/g, "").trim() ? normalized : "";
+  const cleaned = cleanupChineseList(normalized);
+  return cleaned.replace(/[，；。：,.]/g, "").trim() ? cleaned : "";
+}
+
+function cleanupChineseList(value: string) {
+  return clean(value)
+    .replace(/，{2,}/g, "，")
+    .replace(/；{2,}/g, "；")
+    .replace(/。{2,}/g, "。")
+    .replace(/^[，；。：\s]+|[，；：\s]+$/g, "")
+    .trim();
 }
 
 function escapeRegExp(value: string) {
@@ -1592,37 +1613,6 @@ function collectSlots(ir: AssetCompilerIR) {
 
 function slotValue(slotItem?: CompiledVisualSlot) {
   return toEnglishPromptValue(slotItem?.value);
-}
-
-function slotDisplayValue(slotItem?: CompiledVisualSlot) {
-  return toChinesePromptValue(slotItem?.value);
-}
-
-function joinDisplayValues(values: Array<CompiledVisualSlot | undefined>) {
-  return joinDisplayText(values.map((item) => item?.value));
-}
-
-function joinDisplayText(values: unknown[]) {
-  return uniq(values.map((item) => toChinesePromptValue(item)).filter(Boolean)).join("，");
-}
-
-function displayLines(lines: string[]) {
-  return lines.map((line) => clean(line)).filter(Boolean).join("\n");
-}
-
-function displaySection(label: string, values: Array<CompiledVisualSlot | undefined>) {
-  const body = joinDisplayValues(values);
-  return body ? `${label}：${finishZhSentence(body)}` : "";
-}
-
-function displayTextSection(label: string, values: unknown[]) {
-  const body = joinDisplayText(values);
-  return body ? `${label}：${finishZhSentence(body)}` : "";
-}
-
-function finishZhSentence(value: string) {
-  const text = clean(value).replace(/[，,；;.。]+$/g, "").trim();
-  return text ? `${text}。` : "";
 }
 
 function joinValues(values: Array<CompiledVisualSlot | undefined>) {
