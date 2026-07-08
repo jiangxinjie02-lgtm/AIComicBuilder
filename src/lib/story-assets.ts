@@ -612,11 +612,12 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
 
   const styleSpec = normalizeAssetStyleSpec(type, draft);
   const visualSchema = normalizeAssetVisualSchema(draft);
+  const rebuildDisplayPrompt = shouldRebuildAssetDisplayPrompt(draft.prompt);
+  const reusablePromptSource = rebuildDisplayPrompt ? "" : draft.prompt;
   const description = cleanText(draft.description || draft.visualHint || draft.visualConstraints || defaultAssetDescription(type, name));
-  const visualConstraints = cleanText(draft.visualConstraints || draft.visualHint || draft.prompt || description);
+  const visualConstraints = cleanText(draft.visualConstraints || draft.visualHint || reusablePromptSource || description);
   const negativePrompt = cleanText(draft.negativePrompt || defaultAssetNegativeConstraints(type));
-  const displayPrompt = cleanText(shouldRebuildAssetDisplayPrompt(draft.prompt) ? "" : draft.prompt)
-    || cleanText(draft.visualConstraints || draft.visualHint || description);
+  const sourcePrompt = cleanText(reusablePromptSource);
   const faceTemplate = asRecord(draft.faceTemplate);
   const built = buildAssetImagePrompt({
     asset: {
@@ -625,7 +626,7 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
       name,
       role: draft.role || draft.roleKey || draft.scope || draft.category || "",
       category: draft.category || type,
-      prompt: displayPrompt,
+      prompt: sourcePrompt,
       description,
       visualHint: draft.visualHint || "",
       visualConstraints,
@@ -643,6 +644,7 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
     visualSpec: defaultAssetVisualSpec(assetPromptType(type), "1536x1024"),
     styleSpec,
   });
+  const displayPrompt = sourcePrompt || cleanText(built.compiled_display_prompt) || cleanText(draft.visualConstraints || draft.visualHint || description);
   const previousPromptMetadata = asRecord(draft.promptMetadata);
   const checklist = standardChecklist(type, {
     ...draft,
@@ -670,6 +672,7 @@ function standardizeImportAssetDraft(type: StoryAssetType, draft: ImportAssetDra
       compilerIR: built.compiler_ir,
       compiledFinalPrompt: built.compiled_final_prompt,
       compiledNegativePrompt: built.compiled_negative_prompt,
+      compiledDisplayPrompt: built.compiled_display_prompt,
       validationReport: built.validation_report,
       checklist,
     },

@@ -81,6 +81,7 @@ interface ProviderPayload {
     compilerInput?: unknown;
     compilerIR?: unknown;
     compiledFinalPrompt?: string;
+    compiledDisplayPrompt?: string;
     validation?: unknown;
     negativePrompt?: string;
     sourcePrompt?: string;
@@ -230,6 +231,7 @@ export async function POST(
       sourcePrompt: authoritativePrompt,
       providerPrompt,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
       validation: builtPrompt.validation_report,
       negativePrompt: builtPrompt.compiled_negative_prompt,
     },
@@ -257,6 +259,7 @@ export async function POST(
       sourcePrompt: authoritativePrompt,
       providerPrompt,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
       validation: builtPrompt.validation_report,
       negativePrompt: builtPrompt.compiled_negative_prompt,
       updatedAt: new Date().toISOString(),
@@ -304,6 +307,7 @@ export async function POST(
         sourcePrompt: authoritativePrompt,
         providerPrompt,
         compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+        compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
         validation: builtPrompt.validation_report,
         negativePrompt: builtPrompt.compiled_negative_prompt,
         updatedAt: new Date().toISOString(),

@@ -1414,7 +1414,8 @@ function makeCharacterAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = buildCharacterImagePrompt(seed.name, seed.role, profile, background, visualConstraints, faceTemplate, settings.visualStyleGuide);
+  const prompt = builtPrompt.compiled_display_prompt
+    || buildCharacterImagePrompt(seed.name, seed.role, profile, background, visualConstraints, faceTemplate, settings.visualStyleGuide);
 
   return {
     id: `char_${index + 1}_${slugify(seed.name)}`,
@@ -1443,6 +1444,7 @@ function makeCharacterAsset(
       compilerIR: builtPrompt.compiler_ir,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       compiledNegativePrompt: builtPrompt.compiled_negative_prompt,
+      compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
       validation: builtPrompt.validation_report,
     },
     variants: mergeAssetVariants(
@@ -1483,7 +1485,8 @@ function makePropAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = buildPropImagePrompt(seed.name, seed.type, description, settings.visualStyleGuide);
+  const prompt = builtPrompt.compiled_display_prompt
+    || buildPropImagePrompt(seed.name, seed.type, description, settings.visualStyleGuide);
   const explicitVariants = variantHintsToPropVariants(seed.name, seed.type, seed.variantHints || [], prompt);
 
   return {
@@ -1510,6 +1513,7 @@ function makePropAsset(
       compilerIR: builtPrompt.compiler_ir,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       compiledNegativePrompt: builtPrompt.compiled_negative_prompt,
+      compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
       validation: builtPrompt.validation_report,
     },
     variants: explicitVariants.length ? explicitVariants : suggestPropVariants(seed.name, seed.type, sourceSnippets, prompt),
@@ -1549,7 +1553,8 @@ function makeSceneAsset(
       genre: settings.genreConstraint,
     },
   });
-  const prompt = buildSceneImagePrompt(seed.name, seed.type, description, times, settings.visualStyleGuide);
+  const prompt = builtPrompt.compiled_display_prompt
+    || buildSceneImagePrompt(seed.name, seed.type, description, times, settings.visualStyleGuide);
 
   return {
     id: `scene_${index + 1}_${slugify(seed.name)}`,
@@ -1575,6 +1580,7 @@ function makeSceneAsset(
       compilerIR: builtPrompt.compiler_ir,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
       compiledNegativePrompt: builtPrompt.compiled_negative_prompt,
+      compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
       validation: builtPrompt.validation_report,
     },
     variants: mergeAssetVariants(

@@ -192,11 +192,11 @@ function normalizeImportedEnvironments(environments: ExtractedAsset[], projectSt
 }
 
 function normalizeImportedItem(item: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
+  const compiledPrompt = compileImportAssetPrompt("prop", item, projectStyleGuide);
   const displayPrompt = resolveDisplayAssetPrompt(
     item.prompt,
-    buildItemPromptTemplate(item, projectStyleGuide),
+    compiledPrompt.displayPrompt || buildItemPromptTemplate(item, projectStyleGuide),
   );
-  const compiledPrompt = compileImportAssetPrompt("prop", { ...item, prompt: displayPrompt }, projectStyleGuide);
   return {
     ...item,
     prompt: displayPrompt,
@@ -206,11 +206,11 @@ function normalizeImportedItem(item: ExtractedAsset, projectStyleGuide = ""): Ex
 }
 
 function normalizeImportedEnvironment(environment: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
+  const compiledPrompt = compileImportAssetPrompt("scene", environment, projectStyleGuide);
   const displayPrompt = resolveDisplayAssetPrompt(
     environment.prompt,
-    buildEnvironmentPromptTemplate(environment, projectStyleGuide),
+    compiledPrompt.displayPrompt || buildEnvironmentPromptTemplate(environment, projectStyleGuide),
   );
-  const compiledPrompt = compileImportAssetPrompt("scene", { ...environment, prompt: displayPrompt }, projectStyleGuide);
   return {
     ...environment,
     prompt: displayPrompt,
@@ -228,14 +228,14 @@ function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleG
     ? character.variants
     : buildExpectedCharacterVariants(character, faceTemplate, profile);
   const visualConstraints = ensureCharacterVisualConstraints(character, faceTemplate, roleKey);
-  const displayPrompt = resolveDisplayAssetPrompt(
-    character.prompt,
-    buildCharacterPromptTemplate({ ...character, roleKey, faceTemplate }, profile, background, visualConstraints, projectStyleGuide),
-  );
   const compiledPrompt = compileImportAssetPrompt(
     "character",
-    { ...character, description: profile, background, visualConstraints, roleKey, faceTemplate, prompt: displayPrompt },
+    { ...character, description: profile, background, visualConstraints, roleKey, faceTemplate },
     projectStyleGuide,
+  );
+  const displayPrompt = resolveDisplayAssetPrompt(
+    character.prompt,
+    compiledPrompt.displayPrompt || buildCharacterPromptTemplate({ ...character, roleKey, faceTemplate }, profile, background, visualConstraints, projectStyleGuide),
   );
 
   return {
@@ -258,7 +258,7 @@ function compileImportAssetPrompt(
   projectStyleGuide = "",
 ) {
   const existingPrompt = String(asset.prompt || "").trim();
-  const sourcePrompt = isCompiledEnglishAssetPrompt(existingPrompt) || isLegacyAssetPrompt(existingPrompt)
+  const sourcePrompt = isCompiledEnglishAssetPrompt(existingPrompt) || isLegacyAssetPrompt(existingPrompt) || shouldRebuildAssetDisplayPrompt(existingPrompt)
     ? ""
     : existingPrompt;
 
@@ -297,6 +297,8 @@ function compileImportAssetPrompt(
     validationReport: built.validation_report,
     compiledFinalPrompt: built.compiled_final_prompt,
     compiledNegativePrompt: built.compiled_negative_prompt,
+    compiledDisplayPrompt: built.compiled_display_prompt,
+    displayPrompt: built.compiled_display_prompt,
   };
 }
 
@@ -319,6 +321,7 @@ function mergePromptMetadata(
     compilerIR: compiled.compilerIR,
     compiledFinalPrompt: compiled.compiledFinalPrompt,
     compiledNegativePrompt: compiled.compiledNegativePrompt,
+    compiledDisplayPrompt: compiled.compiledDisplayPrompt,
     validationReport: compiled.validationReport,
   };
 }

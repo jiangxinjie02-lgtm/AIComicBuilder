@@ -231,6 +231,17 @@ assert.match(compiled.compiled_final_prompt, /1990s China/i);
 assert.match(compiled.compiled_final_prompt, /red cotton-padded jacket/i);
 assert.match(compiled.compiled_final_prompt, /short hair/i);
 assert.doesNotMatch(compiled.compiled_final_prompt, /【整体美学】|【角色档案】|上衣：|发型：/);
+assert.match(compiled.compiled_display_prompt, /测试女主资产参考设定图/);
+assert.match(compiled.compiled_display_prompt, /外貌：/);
+assert.match(compiled.compiled_display_prompt, /服装：/);
+assert.match(compiled.compiled_display_prompt, /构图：/);
+assert.match(compiled.compiled_display_prompt, /风格：/);
+assert.match(compiled.compiled_display_prompt, /必须满足：/);
+assert.match(compiled.compiled_display_prompt, /排除项：/);
+assert.match(compiled.compiled_display_prompt, /1990年代中国/);
+assert.match(compiled.compiled_display_prompt, /红色棉袄/);
+assert.match(compiled.compiled_display_prompt, /短发/);
+assert.doesNotMatch(compiled.compiled_display_prompt, /【角色档案】|陆少|剧本中的|剧情档案/);
 
 const providerPrompt = buildCompiledAssetProviderPrompt({
   sourcePrompt: displayPrompt,
@@ -247,6 +258,7 @@ const pollutedDisplayPrompt = "【角色档案】\n测试女主是剧本中的�
 assert.equal(shouldRebuildAssetDisplayPrompt(pollutedDisplayPrompt), true, "dialogue-polluted display prompt should be rebuilt");
 const partialConstraintPrompt = "女主角真人模板；主图与全部变体必须严格保持模板的脸型、五官、眉眼鼻唇比例、骨相和面部辨识度一致；只允许改变发型、服装、妆造强弱和剧情状态，禁止漫画风、二次元和插画感。";
 assert.equal(shouldRebuildAssetDisplayPrompt(partialConstraintPrompt), true, "constraint-only display prompt should be rebuilt");
-assert.equal(shouldRebuildAssetDisplayPrompt(displayPrompt), false, "clean Chinese display prompt should be preserved");
+assert.equal(shouldRebuildAssetDisplayPrompt(displayPrompt), true, "legacy section display prompt should be rebuilt");
+assert.equal(shouldRebuildAssetDisplayPrompt(compiled.compiled_display_prompt), false, "compiled Chinese asset display prompt should be preserved");
 
 console.log("Asset agent generalization checks passed.");

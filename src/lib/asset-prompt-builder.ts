@@ -147,10 +147,12 @@ export interface BuiltAssetPrompt {
   compiler_ir: AssetCompilerIR;
   compiled_final_prompt: string;
   compiled_negative_prompt: string;
+  compiled_display_prompt: string;
   validation_report: ValidationReport;
   // Compatibility aliases for older callers. New code should use the four fields above.
   structured_prompt: AssetCompilerIR;
   prompt: string;
+  display_prompt: string;
   negative_prompt: string;
 }
 
@@ -247,15 +249,18 @@ export function buildAssetImagePrompt(input: {
   const validationReport = validateCompilerIR(compilerIR);
   const compiledFinalPrompt = compileFinalPrompt(compilerIR);
   const compiledNegativePrompt = compileNegativePrompt(compilerIR);
+  const compiledDisplayPrompt = compileDisplayPrompt(compilerIR);
 
   return {
     compiler_input: compilerInput,
     compiler_ir: compilerIR,
     compiled_final_prompt: compiledFinalPrompt,
     compiled_negative_prompt: compiledNegativePrompt,
+    compiled_display_prompt: compiledDisplayPrompt,
     validation_report: validationReport,
     structured_prompt: compilerIR,
     prompt: compiledFinalPrompt,
+    display_prompt: compiledDisplayPrompt,
     negative_prompt: compiledNegativePrompt,
   };
 }
@@ -361,6 +366,8 @@ export function shouldRebuildAssetDisplayPrompt(prompt: unknown) {
   if (/Asset reference sheet|Reusable prop asset reference|Reusable empty scene environment reference|STRUCTURED ENGLISH IMAGE PROMPT/i.test(text)) {
     return true;
   }
+  if (looksLikeLegacyDisplayPrompt(text)) return true;
+  if (looksLikeCompiledChineseDisplayPrompt(text)) return hasUntranslatedCompilerResidue(text);
   if (looksLikeConstraintOnlyPrompt(text)) return true;
   const profileText = extractDisplayPromptSection(text, ["角色档案", "物品档案", "环境档案"]) || text;
   return looksLikeDialogueOrActionLeak(profileText);
@@ -409,6 +416,21 @@ function looksLikeConstraintOnlyPrompt(text: string) {
   const hasTemplateOrIdentityRules = /(模板|主图与全部变体|同一角色身份|脸型|五官|眉眼鼻唇|骨相|面部辨识度|性别识别|不改变年龄|只允许改变发型|禁止漫画风|换脸感)/.test(value);
   const hasReusableAssetContext = /(整体美学|画面规格|角色档案|物品档案|环境档案|空间类型|物品参考图|环境概念图|角色设定图|时代约束|资产设定|主图用于后续分镜复用)/.test(value);
   return hasTemplateOrIdentityRules && !hasReusableAssetContext;
+}
+
+function looksLikeLegacyDisplayPrompt(text: string) {
+  return /【(?:整体美学|画面规格|角色档案|物品档案|环境档案|职业与画风锚点|模板锁定|排除项)】/.test(clean(text));
+}
+
+function looksLikeCompiledChineseDisplayPrompt(text: string) {
+  const value = clean(text);
+  const hasAssetHeader = /(资产参考设定图|可复用物品资产参考图|可复用空场景环境参考图)/.test(value);
+  const hasCompiledSections = /(外貌|服装|物品设计|环境设计|构图|风格|必须满足|排除项)：/.test(value);
+  return hasAssetHeader && hasCompiledSections;
+}
+
+function hasUntranslatedCompilerResidue(text: string) {
+  return /\b(stable character identity|story scene background|unrelated environment props|cropped head|cropped feet|dramatic action pose)\b/i.test(text);
 }
 
 function looksLikeSpeakerDialogueLine(line: string) {
@@ -897,6 +919,72 @@ function compileNegativePrompt(ir: AssetCompilerIR) {
   return renderNegativePrompt(ir.constraints.visual_must_not_have);
 }
 
+function compileDisplayPrompt(ir: AssetCompilerIR) {
+  if (ir.asset_type === "character") return compileCharacterDisplayPrompt(ir);
+  if (ir.asset_type === "prop") return compilePropDisplayPrompt(ir);
+  return compileSceneDisplayPrompt(ir);
+}
+
+function compileCharacterDisplayPrompt(ir: AssetCompilerIR) {
+  return displayLines([
+    joinDisplayValues([ir.identity.subject, ir.identity.age_range, ir.identity.role_identity]),
+    finishZhSentence(`${slotDisplayValue(ir.identity.name) || "角色"}资产参考设定图，${joinDisplayText([ir.constraints.genre, ir.constraints.era])}`),
+    displaySection("外貌", [
+      ir.appearance.face_shape,
+      ir.appearance.skin_tone,
+      ir.appearance.body_proportion,
+      ir.appearance.hairstyle,
+      ir.appearance.expression,
+    ]),
+    displaySection("服装", [
+      ir.clothing.top,
+      ir.clothing.bottom,
+      ir.clothing.shoes,
+      ir.clothing.outerwear,
+      ir.clothing.accessories,
+    ]),
+    displaySection("构图", [
+      ir.pose_layout.background,
+      ir.pose_layout.layout,
+      ir.pose_layout.camera,
+      ir.pose_layout.framing,
+      ir.pose_layout.consistency,
+    ]),
+    displaySection("风格", [
+      ir.style.visual_style,
+      ir.style.lighting,
+      ir.style.camera,
+      ir.style.texture,
+      ir.style.aspect_ratio,
+      ir.style.size,
+    ]),
+    displayTextSection("必须满足", ir.constraints.must_have),
+    displayTextSection("排除项", ir.constraints.visual_must_not_have),
+  ]);
+}
+
+function compilePropDisplayPrompt(ir: AssetCompilerIR) {
+  return displayLines([
+    finishZhSentence(`${slotDisplayValue(ir.identity.name) || "物品"}可复用物品资产参考图，${joinDisplayText([ir.identity.category?.value, ir.constraints.genre, ir.constraints.era])}`),
+    displaySection("物品设计", [ir.prop.shape_material, ir.prop.condition]),
+    displaySection("构图", [ir.pose_layout.background, ir.pose_layout.layout, ir.pose_layout.camera, ir.pose_layout.framing]),
+    displaySection("风格", [ir.style.visual_style, ir.style.lighting, ir.style.texture, ir.style.aspect_ratio, ir.style.size]),
+    displayTextSection("必须满足", ir.constraints.must_have),
+    displayTextSection("排除项", ir.constraints.visual_must_not_have),
+  ]);
+}
+
+function compileSceneDisplayPrompt(ir: AssetCompilerIR) {
+  return displayLines([
+    finishZhSentence(`${slotDisplayValue(ir.identity.name) || "场景"}可复用空场景环境参考图，${joinDisplayText([ir.identity.category?.value, ir.constraints.genre, ir.constraints.era])}`),
+    displaySection("环境设计", [ir.scene.environment_design]),
+    displaySection("构图", [ir.pose_layout.background, ir.pose_layout.layout, ir.pose_layout.camera, ir.pose_layout.framing]),
+    displaySection("风格", [ir.style.visual_style, ir.style.lighting, ir.style.texture, ir.style.aspect_ratio, ir.style.size]),
+    displayTextSection("必须满足", ir.constraints.must_have),
+    displayTextSection("排除项", ir.constraints.visual_must_not_have),
+  ]);
+}
+
 function bindingsFor(assetType: AssetPromptType, asset: AssetPromptAsset, variant: AssetPromptVariant | null) {
   const assetId = clean(asset.id) || "unbound_asset";
   const variantId = clean(variant?.id) || "base_variant";
@@ -1277,6 +1365,199 @@ function toEnglishPromptValue(value: unknown) {
     .trim();
 }
 
+const EN_VISUAL_PROMPT_TERMS: Array<[string, string]> = [
+  ["realistic Chinese short-drama asset reference", "现实主义中国短剧资产参考"],
+  ["contemporary realistic China", "当代现实中国"],
+  ["realistic modern/civilian China unless asset schema explicitly states otherwise", "现实主义现代/平民中国，除非资产结构明确指定其他时代"],
+  ["post-apocalyptic wasteland China", "中国末世废土"],
+  ["Republican-era China", "民国时期中国"],
+  ["historical China", "古代中国"],
+  ["1980s China", "1980年代中国"],
+  ["1970s China", "1970年代中国"],
+  ["1990s China", "1990年代中国"],
+  ["Chinese young woman", "中国年轻女性"],
+  ["Chinese young man", "中国年轻男性"],
+  ["Chinese middle-aged woman", "中国中年女性"],
+  ["Chinese middle-aged man", "中国中年男性"],
+  ["Chinese elderly woman", "中国老年女性"],
+  ["Chinese elderly man", "中国老年男性"],
+  ["Chinese woman", "中国女性"],
+  ["Chinese man", "中国男性"],
+  ["Chinese person", "中国人物"],
+  ["female lead live-action face template", "女主角真人模板"],
+  ["male lead live-action face template", "男主角真人模板"],
+  ["female supporting live-action face template", "女配角真人模板"],
+  ["male supporting live-action face template", "男配角真人模板"],
+  ["female supporting character", "女性配角"],
+  ["male supporting character", "男性配角"],
+  ["female lead", "女主角"],
+  ["male lead", "男主角"],
+  ["antagonist character", "反派角色"],
+  ["unnamed supporting character", "无名配角"],
+  ["young adult", "青年"],
+  ["middle-aged", "中年"],
+  ["elderly", "老年"],
+  ["female", "女性"],
+  ["male", "男性"],
+  ["base character sheet", "基础角色设定图"],
+  ["base prop", "基础物品"],
+  ["base scene reference", "基础场景参考"],
+  ["consistent face shape and facial features", "脸型和五官保持一致"],
+  ["natural Chinese skin tone", "自然中国肤色"],
+  ["accurate full-body proportions", "准确全身比例"],
+  ["neutral calm expression for reusable character reference", "中性平静表情，便于复用角色参考"],
+  ["practical post-apocalyptic hairstyle with realistic dust or fatigue when fitting the role", "实用末世发型，可按角色状态加入真实灰尘或疲惫感"],
+  ["simple 1980s China everyday hairstyle", "1980年代中国日常简洁发型"],
+  ["realistic everyday hairstyle consistent across all views", "现实日常发型，各视图保持一致"],
+  ["post-apocalyptic survival workwear or tactical jacket, weathered fabric, practical layered clothing", "末世生存工装或战术夹克，旧化面料，实用层叠穿着"],
+  ["post-apocalyptic cargo pants or durable work trousers with utility details", "末世工装裤或耐磨工作裤，带实用细节"],
+  ["worn tactical boots or heavy-duty survival boots", "旧化战术靴或重型生存靴"],
+  ["dusty survival jacket, tactical vest, or reinforced workwear outer layer if needed", "如需外套，使用带灰尘的生存夹克、战术背心或加固工装外层"],
+  ["survival utility belt, medical pouch, radio, gloves, or practical faction accessories only when fitting the role", "仅在符合角色时加入生存工具腰带、医疗包、对讲机、手套或阵营实用配饰"],
+  ["1980s China plain civilian blouse or shirt, simple modern cut, cotton fabric", "1980年代中国素色日常上衣或衬衫，简洁现代剪裁，棉质面料"],
+  ["1980s China simple trousers or modest knee-length skirt, civilian everyday styling", "1980年代中国简洁长裤或朴素及膝裙，平民日常造型"],
+  ["1980s China plain cloth shoes or low leather shoes", "1980年代中国素色布鞋或低帮皮鞋"],
+  ["simple 1980s civilian jacket if outerwear is needed", "如需外套，使用简洁1980年代平民夹克"],
+  ["simple 1980s civilian accessories only when explicitly defined", "仅在明确设定时加入简洁1980年代平民配饰"],
+  ["1970s China plain civilian shirt or work jacket, simple modern cut", "1970年代中国素色平民衬衫或工作夹克，简洁现代剪裁"],
+  ["1970s China straight trousers or plain skirt", "1970年代中国直筒长裤或素色裙装"],
+  ["plain cloth shoes", "素色布鞋"],
+  ["simple work jacket only if outerwear is needed", "如需外套，仅使用简洁工作夹克"],
+  ["simple 1970s civilian accessories only when explicitly defined", "仅在明确设定时加入简洁1970年代平民配饰"],
+  ["1990s China plain civilian blouse, shirt, or simple jacket", "1990年代中国素色日常上衣、衬衫或简洁夹克"],
+  ["1990s China simple trousers or skirt", "1990年代中国简洁长裤或裙装"],
+  ["plain low shoes", "素色低帮鞋"],
+  ["simple 1990s jacket only if outerwear is needed", "如需外套，仅使用简洁1990年代夹克"],
+  ["simple 1990s civilian accessories only when explicitly defined", "仅在明确设定时加入简洁1990年代平民配饰"],
+  ["plain realistic civilian top, modern cut", "现实平民素色上衣，现代剪裁"],
+  ["plain realistic civilian trousers or skirt", "现实平民素色长裤或裙装"],
+  ["plain realistic low shoes", "现实素色低帮鞋"],
+  ["simple civilian outerwear only if needed", "如需外套，仅使用简洁平民外套"],
+  ["simple realistic civilian accessories only when explicitly defined", "仅在明确设定时加入简洁现实平民配饰"],
+  ["pure white background", "纯白背景"],
+  ["left close-up portrait, right front side back full-body turnaround", "左侧近景肖像，右侧正面、侧面、背面全身三视图"],
+  ["right front side back full-body turnaround", "右侧正面、侧面、背面全身三视图"],
+  ["left close-up portrait", "左侧近景肖像"],
+  ["eye-level front-facing studio reference", "平视正面影棚参考"],
+  ["full body visible with complete head and feet inside the frame", "全身入画，头脚完整不裁切"],
+  ["same face, same hairstyle, same clothing, same skin tone, same body shape in every view", "各视图保持同一脸型、发型、服装、肤色和身形"],
+  ["realistic live-action photography", "真人实拍摄影"],
+  ["realistic product photography", "现实产品摄影"],
+  ["realistic live-action environment reference", "真人实拍环境参考"],
+  ["studio soft light", "影棚柔光"],
+  ["eye-level, 35mm film feel", "平视视角，35mm胶片质感"],
+  ["natural skin texture, fabric texture, realistic material detail", "自然皮肤纹理、织物纹理、真实材质细节"],
+  ["natural skin texture, fabric texture", "自然皮肤纹理、织物纹理"],
+  ["single character only", "仅单人角色"],
+  ["stable character identity", "稳定角色身份"],
+  ["right front view full body", "右侧正面全身"],
+  ["right side view full body", "右侧侧面全身"],
+  ["right back view full body", "右侧背面全身"],
+  ["eye-level camera", "平视镜头"],
+  ["consistent face", "脸部一致"],
+  ["hairstyle", "发型"],
+  ["clothing", "服装"],
+  ["skin tone", "肤色"],
+  ["body shape across all views", "各视图身形一致"],
+  ["stable prop shape, material, color, scale, and surface texture", "稳定的物品形状、材质、颜色、比例和表面质感"],
+  ["base reusable prop state", "基础可复用物品状态"],
+  ["single centered prop, orthographic catalog view", "单个物品居中，正交目录视图"],
+  ["eye-level product reference", "平视产品参考"],
+  ["entire prop visible inside the frame", "物品完整入画"],
+  ["single reusable prop asset", "单个可复用物品资产"],
+  ["scene environment", "场景环境"],
+  ["environment", "环境"],
+  ["prop", "物品"],
+  ["scene", "场景"],
+  ["entire object visible", "物品完整可见"],
+  ["stable empty environment layout, architecture, key furniture, lighting direction", "稳定的空场景布局、建筑结构、关键陈设和光源方向"],
+  ["environment reference, no characters", "环境参考，无角色"],
+  ["wide empty environment reference", "宽幅空场景环境参考"],
+  ["eye-level wide shot", "平视广角镜头"],
+  ["complete reusable scene layout", "完整可复用场景布局"],
+  ["empty reusable scene reference", "空场景可复用参考"],
+  ["stable layout", "稳定布局"],
+  ["clear architecture and key set dressing", "清晰建筑结构和关键陈设"],
+  ["text", "文字"],
+  ["logo", "Logo"],
+  ["watermark", "水印"],
+  ["subtitle", "字幕"],
+  ["caption", "字幕"],
+  ["extra limbs", "多余肢体"],
+  ["extra fingers", "多余手指"],
+  ["distorted anatomy", "人体结构畸变"],
+  ["low resolution", "低清晰度"],
+  ["hanfu", "汉服"],
+  ["ancient costume", "古装"],
+  ["traditional Chinese robe", "传统中式长袍"],
+  ["period drama costume", "古装剧服饰"],
+  ["fantasy clothing", "奇幻服装"],
+  ["wuxia costume", "武侠服饰"],
+  ["xianxia costume", "仙侠服饰"],
+  ["flowing ceremonial dress", "飘逸礼服"],
+  ["imperial robe", "皇室长袍"],
+  ["palace costume", "宫廷服饰"],
+  ["wide-sleeved robe", "宽袖长袍"],
+  ["hair sticks", "发簪"],
+  ["ancient hairstyle", "古代发型"],
+  ["smartphone", "智能手机"],
+  ["modern LED screen", "现代LED屏"],
+  ["LED billboard", "LED广告牌"],
+  ["laptop", "笔记本电脑"],
+  ["tablet computer", "平板电脑"],
+  ["QR code", "二维码"],
+  ["contemporary logo", "当代Logo"],
+  ["modern luxury car", "现代豪车"],
+  ["futuristic technology", "未来科技"],
+  ["neon cyberpunk lighting", "霓虹赛博朋克光效"],
+  ["extra people", "多余人物"],
+  ["story scene background", "故事场景背景"],
+  ["unrelated environment props", "无关环境道具"],
+  ["cropped head", "头部裁切"],
+  ["cropped feet", "脚部裁切"],
+  ["dramatic action pose", "剧情动作姿势"],
+  ["duplicate character", "重复角色"],
+  ["inconsistent face", "脸部不一致"],
+  ["inconsistent clothing", "服装不一致"],
+  ["people", "人物"],
+  ["hands", "手"],
+  ["held object scene", "手持物品场景"],
+  ["background environment", "背景环境"],
+  ["reflected lettering", "反射文字"],
+  ["human silhouette", "人物剪影"],
+  ["character portrait", "人物肖像"],
+  ["unrelated prop close-up", "无关道具特写"],
+  ["characters", "角色"],
+  ["crowds", "人群"],
+  ["UI", "界面"],
+];
+
+function toChinesePromptValue(value: unknown) {
+  let text = clean(value);
+  if (!text) return "";
+
+  text = text
+    .replace(/\/templates\/[^\s，。；;）)]+/g, "模板图")
+    .replace(/\b(19[0-9]{2}|20[0-9]{2}) China\b/gi, "$1年中国");
+
+  for (const [source, target] of EN_VISUAL_PROMPT_TERMS.slice().sort((a, b) => b[0].length - a[0].length)) {
+    const isShortToken = source.length <= 4 && !/\s/.test(source);
+    const pattern = new RegExp(isShortToken ? `^${escapeRegExp(source)}$` : escapeRegExp(source), "gi");
+    text = text.replace(pattern, target);
+  }
+
+  const normalized = text
+    .replace(/\s*,\s*/g, "，")
+    .replace(/\s*;\s*/g, "；")
+    .replace(/\s*\.\s*/g, "。")
+    .replace(/(^|[^0-9])\s*:\s*(?![0-9])/g, "$1：")
+    .replace(/\s+/g, " ")
+    .replace(/([，；。：])\s+/g, "$1")
+    .replace(/\s+([，；。：])/g, "$1")
+    .trim();
+  return normalized.replace(/[，；。：,.]/g, "").trim() ? normalized : "";
+}
+
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1311,6 +1592,37 @@ function collectSlots(ir: AssetCompilerIR) {
 
 function slotValue(slotItem?: CompiledVisualSlot) {
   return toEnglishPromptValue(slotItem?.value);
+}
+
+function slotDisplayValue(slotItem?: CompiledVisualSlot) {
+  return toChinesePromptValue(slotItem?.value);
+}
+
+function joinDisplayValues(values: Array<CompiledVisualSlot | undefined>) {
+  return joinDisplayText(values.map((item) => item?.value));
+}
+
+function joinDisplayText(values: unknown[]) {
+  return uniq(values.map((item) => toChinesePromptValue(item)).filter(Boolean)).join("，");
+}
+
+function displayLines(lines: string[]) {
+  return lines.map((line) => clean(line)).filter(Boolean).join("\n");
+}
+
+function displaySection(label: string, values: Array<CompiledVisualSlot | undefined>) {
+  const body = joinDisplayValues(values);
+  return body ? `${label}：${finishZhSentence(body)}` : "";
+}
+
+function displayTextSection(label: string, values: unknown[]) {
+  const body = joinDisplayText(values);
+  return body ? `${label}：${finishZhSentence(body)}` : "";
+}
+
+function finishZhSentence(value: string) {
+  const text = clean(value).replace(/[，,；;.。]+$/g, "").trim();
+  return text ? `${text}。` : "";
 }
 
 function joinValues(values: Array<CompiledVisualSlot | undefined>) {
