@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { generateText } from "ai";
+import { createHash } from "node:crypto";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { createLanguageModel, extractJSON, resolveLanguageModelConfigs, supportsOpenAIJsonMode } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
@@ -15,6 +16,7 @@ import { buildChunkStructurePrompt, CHUNK_STRUCTURE_SYSTEM } from "@/lib/ai/prom
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
 import { id as genId } from "@/lib/id";
+import { structureScriptText } from "@/lib/script-structure";
 
 export const maxDuration = 900;
 
@@ -39,6 +41,40 @@ interface ChunkAssetCandidate {
   description?: string;
 }
 
+interface StructureVisualDetails {
+  location_detail?: string;
+  blocking?: string;
+  props?: string[];
+  set_dressing?: string[];
+  wardrobe_detail?: string;
+  action_detail?: string;
+  emotion?: string;
+  lighting?: string;
+  atmosphere?: string;
+}
+
+interface StructureVisualAssetCandidate {
+  name?: string;
+  type?: "character" | "scene" | "prop" | "set_dressing" | "prompt_detail" | string;
+  importance?: string;
+}
+
+interface StructureVisualPatch {
+  beat_id?: string;
+  original_text?: string;
+  enriched_text?: string;
+  added_visual_details?: StructureVisualDetails;
+  asset_candidates?: StructureVisualAssetCandidate[];
+  source_type?: string;
+  confidence?: number;
+}
+
+interface StructureVisualEnrichment {
+  patches?: StructureVisualPatch[];
+  acceptedPatches?: StructureVisualPatch[];
+  stats?: Record<string, unknown>;
+}
+
 interface ChunkStructureAnalysis {
   chunk_id: string;
   summary: string;
@@ -57,6 +93,8 @@ interface ChunkStructureAnalysis {
 
 interface StructureBody {
   scriptId?: string;
+  text?: string;
+  visualEnrichment?: StructureVisualEnrichment | null;
   modelConfig?: { text?: ProviderConfig | null };
   concurrency?: number;
   retryFallback?: boolean;
@@ -510,10 +548,113 @@ function mergeAssets(items: ChunkAssetCandidate[]) {
     .map(({ count, ...item }) => ({ ...item, frequency: count }));
 }
 
-function buildStoryAnalysis(scriptId: string, analyses: ChunkStructureAnalysis[]) {
+function compactForPrompt(value: unknown, maxLength = 180) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength).trim()}...` : text;
+}
+
+function getVisualPatches(visualEnrichment?: StructureVisualEnrichment | null) {
+  const patches = visualEnrichment?.acceptedPatches?.length
+    ? visualEnrichment.acceptedPatches
+    : visualEnrichment?.patches || [];
+  return patches.filter((patch) => String(patch.original_text || "").trim());
+}
+
+function formatVisualPatchForPrompt(patch: StructureVisualPatch) {
+  const details = patch.added_visual_details || {};
+  const detailsText = [
+    details.location_detail && `location=${compactForPrompt(details.location_detail)}`,
+    details.blocking && `blocking=${compactForPrompt(details.blocking)}`,
+    details.action_detail && `action=${compactForPrompt(details.action_detail)}`,
+    details.emotion && `emotion=${compactForPrompt(details.emotion)}`,
+    details.lighting && `lighting=${compactForPrompt(details.lighting)}`,
+    details.atmosphere && `atmosphere=${compactForPrompt(details.atmosphere)}`,
+    details.props?.length ? `props=${details.props.map((item) => compactForPrompt(item, 40)).join(", ")}` : "",
+    details.set_dressing?.length ? `set_dressing=${details.set_dressing.map((item) => compactForPrompt(item, 40)).join(", ")}` : "",
+    details.wardrobe_detail && `wardrobe=${compactForPrompt(details.wardrobe_detail)}`,
+  ].filter(Boolean).join("; ");
+  const candidates = (patch.asset_candidates || [])
+    .filter((candidate) => candidate.name && candidate.type !== "prompt_detail")
+    .map((candidate) => `${candidate.name}(${candidate.type || "asset"}:${candidate.importance || "temporary"})`)
+    .slice(0, 8)
+    .join(", ");
+  return [
+    `source: ${compactForPrompt(patch.original_text, 160)}`,
+    detailsText ? `visual: ${detailsText}` : "",
+    candidates ? `asset_candidates: ${candidates}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function buildVisualContextByChunk(
+  chunks: Array<typeof scriptChunks.$inferSelect>,
+  visualEnrichment?: StructureVisualEnrichment | null,
+) {
+  const byChunkId = new Map<string, string[]>();
+  const usedPatchIds = new Set<number>();
+  const patches = getVisualPatches(visualEnrichment);
+
+  patches.forEach((patch, patchIndex) => {
+    const original = String(patch.original_text || "").trim();
+    if (!original) return;
+    const owner = chunks.find((chunk) => chunk.text.includes(original));
+    if (!owner) return;
+    const current = byChunkId.get(owner.id) || [];
+    if (current.length >= 8) return;
+    current.push(formatVisualPatchForPrompt(patch));
+    byChunkId.set(owner.id, current);
+    usedPatchIds.add(patchIndex);
+  });
+
+  return {
+    byChunkId,
+    patchCount: patches.length,
+    usedPatchCount: usedPatchIds.size,
+  };
+}
+
+function assetsFromVisualEnrichment(visualEnrichment?: StructureVisualEnrichment | null) {
+  const assets = {
+    characters: [] as ChunkAssetCandidate[],
+    scenes: [] as ChunkAssetCandidate[],
+    props: [] as ChunkAssetCandidate[],
+  };
+
+  for (const patch of getVisualPatches(visualEnrichment)) {
+    const details = patch.added_visual_details || {};
+    const candidates = patch.asset_candidates || [];
+    for (const candidate of candidates) {
+      const name = String(candidate.name || "").trim();
+      if (!name || candidate.type === "prompt_detail") continue;
+      const description = [
+        details.location_detail,
+        details.blocking,
+        details.action_detail,
+        details.lighting,
+        details.atmosphere,
+      ].map((item) => compactForPrompt(item, 60)).filter(Boolean).join("；");
+      const item: ChunkAssetCandidate = {
+        name,
+        type: String(candidate.type || ""),
+        description: description || compactForPrompt(patch.enriched_text || patch.original_text, 80),
+      };
+      if (candidate.type === "character") assets.characters.push(item);
+      if (candidate.type === "scene") assets.scenes.push(item);
+      if (candidate.type === "prop" || candidate.type === "set_dressing") assets.props.push(item);
+    }
+  }
+
+  return assets;
+}
+
+function buildStoryAnalysis(
+  scriptId: string,
+  analyses: ChunkStructureAnalysis[],
+  visualEnrichment?: StructureVisualEnrichment | null,
+) {
   const worldFacts = analyses.flatMap((item) => item.world_facts);
   const timeline = analyses.flatMap((item) => item.timeline_events);
   const continuity = analyses.flatMap((item) => item.continuity_notes);
+  const visualAssets = assetsFromVisualEnrichment(visualEnrichment);
 
   return {
     scriptId,
@@ -528,9 +669,9 @@ function buildStoryAnalysis(scriptId: string, analyses: ChunkStructureAnalysis[]
         .join("; "),
     },
     assets: {
-      characters: mergeAssets(analyses.flatMap((item) => item.assets.characters)),
-      scenes: mergeAssets(analyses.flatMap((item) => item.assets.scenes)),
-      props: mergeAssets(analyses.flatMap((item) => item.assets.props)),
+      characters: mergeAssets([...analyses.flatMap((item) => item.assets.characters), ...visualAssets.characters]),
+      scenes: mergeAssets([...analyses.flatMap((item) => item.assets.scenes), ...visualAssets.scenes]),
+      props: mergeAssets([...analyses.flatMap((item) => item.assets.props), ...visualAssets.props]),
     },
     chunks: analyses,
     continuityNotes: continuity,
@@ -597,6 +738,89 @@ async function getTargetScript(projectId: string, scriptId?: string) {
   return latest ?? null;
 }
 
+async function syncScriptTextForStructure(
+  projectId: string,
+  script: typeof scripts.$inferSelect,
+  text?: string,
+) {
+  const incomingText = String(text || "").trim();
+  const currentText = String(script.cleanedText || script.rawText || "").trim();
+  if (!incomingText || incomingText === currentText) return script;
+
+  const structured = structureScriptText(incomingText);
+  const cleanedText = structured.cleanedText;
+  if (!cleanedText.trim()) {
+    throw new Error("Enriched script text is empty");
+  }
+
+  await db.delete(scriptChunks).where(eq(scriptChunks.scriptId, script.id));
+
+  const metadata = script.metadata && typeof script.metadata === "object"
+    ? script.metadata as Record<string, unknown>
+    : {};
+  const updatedMetadata = {
+    ...metadata,
+    ...structured.summary,
+    enrichmentApplied: true,
+    enrichmentUpdatedAt: new Date().toISOString(),
+  };
+
+  const [updatedScript] = await db
+    .update(scripts)
+    .set({
+      cleanedText,
+      contentHash: createHash("sha256").update(cleanedText).digest("hex"),
+      status: "chunked",
+      metadata: updatedMetadata,
+      updatedAt: new Date(),
+    })
+    .where(eq(scripts.id, script.id))
+    .returning();
+
+  if (structured.chunks.length > 0) {
+    await db.insert(scriptChunks).values(
+      structured.chunks.map((chunk) => ({
+        id: genId(),
+        scriptId: script.id,
+        projectId,
+        chunkIndex: chunk.chunkIndex,
+        episodeIndex: chunk.episodeIndex,
+        sceneIndex: chunk.sceneIndex,
+        text: chunk.text,
+        startIndex: chunk.startIndex,
+        endIndex: chunk.endIndex,
+        overlapBefore: chunk.overlapBefore,
+        overlapAfter: chunk.overlapAfter,
+        status: "pending" as const,
+        metadata: {
+          ...chunk.metadata,
+          localChunkId: chunk.id,
+          source: "enriched_text",
+        },
+      })),
+    );
+  }
+
+  await db
+    .update(projects)
+    .set({ script: cleanedText, updatedAt: new Date() })
+    .where(eq(projects.id, projectId));
+
+  await addImportLog(
+    projectId,
+    2,
+    "running",
+    `enriched script synced before review: ${cleanedText.length} chars, ${structured.chunks.length} chunks`,
+    {
+      scriptId: script.id,
+      charCount: cleanedText.length,
+      chunkCount: structured.chunks.length,
+    },
+  );
+
+  return updatedScript ?? { ...script, cleanedText, metadata: updatedMetadata };
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -621,10 +845,11 @@ export async function POST(
     return NextResponse.json({ error: "No text model" }, { status: 400 });
   }
 
-  const script = await getTargetScript(projectId, body.scriptId);
+  let script = await getTargetScript(projectId, body.scriptId);
   if (!script) {
     return NextResponse.json({ error: "No parsed script found" }, { status: 404 });
   }
+  script = await syncScriptTextForStructure(projectId, script, body.text);
 
   const chunks = await db
     .select()
@@ -634,6 +859,20 @@ export async function POST(
 
   if (chunks.length === 0) {
     return NextResponse.json({ error: "Script has no chunks" }, { status: 400 });
+  }
+
+  const visualContext = buildVisualContextByChunk(chunks, body.visualEnrichment);
+  if (visualContext.patchCount > 0) {
+    await addImportLog(
+      projectId,
+      2,
+      "running",
+      `隐藏视觉补充已接入审阅：${visualContext.usedPatchCount}/${visualContext.patchCount} 段匹配到原文 chunk`,
+      {
+        patchCount: visualContext.patchCount,
+        usedPatchCount: visualContext.usedPatchCount,
+      },
+    );
   }
 
   const perKeyConcurrency = positiveIntEnv("IMPORT_TEXT_PER_KEY_CONCURRENCY", 2);
@@ -746,6 +985,7 @@ export async function POST(
               episodeTitle: String(metadata.episodeTitle || ""),
               sceneTitle: String(metadata.sceneTitle || ""),
               text: chunk.text,
+              visualContext: (visualContext.byChunkId.get(chunk.id) || []).join("\n\n"),
             }),
             providerOptions: supportsOpenAIJsonMode(modelConfig)
               ? { openai: { response_format: { type: "json_object" as const } } }
@@ -773,6 +1013,7 @@ export async function POST(
             analysis,
             usage: result.usage,
             source: "ai",
+            visualEnrichmentUsed: (visualContext.byChunkId.get(chunk.id) || []).length,
           },
           updatedAt: new Date(),
         })
@@ -852,7 +1093,7 @@ export async function POST(
       });
     }
   }
-  const storyAnalysis = buildStoryAnalysis(script.id, analyses);
+  const storyAnalysis = buildStoryAnalysis(script.id, analyses, body.visualEnrichment);
   const issues = buildReviewIssues(analyses);
   const status = failedChunks.length === chunks.length ? "failed" : "parsed";
 
@@ -865,6 +1106,10 @@ export async function POST(
         storyAnalysis,
         issues,
         failedChunks,
+        visualEnrichment: {
+          patchCount: visualContext.patchCount,
+          usedPatchCount: visualContext.usedPatchCount,
+        },
       },
       updatedAt: new Date(),
     })

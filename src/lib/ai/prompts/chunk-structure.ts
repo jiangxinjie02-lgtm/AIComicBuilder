@@ -65,6 +65,7 @@ export function buildChunkStructurePrompt(input: {
   episodeTitle?: string | null;
   sceneTitle?: string | null;
   text: string;
+  visualContext?: string;
 }) {
   return `Analyze this script chunk for an industrial AI short-drama pipeline.
 
@@ -79,6 +80,13 @@ Source chunk:
 """
 ${input.text}
 """
+
+Supplemental visual context:
+"""
+${input.visualContext || "None"}
+"""
+
+Use supplemental visual context only to improve assets, scene descriptions, props, continuity, lighting, blocking, and atmosphere. Do not quote supplemental visual context as risky source text; compliance_flags.text must come from the Source chunk whenever possible.
 
 Return the required JSON object.`;
 }

@@ -8,7 +8,7 @@ import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { ApiKeyPool, splitConfiguredKeys } from "@/lib/ai/key-pool";
 import {
   buildAssetImagePrompt,
-  buildPromptAnchoredFinalPrompt,
+  buildCompiledAssetProviderPrompt,
   categoryToAssetType,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
@@ -80,6 +80,7 @@ interface EditImagePayload {
     sourcePrompt?: string;
     providerPrompt?: string;
     compiledFinalPrompt?: string;
+    compiledDisplayPrompt?: string;
     validation?: unknown;
   };
 }
@@ -181,7 +182,7 @@ export async function POST(
       ...(body.styleSpec || {}),
     },
   });
-  const anchoredPrompt = buildPromptAnchoredFinalPrompt({
+  const anchoredPrompt = buildCompiledAssetProviderPrompt({
     sourcePrompt: authoritativePrompt,
     compiledPrompt: builtPrompt.compiled_final_prompt,
     category,
@@ -227,6 +228,7 @@ export async function POST(
       sourcePrompt: authoritativePrompt,
       providerPrompt: prompt,
       compiledFinalPrompt: builtPrompt.compiled_final_prompt,
+      compiledDisplayPrompt: builtPrompt.compiled_display_prompt,
       validation: builtPrompt.validation_report,
     },
   };

@@ -362,6 +362,11 @@
     "upload": "업로드 및 분할",
     "processing": "처리 중...",
     "success": "{count}개 에피소드 생성 완료",
+    "queued": "각본이 표준화 대기열에 추가되었습니다",
+    "reviewReady": "각본 표준화가 완료되었습니다. 본문을 확인하세요",
+    "confirmed": "confirmed_script_version이 생성되었습니다",
+    "confirm": "각본 확인",
+    "confirming": "확인 중...",
     "fileTooLarge": "파일이 너무 큽니다 — 최대 20MB"
   },
   "settings": {
@@ -403,6 +408,7 @@
     "agentCategory_scriptOutline": "스토리 개요",
     "agentCategory_scriptGenerate": "스크립트 생성",
     "agentCategory_scriptParse": "대본 분석",
+    "agentCategory_scriptVisualEnrichment": "Script Visual Enrichment",
     "agentCategory_characterExtract": "캐릭터 추출",
     "agentCategory_shotSplit": "샷 분할",
     "agentCategory_keyframePrompts": "Keyframe Prompts",

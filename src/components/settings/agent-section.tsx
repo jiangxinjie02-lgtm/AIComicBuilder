@@ -28,6 +28,7 @@ const CATEGORIES = [
   { value: "script_outline", labelKey: "scriptOutline" },
   { value: "script_generate", labelKey: "scriptGenerate" },
   { value: "script_parse", labelKey: "scriptParse" },
+  { value: "script_visual_enrichment", labelKey: "scriptVisualEnrichment" },
   { value: "character_extract", labelKey: "characterExtract" },
   { value: "shot_split", labelKey: "shotSplit" },
   { value: "keyframe_prompts", labelKey: "keyframePrompts" },

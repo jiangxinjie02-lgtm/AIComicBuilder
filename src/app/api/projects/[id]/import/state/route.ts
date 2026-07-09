@@ -18,6 +18,10 @@ type ImportDraftState = {
   episodes?: unknown;
   confirmedEpisodeIndexes?: unknown;
   shotReview?: unknown;
+  enrichmentJobId?: unknown;
+  intakeJobId?: unknown;
+  confirmedScriptVersionId?: unknown;
+  assetLibraryVersionId?: unknown;
 };
 
 async function assertProject(request: Request, projectId: string) {
@@ -80,6 +84,18 @@ export async function PATCH(
       confirmedEpisodeIndexes: body.confirmedEpisodeIndexes,
     }),
     ...(body.shotReview !== undefined && { shotReview: body.shotReview }),
+    ...((typeof body.enrichmentJobId === "string" || body.enrichmentJobId === null) && {
+      enrichmentJobId: body.enrichmentJobId,
+    }),
+    ...((typeof body.intakeJobId === "string" || body.intakeJobId === null) && {
+      intakeJobId: body.intakeJobId,
+    }),
+    ...((typeof body.confirmedScriptVersionId === "string" || body.confirmedScriptVersionId === null) && {
+      confirmedScriptVersionId: body.confirmedScriptVersionId,
+    }),
+    ...((typeof body.assetLibraryVersionId === "string" || body.assetLibraryVersionId === null) && {
+      assetLibraryVersionId: body.assetLibraryVersionId,
+    }),
     updatedAt: new Date(),
   };
 

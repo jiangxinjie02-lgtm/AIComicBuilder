@@ -5,7 +5,9 @@ import { eq, and, max } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog } from "@/lib/import-utils";
-import { findCharacterIdByName, syncImportAssets } from "@/lib/story-assets";
+import { findCharacterIdByName, pruneStaleImportDraftAssets, syncImportAssets } from "@/lib/story-assets";
+import { requireConfirmedScriptVersion } from "@/lib/confirmed-script-version";
+import { lockAssetLibraryVersion, requireLockedAssetLibraryVersion } from "@/lib/industrial-pipeline";
 
 export const maxDuration = 60;
 
@@ -38,6 +40,8 @@ interface CharacterData {
   tags?: string[];
   faceTemplate?: unknown;
   promptMetadata?: unknown;
+  styleSpec?: unknown;
+  visualSchema?: unknown;
 }
 
 interface AssetData {
@@ -61,6 +65,8 @@ interface AssetData {
   tags?: string[];
   faceTemplate?: unknown;
   promptMetadata?: unknown;
+  styleSpec?: unknown;
+  visualSchema?: unknown;
 }
 
 export async function POST(
@@ -85,6 +91,8 @@ export async function POST(
     items?: AssetData[];
     environments?: AssetData[];
     voices?: AssetData[];
+    confirmedScriptVersionId?: string;
+    assetLibraryVersionId?: string;
     relationships?: Array<{
       characterA: string;
       characterB: string;
@@ -93,9 +101,23 @@ export async function POST(
     }>;
   };
 
+  let confirmedVersion: Awaited<ReturnType<typeof requireConfirmedScriptVersion>>;
+  try {
+    confirmedVersion = await requireConfirmedScriptVersion(projectId, body.confirmedScriptVersionId);
+  } catch (error) {
+    if (error instanceof Error && error.name === "ConfirmedScriptVersionRequiredError") {
+      return NextResponse.json({
+        error: "Import generation requires a confirmed_script_version",
+        code: "needs_confirmed_script_version",
+      }, { status: 409 });
+    }
+    throw error;
+  }
+
   await addImportLog(
     projectId, 5, "running",
-    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境、${body.voices?.length || 0} 个音色`
+    `开始创建 ${body.episodes.length} 集、${body.characters.length} 个角色、${body.items?.length || 0} 个物品、${body.environments?.length || 0} 个环境、${body.voices?.length || 0} 个音色`,
+    { confirmedScriptVersionId: confirmedVersion.id }
   );
 
   // 1. Create all characters (main + guest), build name→id map
@@ -150,11 +172,73 @@ export async function POST(
     },
     { characterIdByName: await findCharacterIdByName(projectId) }
   );
+  const persistedAssetIds = new Set(persistedAssetRows.map((asset) => asset.id));
+  const prunedAssetCount = await pruneStaleImportDraftAssets(projectId, persistedAssetIds);
 
   await addImportLog(
     projectId, 5, "running",
-    `已写入资产库：人物 ${body.characters.length}、道具 ${body.items?.length || 0}、场景 ${body.environments?.length || 0}`
+    `已写入资产库：人物 ${body.characters.length}、道具 ${body.items?.length || 0}、场景 ${body.environments?.length || 0}${prunedAssetCount ? `，清理旧草稿资产 ${prunedAssetCount} 个` : ""}`
   );
+
+  let assetLibraryVersion: Awaited<ReturnType<typeof lockAssetLibraryVersion>>;
+  if (body.assetLibraryVersionId) {
+    try {
+      assetLibraryVersion = await requireLockedAssetLibraryVersion(projectId, body.assetLibraryVersionId);
+      if (assetLibraryVersion.confirmedScriptVersionId !== confirmedVersion.id) {
+        throw new Error("Locked asset library does not belong to the confirmed script version");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Locked asset library is required";
+      await addImportLog(projectId, 5, "error", `资产库版本不可用：${message}`, {
+        confirmedScriptVersionId: confirmedVersion.id,
+        assetLibraryVersionId: body.assetLibraryVersionId,
+      });
+      return NextResponse.json({ error: message }, { status: 409 });
+    }
+
+    await addImportLog(
+      projectId, 5, "running",
+      `复用已锁定资产库版本：${assetLibraryVersion.id}`,
+      {
+        assetLibraryVersionId: assetLibraryVersion.id,
+        confirmedScriptVersionId: confirmedVersion.id,
+      }
+    );
+  } else {
+    try {
+      assetLibraryVersion = await lockAssetLibraryVersion({
+        projectId,
+        confirmedScriptVersionId: confirmedVersion.id,
+        assetIds: persistedAssetRows.map((asset) => asset.id),
+        reviewSummary: {
+          source: "import_generate",
+          assetCount: persistedAssetRows.length,
+          prunedAssetCount,
+          characterCount: body.characters.length,
+          itemCount: body.items?.length || 0,
+          environmentCount: body.environments?.length || 0,
+          voiceCount: body.voices?.length || 0,
+        },
+        userId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to lock asset library";
+      await addImportLog(projectId, 5, "error", `资产库锁定失败：${message}`, {
+        confirmedScriptVersionId: confirmedVersion.id,
+        assetCount: persistedAssetRows.length,
+      });
+      return NextResponse.json({ error: message }, { status: 409 });
+    }
+
+    await addImportLog(
+      projectId, 5, "running",
+      `已锁定资产库版本：${assetLibraryVersion.id}`,
+      {
+        assetLibraryVersionId: assetLibraryVersion.id,
+        confirmedScriptVersionId: confirmedVersion.id,
+      }
+    );
+  }
 
   // 2. Create episodes
   const [seqResult] = await db
@@ -210,6 +294,9 @@ export async function POST(
       environmentCount: body.environments?.length || 0,
       voiceCount: body.voices?.length || 0,
       assetCount: persistedAssetRows.length,
+      prunedAssetCount,
+      confirmedScriptVersionId: confirmedVersion.id,
+      assetLibraryVersionId: assetLibraryVersion.id,
       items: body.items || [],
       environments: body.environments || [],
       voices: body.voices || [],
@@ -228,6 +315,10 @@ export async function POST(
     environmentCount: body.environments?.length || 0,
     voiceCount: body.voices?.length || 0,
     assetCount: persistedAssetRows.length,
+    prunedAssetCount,
+    confirmedScriptVersionId: confirmedVersion.id,
+    assetLibraryVersionId: assetLibraryVersion.id,
+    assetLibraryVersion,
   }, { status: 201 });
 }
 

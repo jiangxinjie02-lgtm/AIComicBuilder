@@ -364,6 +364,11 @@
     "upload": "上传并分集",
     "processing": "解析中...",
     "success": "成功创建 {count} 集",
+    "queued": "剧本已进入标准化队列",
+    "reviewReady": "剧本标准化完成，请确认正文",
+    "confirmed": "confirmed_script_version 已生成",
+    "confirm": "确认剧本",
+    "confirming": "确认中...",
     "fileTooLarge": "文件太大，最大支持 20MB"
   },
   "settings": {
@@ -405,6 +410,7 @@
     "agentCategory_scriptOutline": "故事大纲",
     "agentCategory_scriptGenerate": "剧本生成",
     "agentCategory_scriptParse": "剧本解析",
+    "agentCategory_scriptVisualEnrichment": "剧本视觉细节补全",
     "agentCategory_characterExtract": "角色提取",
     "agentCategory_shotSplit": "分镜拆分",
     "agentCategory_keyframePrompts": "首尾帧提示词",

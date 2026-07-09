@@ -27,6 +27,8 @@ import {
   buildAssetImagePrompt,
   defaultAssetStyleSpec,
   defaultAssetVisualSpec,
+  shouldPreferCompiledDisplayPrompt,
+  shouldRebuildAssetDisplayPrompt,
   type AssetPromptType,
   type AssetStyleSpec,
   type AssetVisualSchema,
@@ -61,6 +63,7 @@ interface ExtractedCharacter {
   editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
+  promptMetadata?: Record<string, unknown>;
   visualSchema?: AssetVisualSchema | null;
   styleSpec?: AssetStyleSpec | null;
 }
@@ -68,6 +71,7 @@ interface ExtractedCharacter {
 interface AssetVariant {
   id?: string;
   name: string;
+  variantType?: string;
   description?: string;
   prompt?: string;
   imageUrl?: string;
@@ -98,12 +102,58 @@ interface ExtractedAsset {
   editInstruction?: string;
   tags?: string[];
   faceTemplate?: { label?: string; url?: string; note?: string } | null;
+  promptMetadata?: Record<string, unknown>;
   visualSchema?: AssetVisualSchema | null;
   styleSpec?: AssetStyleSpec | null;
 }
 
+interface IntakeJobStatus {
+  status: "queued" | "running" | "awaiting_review" | "confirmed" | "failed" | "cancelled";
+  progress: number;
+  current_stage: string;
+  candidate_text?: string;
+  error_message?: string;
+  confirmed_script_version_id?: string;
+  story_analysis?: StoryAssetAnalysis | null;
+  issue_summary?: {
+    total?: number;
+    high?: number;
+    medium?: number;
+    low?: number;
+  };
+  stages?: Array<{
+    stage: string;
+    sequence: number;
+    status: "pending" | "running" | "completed" | "failed" | "skipped";
+    issues?: Array<{
+      stage?: string;
+      severity?: "high" | "medium" | "low";
+      category?: string;
+      message?: string;
+      text?: string;
+      suggestion?: string;
+      lineNumber?: number;
+      episodeTitle?: string;
+      sceneTitle?: string;
+      context?: string;
+    }>;
+    result?: unknown;
+    error_message?: string;
+  }>;
+}
+
+function isActiveIntakeStatus(status?: IntakeJobStatus | null) {
+  return status?.status === "queued" || status?.status === "running";
+}
+
 type AssetTab = "characters" | "items" | "environments" | "voices";
 type WorkbenchAsset = ExtractedAsset & { scope?: "main" | "guest" };
+type SyncedProjectAsset = {
+  id: string;
+  type: "character" | "prop" | "scene" | string;
+  name: string;
+  metadata?: Record<string, unknown>;
+};
 type StepStatus = Record<Step, "idle" | "running" | "done" | "error">;
 
 const CHARACTER_FACE_TEMPLATES: Record<string, NonNullable<ExtractedCharacter["faceTemplate"]>> = {
@@ -144,19 +194,29 @@ function normalizeImportedEnvironments(environments: ExtractedAsset[], projectSt
 
 function normalizeImportedItem(item: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
   const compiledPrompt = compileImportAssetPrompt("prop", item, projectStyleGuide);
+  const displayPrompt = resolveDisplayAssetPrompt(
+    item.prompt,
+    compiledPrompt.displayPrompt || buildItemPromptTemplate(item, projectStyleGuide),
+  );
   return {
     ...item,
-    prompt: compiledPrompt.prompt,
+    prompt: displayPrompt,
     negativePrompt: compiledPrompt.negativePrompt || item.negativePrompt,
+    promptMetadata: mergePromptMetadata(item.promptMetadata, compiledPrompt),
   };
 }
 
 function normalizeImportedEnvironment(environment: ExtractedAsset, projectStyleGuide = ""): ExtractedAsset {
   const compiledPrompt = compileImportAssetPrompt("scene", environment, projectStyleGuide);
+  const displayPrompt = resolveDisplayAssetPrompt(
+    environment.prompt,
+    compiledPrompt.displayPrompt || buildEnvironmentPromptTemplate(environment, projectStyleGuide),
+  );
   return {
     ...environment,
-    prompt: compiledPrompt.prompt,
+    prompt: displayPrompt,
     negativePrompt: compiledPrompt.negativePrompt || environment.negativePrompt,
+    promptMetadata: mergePromptMetadata(environment.promptMetadata, compiledPrompt),
   };
 }
 
@@ -165,12 +225,18 @@ function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleG
   const faceTemplate = CHARACTER_FACE_TEMPLATES[roleKey] || character.faceTemplate || null;
   const profile = sanitizeCharacterProfile(character);
   const background = buildCharacterBackground(character, profile);
-  const variants = buildExpectedCharacterVariants(character, faceTemplate, profile);
+  const variants = character.variants?.length
+    ? character.variants
+    : buildExpectedCharacterVariants(character, faceTemplate, profile);
   const visualConstraints = ensureCharacterVisualConstraints(character, faceTemplate, roleKey);
   const compiledPrompt = compileImportAssetPrompt(
     "character",
     { ...character, description: profile, background, visualConstraints, roleKey, faceTemplate },
     projectStyleGuide,
+  );
+  const displayPrompt = resolveDisplayAssetPrompt(
+    character.prompt,
+    compiledPrompt.displayPrompt || buildCharacterPromptTemplate({ ...character, roleKey, faceTemplate }, profile, background, visualConstraints, projectStyleGuide),
   );
 
   return {
@@ -180,8 +246,9 @@ function normalizeImportedCharacter(character: ExtractedCharacter, projectStyleG
     roleKey,
     faceTemplate,
     visualConstraints,
-    prompt: compiledPrompt.prompt,
+    prompt: displayPrompt,
     negativePrompt: compiledPrompt.negativePrompt || character.negativePrompt,
+    promptMetadata: mergePromptMetadata(character.promptMetadata, compiledPrompt),
     variants,
   };
 }
@@ -192,12 +259,9 @@ function compileImportAssetPrompt(
   projectStyleGuide = "",
 ) {
   const existingPrompt = String(asset.prompt || "").trim();
-  if (isCompiledEnglishAssetPrompt(existingPrompt)) {
-    return {
-      prompt: existingPrompt,
-      negativePrompt: asset.negativePrompt || defaultAssetNegativePrompt(assetType, asset, projectStyleGuide),
-    };
-  }
+  const sourcePrompt = isCompiledEnglishAssetPrompt(existingPrompt) || isLegacyAssetPrompt(existingPrompt) || shouldRebuildAssetDisplayPrompt(existingPrompt)
+    ? ""
+    : existingPrompt;
 
   const styleSpec = buildImportAssetStyleSpec(asset, projectStyleGuide);
   const built = buildAssetImagePrompt({
@@ -207,7 +271,7 @@ function compileImportAssetPrompt(
       name: asset.name || "asset",
       role: asset.role || asset.category || asset.scope || "",
       category: asset.category || (assetType === "character" ? "characters" : assetType === "prop" ? "items" : "environments"),
-      prompt: isLegacyAssetPrompt(existingPrompt) ? "" : existingPrompt,
+      prompt: sourcePrompt,
       description: asset.description || "",
       visualHint: asset.visualHint || "",
       visualConstraints: asset.visualConstraints || "",
@@ -229,6 +293,37 @@ function compileImportAssetPrompt(
   return {
     prompt: built.compiled_final_prompt || existingPrompt,
     negativePrompt: built.compiled_negative_prompt || asset.negativePrompt || "",
+    compilerInput: built.compiler_input,
+    compilerIR: built.compiler_ir,
+    validationReport: built.validation_report,
+    compiledFinalPrompt: built.compiled_final_prompt,
+    compiledNegativePrompt: built.compiled_negative_prompt,
+    compiledDisplayPrompt: built.compiled_display_prompt,
+    displayPrompt: built.compiled_display_prompt,
+  };
+}
+
+function resolveDisplayAssetPrompt(prompt: unknown, fallback: string) {
+  const existingPrompt = String(prompt || "").trim();
+  if (shouldPreferCompiledDisplayPrompt(existingPrompt, fallback)) return fallback;
+  return existingPrompt;
+}
+
+function mergePromptMetadata(
+  metadata: Record<string, unknown> | undefined,
+  compiled: ReturnType<typeof compileImportAssetPrompt>,
+): Record<string, unknown> {
+  return {
+    ...(metadata || {}),
+    displayPromptLanguage: "zh",
+    generationPromptLanguage: "en_structured",
+    promptBuilder: "asset_prompt_compiler_v2",
+    compilerInput: compiled.compilerInput,
+    compilerIR: compiled.compilerIR,
+    compiledFinalPrompt: compiled.compiledFinalPrompt,
+    compiledNegativePrompt: compiled.compiledNegativePrompt,
+    compiledDisplayPrompt: compiled.compiledDisplayPrompt,
+    validationReport: compiled.validationReport,
   };
 }
 
@@ -241,31 +336,24 @@ function isLegacyAssetPrompt(prompt: string) {
   return /【整体美学】|【画面规格】|【角色档案】|【职业与画风锚点】|【模板锁定】|【排除项】/.test(prompt);
 }
 
-function defaultAssetNegativePrompt(assetType: AssetPromptType, asset: WorkbenchAsset, projectStyleGuide = "") {
-  const built = buildAssetImagePrompt({
-    asset: {
-      id: asset.assetId || asset.name || "",
-      type: assetType,
-      name: asset.name || "asset",
-      role: asset.role || asset.category || asset.scope || "",
-      category: asset.category || "",
-      description: asset.description || "",
-      visualHint: asset.visualHint || "",
-      visualConstraints: asset.visualConstraints || "",
-      negativeConstraints: asset.negativePrompt || "",
-      tags: asset.tags || [],
-      faceTemplate: asset.faceTemplate || null,
-      visualSchema: asset.visualSchema || null,
-    },
-    variant: null,
-    visualSpec: defaultAssetVisualSpec(assetType, "1536x1024"),
-    styleSpec: buildImportAssetStyleSpec(asset, projectStyleGuide),
-  });
-  return built.compiled_negative_prompt || "";
-}
-
 function buildImportAssetStyleSpec(asset: WorkbenchAsset, projectStyleGuide = ""): AssetStyleSpec {
+  const incoming = asRecord(asset.styleSpec);
+  const visualSchema = asRecord(asset.visualSchema);
+  const visualConstraints = asRecord(visualSchema.constraints);
+  const promptMetadata = asRecord(asset.promptMetadata);
+  const compilerIR = asRecord(promptMetadata.compilerIR);
+  const compilerConstraints = asRecord(compilerIR.constraints);
+  const compilerInput = asRecord(promptMetadata.compilerInput);
+  const compilerStyleSpec = asRecord(compilerInput.style_spec);
   const era = detectEraConstraint([
+    readRecordString(incoming, "era"),
+    readRecordString(incoming, "eraConstraint"),
+    readRecordString(visualConstraints, "era"),
+    readRecordString(compilerConstraints, "era"),
+    readRecordString(compilerStyleSpec, "eraConstraint"),
+    readRecordString(compilerStyleSpec, "era"),
+    promptMetadata.compiledFinalPrompt,
+    promptMetadata.compiledDisplayPrompt,
     projectStyleGuide,
     asset.description,
     asset.visualHint,
@@ -276,12 +364,14 @@ function buildImportAssetStyleSpec(asset: WorkbenchAsset, projectStyleGuide = ""
   ]);
   return {
     ...defaultAssetStyleSpec(),
+    ...compilerStyleSpec,
+    ...incoming,
     ...(era ? { era, eraConstraint: era } : {}),
   };
 }
 
 function detectEraConstraint(values: unknown[]) {
-  const text = values.map((value) => String(value || "")).join(" ");
+  const text = values.map((value) => String(value || "")).filter(Boolean).join(" ");
   const explicitYear = text.match(/(19[0-9]{2}|20[0-9]{2})\s*(?:年|s)?/i);
   if (explicitYear) return `${explicitYear[1]} China`;
   if (/八十年代|八零年代|80年代|1980s|1980年代/i.test(text)) return "1980s China";
@@ -289,6 +379,13 @@ function detectEraConstraint(values: unknown[]) {
   if (/九十年代|90年代|1990s|1990年代/i.test(text)) return "1990s China";
   if (/民国|军阀|谍战|抗战/.test(text)) return "Republican-era China";
   if (/古代|古装|仙侠|武侠|宫廷|汉服/.test(text)) return "historical China";
+  return "";
+}
+
+function readRecordString(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
 }
 
@@ -394,7 +491,6 @@ function buildCharacterBackground(character: ExtractedCharacter, profile: string
   return normalizeTwoLineBackground(source, character.name || "角色");
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildCharacterProfileSummary(character: ExtractedCharacter, profile: string, background: string) {
   const name = character.name || "角色";
   const role = character.role || "角色";
@@ -422,6 +518,7 @@ function buildCharacterProfileSummary(character: ExtractedCharacter, profile: st
 function cleanPromptSentence(text: string) {
   return String(text || "")
     .replace(/^主体[:：]\s*/, "")
+    .replace(/^[\u4e00-\u9fa5A-Za-z0-9·]{1,12}(?:[（(][^）)]{1,24}[）)])?[：:]\s*/g, "")
     .replace(/人物[:：][^。！？!?]*/g, "")
     .replace(/【[\s\S]*$/g, "")
     .replace(/模板锁定[:：][\s\S]*$/g, "")
@@ -440,29 +537,56 @@ function shortenPromptLine(text: string, maxLength: number) {
   return ensureChineseSentence(compact);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildCharacterVisualAnchors(
   character: ExtractedCharacter,
   profile: string,
   background: string,
-  projectStyleGuide: string,
 ) {
-  const text = `${character.name || ""} ${character.role || ""} ${profile} ${background} ${projectStyleGuide}`;
+  const text = `${character.name || ""} ${character.role || ""} ${profile} ${background}`;
   const anchors: string[] = [];
-  if (/医疗|医生|外科|急救|护士|医疗官/.test(text)) {
-    anchors.push("医疗职业必须可视化：服装和配件体现据点医疗官或外科医生身份，可使用战术医疗背心、急救包、医用腰包、医疗臂章等，不要普通白衫牛仔裤。");
+  if (/医生|军医|护士|护工|大夫|医师|医疗官|外科|急救/.test(text)) {
+    anchors.push("医疗职业必须可视化：服装、配件和工作状态体现医生、护士或医疗人员身份；可使用白大褂、医疗胸牌、急救包、医用腰包或年代匹配的医疗用品，避免普通棚拍装。");
   }
-  if (/重卡|指挥官|车队|队长|战神|系统|救援/.test(text)) {
+  if (/重卡|指挥官|车队|队长|战神|救援/.test(text)) {
     anchors.push("指挥/车队身份必须可视化：服装体现末世重卡指挥官或救援队核心身份，可使用战术夹克、工装裤、战术靴、腰挂装备、通讯配件等，不要普通黑衬衫棚拍。");
   }
-  if (/工程师|工兵|机械|焊接|维修|工厂/.test(text)) {
+  if (/工程师|工兵|机械|焊接|维修|工厂|技工/.test(text)) {
     anchors.push("工程职业必须可视化：服装和配件体现机械工程师或工兵身份，可使用耐磨工装、工具腰带、焊接痕迹、机械油污或护具。");
   }
-  if (/反派|暴君|城主|军官|武装|势力|黑市|商会/.test(text)) {
+  if (/反派|暴君|城主|军官|武装|势力|黑市|商会|将军|首长/.test(text)) {
     anchors.push("阵营身份必须可视化：服装、配饰和气质体现所属势力、权力层级或黑市/武装背景，避免普通路人造型。");
   }
   anchors.push("整体画风必须落到服装材质、配件磨损、妆发状态、色彩气氛和资产细节；禁止与角色档案无关的普通都市棚拍装。");
   return anchors.slice(0, 3);
+}
+
+function buildCharacterPromptTemplate(
+  character: ExtractedCharacter,
+  profile: string,
+  background: string,
+  visualConstraints: string,
+  projectStyleGuide = "",
+) {
+  const name = character.name || "角色";
+  const faceTemplate = character.faceTemplate;
+  const templateLock = faceTemplate
+    ? `参考${faceTemplate.label}（${faceTemplate.url || "模板图"}），脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须与模板一致。`
+    : "同一角色身份锁定，脸型、五官比例、眉眼鼻唇关系、骨相和面部辨识度必须保持一致。";
+  return joinPromptSections([
+    ["整体美学", buildOverallAesthetic(projectStyleGuide)],
+    ["画面规格", [
+      `角色设定图，“${name}”，16:9 横版，纯白背景，平视视角。`,
+      "左 40%：3/4 面部近景；右 60%：正面、侧面、背面全身三视图。",
+      "单人完整入画，头脚不裁切；服装、发型、配饰、身材比例和肤色保持一致。",
+    ]],
+    ["角色档案", buildCharacterProfileSummary(character, profile, background)],
+    ["职业与画风锚点", buildCharacterVisualAnchors(character, profile, background)],
+    ["模板锁定", [
+      `${templateLock}只允许改变发型、服装、妆造强弱和剧情状态，不改变脸型与五官。`,
+      visualConstraints ? `身份约束：${visualConstraints}` : "",
+    ]],
+    ["排除项", "无字幕、文字、Logo、水印、UI；无其他人物；不复制身体或同脸分身；禁止漫画风、二次元、插画风。"],
+  ]);
 }
 
 function normalizeTwoLineBackground(source: string, name: string) {
@@ -498,7 +622,6 @@ function assetPromptDescription(asset: ExtractedAsset, fallback: string) {
   );
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildItemPromptTemplate(item: ExtractedAsset, projectStyleGuide = "") {
   const name = item.name || "物品";
   const type = assetTypeLabel(item, "剧情道具");
@@ -515,7 +638,6 @@ function buildItemPromptTemplate(item: ExtractedAsset, projectStyleGuide = "") {
   ]);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildEnvironmentPromptTemplate(environment: ExtractedAsset, projectStyleGuide = "") {
   const name = environment.name || "环境";
   const type = assetTypeLabel(environment, "剧情场景");
@@ -581,7 +703,9 @@ function buildExpectedCharacterVariants(
 }
 
 function sanitizeCharacterProfile(character: ExtractedCharacter) {
-  const promptProfile = extractCharacterSubject(character.prompt || "");
+  const promptProfile = shouldRebuildAssetDisplayPrompt(character.prompt)
+    ? ""
+    : extractCharacterSubject(character.prompt || "");
   const source = promptProfile || character.description || `${character.name || "角色"}是剧本中的${character.role || "角色"}`;
   const cleaned = String(source)
     .replace(/人物：[^。！？!?]*/g, "")
@@ -772,6 +896,10 @@ interface ImportDraftState {
   relationships?: Array<{ characterA: string; characterB: string; relationType: string; description?: string }> | null;
   episodes?: SplitEpisode[] | null;
   confirmedEpisodeIndexes?: number[] | null;
+  enrichmentJobId?: string | null;
+  intakeJobId?: string | null;
+  confirmedScriptVersionId?: string | null;
+  assetLibraryVersionId?: string | null;
 }
 
 interface StoryReviewIssue {
@@ -784,6 +912,58 @@ interface StoryReviewIssue {
   replacement: string;
   replaceMode?: "first" | "all";
   applied?: boolean;
+  waived?: boolean;
+  waiverNote?: string;
+  lineNumber?: number;
+  episodeTitle?: string;
+  sceneTitle?: string;
+  context?: string;
+}
+
+function categoryFromIntakeIssue(stage: string, category?: string): StoryReviewIssue["category"] {
+  const key = `${stage} ${category || ""}`.toLowerCase();
+  if (/compliance|risk|symbol|violence|crime|sexual|medical|state|law/.test(key)) return "prohibited";
+  if (/continuity/.test(key)) return "continuity";
+  if (/setting|era|world/.test(key)) return "setting";
+  if (/structure|format|logic/.test(key)) return "logic";
+  return "other";
+}
+
+function severityFromIntakeIssue(severity?: string): StoryReviewIssue["severity"] {
+  if (severity === "high" || severity === "low") return severity;
+  return "medium";
+}
+
+function intakeIssuesToStoryIssues(status: IntakeJobStatus, sourceText: string): StoryReviewIssue[] {
+  const issues = (status.stages || []).flatMap((stage) =>
+    (stage.issues || []).map((issue) => {
+      const exactQuote = String(issue.text || "").trim();
+      const suggestion = String(issue.suggestion || "").trim();
+      const hasSourceQuote = exactQuote && sourceText.includes(exactQuote);
+      return {
+        category: categoryFromIntakeIssue(stage.stage, issue.category),
+        severity: severityFromIntakeIssue(issue.severity),
+        title: `${stage.stage}: ${issue.category || "review"}`,
+        exactQuote,
+        explanation: String(issue.message || "需要人工复查"),
+        suggestion: suggestion || "请人工复查后确认是否修改。",
+        replacement: hasSourceQuote && suggestion ? suggestion : exactQuote,
+        replaceMode: "first" as const,
+        lineNumber: Number.isFinite(Number(issue.lineNumber)) ? Number(issue.lineNumber) : undefined,
+        episodeTitle: String(issue.episodeTitle || ""),
+        sceneTitle: String(issue.sceneTitle || ""),
+        context: String(issue.context || ""),
+      };
+    })
+  );
+
+  const seen = new Set<string>();
+  return issues.filter((issue) => {
+    const key = `${issue.title}:${issue.exactQuote}:${issue.explanation}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 interface StoryAssetAnalysis {
@@ -801,9 +981,282 @@ interface StoryAssetAnalysis {
   };
 }
 
-type StoryAssetSectionKey = "characters" | "scenes" | "props";
+function storyMetaOnlyAnalysis(analysis?: StoryAssetAnalysis | null): StoryAssetAnalysis | null {
+  if (!analysis?.storyMeta) return null;
+  return { storyMeta: analysis.storyMeta };
+}
+
+function storyAnalysisFromStatus(status?: IntakeJobStatus | null): StoryAssetAnalysis | null {
+  return storyMetaOnlyAnalysis(status?.story_analysis ?? null);
+}
+
+const REQUIRED_STORY_META_FIELDS: Array<[keyof NonNullable<StoryAssetAnalysis["storyMeta"]>, string]> = [
+  ["time", "时间/年代"],
+  ["background", "世界观/背景"],
+  ["visualStyleBase", "统一视觉风格"],
+  ["genre", "题材类型"],
+  ["locationBackground", "地域/空间背景"],
+];
+
+function missingStoryMetaLabels(analysis?: StoryAssetAnalysis | null) {
+  const meta = analysis?.storyMeta || {};
+  return REQUIRED_STORY_META_FIELDS
+    .filter(([field]) => !String(meta[field] || "").trim())
+    .map(([, label]) => label);
+}
+
+interface PersistedAssetVariant {
+  id?: string;
+  name?: string;
+  variantType?: string;
+  state?: string;
+  visualConstraints?: string;
+  referenceImage?: string | null;
+  metadata?: unknown;
+  changedTraits?: unknown;
+}
+
+interface PersistedStoryAsset {
+  id: string;
+  type: "character" | "scene" | "prop";
+  name: string;
+  importance?: number;
+  description?: string;
+  visualConstraints?: string;
+  negativeConstraints?: string;
+  referenceImage?: string | null;
+  confirmed?: boolean | number;
+  metadata?: unknown;
+  variants?: PersistedAssetVariant[];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return asRecord(parsed);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+interface IntakeRevisionSummary {
+  stage: string;
+  label: string;
+  beforeHash: string;
+  afterHash: string;
+  charDelta: number;
+  changedLineCount: number;
+  changedSamples: Array<{ lineNumber: number; before: string; after: string }>;
+}
+
+const INTAKE_STAGE_LABELS: Record<string, string> = {
+  script_visual_enrichment: "视觉细节补全",
+  text_compliance_review: "文本合规改写",
+};
+
+function shortHash(value: unknown) {
+  const text = String(value || "");
+  return text ? text.slice(0, 10) : "";
+}
+
+function collectIntakeRevisionSummaries(status?: IntakeJobStatus | null): IntakeRevisionSummary[] {
+  return (status?.stages || []).flatMap((stage) => {
+    const revision = asRecord(asRecord(stage.result).revision);
+    if (revision.changed !== true) return [];
+    const rawSamples = Array.isArray(revision.changedSamples)
+      ? revision.changedSamples
+      : Array.isArray(revision.samples) ? revision.samples : [];
+    return [{
+      stage: stage.stage,
+      label: INTAKE_STAGE_LABELS[stage.stage] || stage.stage,
+      beforeHash: shortHash(revision.beforeHash),
+      afterHash: shortHash(revision.afterHash),
+      charDelta: Number(revision.charDelta || 0),
+      changedLineCount: Number(revision.changedLineCount || 0),
+      changedSamples: rawSamples.map((sample) => {
+        const item = asRecord(sample);
+        return {
+          lineNumber: Number(item.lineNumber || 0),
+          before: String(item.before || ""),
+          after: String(item.after || ""),
+        };
+      }).filter((sample) => sample.before || sample.after).slice(0, 3),
+    }];
+  });
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean);
+}
+
+function persistedVariantToWorkbench(variant: PersistedAssetVariant): AssetVariant {
+  const metadata = asRecord(variant.metadata);
+  const changedTraits = asRecord(variant.changedTraits);
+  return {
+    id: String(variant.id || ""),
+    name: String(variant.name || "资产变体"),
+    variantType: String(variant.variantType || ""),
+    description: String(variant.state || variant.visualConstraints || ""),
+    prompt: String(changedTraits.prompt || variant.visualConstraints || variant.state || ""),
+    imageUrl: String(variant.referenceImage || ""),
+    history: Array.isArray(metadata.history) ? metadata.history as Array<Record<string, unknown>> : [],
+    editInstruction: String(changedTraits.editInstruction || ""),
+  };
+}
+
+function persistedAssetToWorkbench(asset: PersistedStoryAsset): WorkbenchAsset {
+  const metadata = asRecord(asset.metadata);
+  const variants = (asset.variants || [])
+    .filter((variant) => {
+      const variantType = String((variant as PersistedAssetVariant & { variantType?: string }).variantType || "");
+      return variantType !== "default" && variantType !== "base";
+    })
+    .map(persistedVariantToWorkbench);
+  const role = String(metadata.role || metadata.roleKey || "");
+  const scope = metadata.scope === "main" || /男主|女主|主角/.test(role) ? "main" as const : "guest" as const;
+  const metadataPrompt = String(metadata.prompt || asset.visualConstraints || "");
+  return {
+    name: asset.name,
+    frequency: Number(metadata.frequency ?? asset.importance ?? 1),
+    description: asset.description || "",
+    visualHint: String(metadata.visualHint || metadata.mainImageName || asset.name),
+    visualConstraints: asset.visualConstraints || "",
+    confirmed: Boolean(asset.confirmed),
+    assetId: asset.id,
+    category: String(metadata.category || asset.type),
+    role,
+    roleKey: String(metadata.roleKey || ""),
+    episodes: asStringArray(metadata.episodes),
+    prompt: shouldRebuildAssetDisplayPrompt(metadataPrompt) ? asset.visualConstraints || "" : metadataPrompt,
+    negativePrompt: asset.negativeConstraints || "",
+    variants,
+    imageUrl: asset.referenceImage || "",
+    history: Array.isArray(metadata.imageHistory) ? metadata.imageHistory as Array<Record<string, unknown>> : [],
+    mainImageName: String(metadata.mainImageName || asset.name),
+    tags: asStringArray(metadata.tags),
+    faceTemplate: metadata.faceTemplate as ExtractedCharacter["faceTemplate"],
+    promptMetadata: metadata.promptMetadata as ExtractedCharacter["promptMetadata"],
+    scope,
+  };
+}
+
+interface ScriptEnrichmentPreview {
+  patches?: ScriptEnrichmentPatch[];
+  enrichedText?: string;
+  appliedPatchCount?: number;
+  skippedPatchCount?: number;
+  stats?: {
+    total_beats?: number;
+    enriched_beats?: number;
+    needs_review?: number;
+    invalid?: number;
+  };
+  validation?: {
+    status?: "valid" | "needs_review" | "invalid";
+    warnings?: string[];
+    errors?: string[];
+    accepted_patches?: ScriptEnrichmentPatch[];
+  };
+}
+
+interface ScriptEnrichmentPatch {
+  beat_id?: string;
+  original_text?: string;
+  enriched_text?: string;
+  added_visual_details?: Record<string, unknown>;
+  asset_candidates?: Array<{ name?: string; type?: string; importance?: string }>;
+  source_type?: string;
+  confidence?: number;
+}
+
+interface ReviewPreparation {
+  text: string;
+  visualEnrichment: {
+    patches: ScriptEnrichmentPatch[];
+    stats?: ScriptEnrichmentPreview["stats"];
+    validation?: ScriptEnrichmentPreview["validation"];
+  } | null;
+}
+
+interface ScriptEnrichmentJobStatus {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  progress: number;
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  skipped_tasks: number;
+  current_episode?: string;
+  current_scene?: string;
+  error_message?: string;
+  enrichedText?: string;
+  visualEnrichment?: ReviewPreparation["visualEnrichment"];
+  recent_logs?: Array<{
+    id: string;
+    level: "info" | "warn" | "error";
+    message: string;
+    created_at: string | number;
+  }>;
+}
 
 type Step = 1 | 2 | 3 | 4 | 5;
+type StepStatusValue = "idle" | "running" | "done" | "error";
+
+const STEP_IDLE_STATUS: Record<Step, StepStatusValue> = {
+  1: "idle",
+  2: "idle",
+  3: "idle",
+  4: "idle",
+  5: "idle",
+};
+
+const SCRIPT_ENRICHMENT_POLL_MS = 2500;
+
+function sanitizePersistedStepStatus(status?: Partial<Record<Step, StepStatusValue>>) {
+  const next = { ...STEP_IDLE_STATUS };
+  if (!status) return next;
+  for (const step of [1, 2, 3, 4, 5] as Step[]) {
+    const value = status[step];
+    if (!value) continue;
+    next[step] = value === "running" ? "idle" : value;
+  }
+  return next;
+}
+
+function mergeStepStatusPreservingDone(
+  current: Record<Step, StepStatusValue>,
+  incoming: Partial<Record<Step, StepStatusValue>>,
+) {
+  const next = { ...current };
+  for (const step of [1, 2, 3, 4, 5] as Step[]) {
+    const value = incoming[step];
+    if (!value) continue;
+    next[step] = current[step] === "done" ? "done" : value;
+  }
+  return next;
+}
+
+function sanitizeDraftPayload(payload: ImportDraftState): ImportDraftState {
+  const stepStatus = sanitizePersistedStepStatus(payload.stepStatus);
+  let currentStep = payload.currentStep;
+  if (typeof currentStep === "number") {
+    if (stepStatus[1] === "done" && currentStep < 2) currentStep = 2;
+    if (stepStatus[3] === "done" && currentStep < 3) currentStep = 3;
+    if (stepStatus[4] === "done" && currentStep < 4) currentStep = 4;
+    if (stepStatus[5] === "done" && currentStep < 5) currentStep = 5;
+  }
+  return {
+    ...payload,
+    currentStep,
+    stepStatus,
+  };
+}
 
 const STEPS = [
   { num: 1 as Step, icon: FileText, label: "importStep.parse" },
@@ -843,6 +1296,22 @@ export default function ImportPage({
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const storyReviewedRef = useRef(false);
+  const enrichedTextRef = useRef("");
+  const visualEnrichmentRef = useRef<ReviewPreparation["visualEnrichment"]>(null);
+  const detailSupplementedRef = useRef(false);
+  const [detailSupplemented, setDetailSupplemented] = useState(false);
+  const enrichmentJobIdRef = useRef<string | null>(null);
+  const enrichmentStatusRef = useRef<ScriptEnrichmentJobStatus | null>(null);
+  const lastEnrichmentTerminalLogRef = useRef<string | null>(null);
+  const [enrichmentJobId, setEnrichmentJobId] = useState<string | null>(null);
+  const [enrichmentJobStatus, setEnrichmentJobStatus] = useState<ScriptEnrichmentJobStatus | null>(null);
+  const [intakeJobId, setIntakeJobId] = useState<string | null>(null);
+  const [intakeJobStatus, setIntakeJobStatus] = useState<IntakeJobStatus | null>(null);
+  const [confirmedScriptVersionId, setConfirmedScriptVersionId] = useState<string | null>(null);
+  const [assetLibraryVersionId, setAssetLibraryVersionId] = useState<string | null>(null);
+  const [assetLibraryLocking, setAssetLibraryLocking] = useState(false);
+  const intakePollingRef = useRef(false);
+  const persistedAssetsHydratedRef = useRef(false);
 
   // Step 0: Upload
   const [file, setFile] = useState<File | null>(null);
@@ -922,7 +1391,7 @@ export default function ImportPage({
 
   const buildDraftPayload = useCallback((): ImportDraftState => ({
     currentStep,
-    stepStatus,
+    stepStatus: sanitizePersistedStepStatus(stepStatus),
     fullText,
     reviewIssues,
     storyAnalysis,
@@ -933,6 +1402,10 @@ export default function ImportPage({
     relationships,
     episodes,
     confirmedEpisodeIndexes: Array.from(confirmedEpisodeIndexes),
+    enrichmentJobId,
+    intakeJobId,
+    confirmedScriptVersionId,
+    assetLibraryVersionId,
   }), [
     currentStep,
     stepStatus,
@@ -946,14 +1419,19 @@ export default function ImportPage({
     relationships,
     episodes,
     confirmedEpisodeIndexes,
+    enrichmentJobId,
+    intakeJobId,
+    confirmedScriptVersionId,
+    assetLibraryVersionId,
   ]);
 
   const saveDraft = useCallback(async (payload?: ImportDraftState) => {
     try {
+      const draftPayload = sanitizeDraftPayload(payload ?? buildDraftPayload());
       await apiFetch(`/api/projects/${projectId}/import/state`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload ?? buildDraftPayload()),
+        body: JSON.stringify(draftPayload),
       });
       hasPendingDraftSaveRef.current = false;
     } catch (err) {
@@ -964,7 +1442,7 @@ export default function ImportPage({
   const flushDraft = useCallback(() => {
     const payload = latestDraftPayloadRef.current;
     if (!payload || !hasPendingDraftSaveRef.current) return;
-    const body = JSON.stringify(payload);
+    const body = JSON.stringify(sanitizeDraftPayload(payload));
     const headers: HeadersInit = { "Content-Type": "application/json" };
     const userId = typeof window !== "undefined" ? localStorage.getItem("ai_comic_uid") : null;
     if (userId) headers["x-user-id"] = userId;
@@ -982,7 +1460,7 @@ export default function ImportPage({
 
   const resetDraftPayload = useCallback((): ImportDraftState => ({
     currentStep: 0,
-    stepStatus: { 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+    stepStatus: sanitizePersistedStepStatus(),
     fullText: "",
     reviewIssues: [],
     storyAnalysis: null,
@@ -993,7 +1471,26 @@ export default function ImportPage({
     relationships: [],
     episodes: [],
     confirmedEpisodeIndexes: [],
+    enrichmentJobId: null,
+    intakeJobId: null,
+    confirmedScriptVersionId: null,
+    assetLibraryVersionId: null,
   }), []);
+
+  const syncReviewFromIntakeStatus = useCallback((status: IntakeJobStatus, options?: { preserveExistingIssues?: boolean }) => {
+    const candidateText = status.candidate_text || "";
+    const statusStoryAnalysis = storyAnalysisFromStatus(status);
+    if (statusStoryAnalysis) setStoryAnalysis(statusStoryAnalysis);
+    if (candidateText.trim()) {
+      const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+      setFullText(candidateText);
+      setReviewIssues((prev) => options?.preserveExistingIssues && prev.length > 0 ? prev : intakeReviewIssues);
+      enrichedTextRef.current = candidateText;
+      visualEnrichmentRef.current = null;
+      return { candidateText, intakeReviewIssues, statusStoryAnalysis };
+    }
+    return { candidateText, intakeReviewIssues: [] as StoryReviewIssue[], statusStoryAnalysis };
+  }, []);
 
   if (draftHydratedRef.current) {
     latestDraftPayloadRef.current = buildDraftPayload();
@@ -1012,23 +1509,28 @@ export default function ImportPage({
         const data = await logsRes.json();
         let restoredTextForStyle = "";
         let storyAnalysisForStyle: StoryAssetAnalysis | null = null;
+        let restoredIntakeJobId: string | null = null;
+        let draftCurrentStepValue = 0;
+        let logCurrentStepValue = 0;
         if (data.length > 0) {
           setLogs(data);
           setHistoryMode(true);
           // Determine last completed step
           const doneSteps = data.filter((l: LogEntry) => l.status === "done").map((l: LogEntry) => l.step);
           const maxDone = Math.max(0, ...doneSteps) as Step | 0;
+          logCurrentStepValue = maxDone;
           setCurrentStep(maxDone);
           const parseLog = data.find((l: LogEntry) => l.step === 1 && l.status === "done" && l.metadata);
           const parseMeta = parseLog?.metadata as { text?: string } | undefined;
           const storyLog = data.find((l: LogEntry) => l.step === 2 && l.status === "done" && l.metadata);
           const storyMeta = storyLog?.metadata as { text?: string; preview?: string; storyAnalysis?: StoryAssetAnalysis | null } | undefined;
+          const logStoryAnalysis = storyMetaOnlyAnalysis(storyMeta?.storyAnalysis ?? null);
           const restoredText = storyMeta?.text || parseMeta?.text || storyMeta?.preview;
           if (restoredText) setFullText(restoredText);
-          if (storyMeta?.storyAnalysis) setStoryAnalysis(storyMeta.storyAnalysis);
+          if (logStoryAnalysis) setStoryAnalysis(logStoryAnalysis);
           restoredTextForStyle = restoredText || "";
-          storyAnalysisForStyle = storyMeta?.storyAnalysis ?? null;
-          const logProjectStyleGuide = buildProjectStyleGuide(storyMeta?.storyAnalysis ?? null, restoredText || "");
+          storyAnalysisForStyle = logStoryAnalysis;
+          const logProjectStyleGuide = buildProjectStyleGuide(logStoryAnalysis, restoredText || "");
 
           const assetLog = data.find((l: LogEntry) => l.step === 3 && l.status === "done" && l.metadata);
           const assetMeta = assetLog?.metadata as {
@@ -1056,23 +1558,42 @@ export default function ImportPage({
             const stepLogs = data.filter((l: LogEntry) => l.step === s);
             const latestStepLog = stepLogs[stepLogs.length - 1];
             if (latestStepLog) {
-              setStepStatus((prev) => ({ ...prev, [s]: latestStepLog.status }));
+              setStepStatus((prev) => ({
+                ...prev,
+                [s]: latestStepLog.status === "running" ? "idle" : latestStepLog.status,
+              }));
             }
           }
         }
 
         if (draft) {
+          const draftStepStatus = sanitizePersistedStepStatus(draft.stepStatus);
           if (typeof draft.currentStep === "number") {
-            setCurrentStep(Math.max(0, Math.min(5, draft.currentStep)) as Step | 0);
+            const draftCurrentStep = Math.max(0, Math.min(5, draft.currentStep)) as Step | 0;
+            const mergedCurrentStep = Math.max(draftCurrentStep, logCurrentStepValue) as Step | 0;
+            draftCurrentStepValue = mergedCurrentStep;
+            setCurrentStep(mergedCurrentStep as Step | 0);
+            if (mergedCurrentStep < 5 || draftStepStatus[5] !== "done") {
+              setHistoryMode(false);
+              setSelectedStep(null);
+            }
           }
           if (draft.stepStatus) {
-            setStepStatus((prev) => ({ ...prev, ...draft.stepStatus }));
+            setStepStatus((prev) => mergeStepStatusPreservingDone(prev, draftStepStatus));
           }
-          if (typeof draft.fullText === "string") setFullText(draft.fullText);
+          if (typeof draft.fullText === "string") {
+            setFullText(draft.fullText);
+            if (draftStepStatus[2] === "done") {
+              enrichedTextRef.current = draft.fullText;
+              detailSupplementedRef.current = true;
+              setDetailSupplemented(true);
+            }
+          }
           if (Array.isArray(draft.reviewIssues)) setReviewIssues(draft.reviewIssues);
-          if (draft.storyAnalysis !== undefined) setStoryAnalysis(draft.storyAnalysis ?? null);
+          const draftStoryAnalysis = storyMetaOnlyAnalysis(draft.storyAnalysis ?? null);
+          if (draft.storyAnalysis !== undefined) setStoryAnalysis(draftStoryAnalysis);
           const draftProjectStyleGuide = buildProjectStyleGuide(
-            draft.storyAnalysis ?? storyAnalysisForStyle,
+            draftStoryAnalysis ?? storyAnalysisForStyle,
             typeof draft.fullText === "string" ? draft.fullText : restoredTextForStyle,
           );
           if (Array.isArray(draft.characters)) setCharacters(normalizeImportedCharacters(draft.characters, draftProjectStyleGuide));
@@ -1087,7 +1608,37 @@ export default function ImportPage({
           if (Array.isArray(draft.confirmedEpisodeIndexes)) {
             setConfirmedEpisodeIndexes(new Set(draft.confirmedEpisodeIndexes));
           }
-          storyReviewedRef.current = draft.stepStatus?.[2] === "done";
+          if (typeof draft.intakeJobId === "string" && draft.intakeJobId) {
+            restoredIntakeJobId = draft.intakeJobId;
+            setIntakeJobId(draft.intakeJobId);
+          }
+          if (typeof draft.confirmedScriptVersionId === "string" && draft.confirmedScriptVersionId) {
+            setConfirmedScriptVersionId(draft.confirmedScriptVersionId);
+          }
+          if (typeof draft.assetLibraryVersionId === "string" && draft.assetLibraryVersionId) {
+            setAssetLibraryVersionId(draft.assetLibraryVersionId);
+          }
+          storyReviewedRef.current = draftStepStatus[2] === "done";
+        }
+
+        if (restoredIntakeJobId) {
+          const intakeRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${restoredIntakeJobId}`);
+          if (intakeRes.ok) {
+            const status = await intakeRes.json() as IntakeJobStatus;
+            setIntakeJobStatus(status);
+            const { candidateText } = syncReviewFromIntakeStatus(status, { preserveExistingIssues: true });
+            if ((status.status === "awaiting_review" || status.status === "confirmed") && candidateText.trim()) {
+              detailSupplementedRef.current = true;
+              setDetailSupplemented(true);
+              if (draftCurrentStepValue < 2) {
+                setCurrentStep(2);
+                setStepStatus((prev) => ({ ...prev, 1: "done", 2: "idle" }));
+              }
+              if (status.confirmed_script_version_id) {
+                setConfirmedScriptVersionId(status.confirmed_script_version_id);
+              }
+            }
+          }
         }
       } catch {
         // No draft/logs, fresh import
@@ -1097,7 +1648,81 @@ export default function ImportPage({
       }
     }
     loadDraftAndLogs();
-  }, [projectId]);
+  }, [projectId, syncReviewFromIntakeStatus]);
+
+  useEffect(() => {
+    if (!draftHydrated || !intakeJobId || !isActiveIntakeStatus(intakeJobStatus)) return;
+    if (intakePollingRef.current) return;
+
+    let active = true;
+    intakePollingRef.current = true;
+
+    async function pollRestoredIntake() {
+      while (active && intakePollingRef.current && intakeJobId) {
+        try {
+          const statusRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}`);
+          if (!statusRes.ok) {
+            const errData = await statusRes.json().catch(() => ({}));
+            throw new Error(errData.error || `HTTP ${statusRes.status}`);
+          }
+
+          const status = await statusRes.json() as IntakeJobStatus;
+          setIntakeJobStatus(status);
+          const { candidateText, intakeReviewIssues, statusStoryAnalysis } = syncReviewFromIntakeStatus(status, {
+            preserveExistingIssues: isActiveIntakeStatus(status),
+          });
+
+          if (status.status === "failed" || status.status === "cancelled") {
+            setStepStatus((prev) => ({ ...prev, 1: "error" }));
+            intakePollingRef.current = false;
+            return;
+          }
+
+          if (status.status === "awaiting_review" || status.status === "confirmed") {
+            if (!candidateText.trim()) throw new Error("Script intake finished without candidate text");
+            detailSupplementedRef.current = true;
+            setDetailSupplemented(true);
+            setCurrentStep(2);
+            setStepStatus((prev) => ({ ...prev, 1: "done", 2: "idle" }));
+            if (status.confirmed_script_version_id) {
+              setConfirmedScriptVersionId(status.confirmed_script_version_id);
+            }
+            await saveDraft({
+              ...resetDraftPayload(),
+              currentStep: 2,
+              stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+              fullText: candidateText,
+              reviewIssues: intakeReviewIssues,
+              storyAnalysis: statusStoryAnalysis,
+              intakeJobId,
+              confirmedScriptVersionId: status.confirmed_script_version_id || null,
+              assetLibraryVersionId: null,
+            });
+            intakePollingRef.current = false;
+            return;
+          }
+        } catch (error) {
+          console.error("Restored script intake polling error:", error);
+        }
+
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+      }
+    }
+
+    void pollRestoredIntake();
+    return () => {
+      active = false;
+      intakePollingRef.current = false;
+    };
+  }, [
+    draftHydrated,
+    intakeJobId,
+    intakeJobStatus,
+    projectId,
+    resetDraftPayload,
+    saveDraft,
+    syncReviewFromIntakeStatus,
+  ]);
 
   useEffect(() => {
     if (!draftHydrated || !forceAssetWorkbench) return;
@@ -1105,6 +1730,53 @@ export default function ImportPage({
     setSelectedStep(null);
     setCurrentStep(3);
   }, [draftHydrated, forceAssetWorkbench]);
+
+  useEffect(() => {
+    if (!draftHydrated) return;
+    if (persistedAssetsHydratedRef.current) return;
+    if (!(forceAssetWorkbench || currentStep >= 3 || stepStatus[3] === "done" || historyMode)) return;
+
+    let cancelled = false;
+    async function loadPersistedAssets() {
+      try {
+        const res = await apiFetch(`/api/projects/${projectId}/assets`);
+        if (!res.ok) return;
+        const data = await res.json() as { assets?: PersistedStoryAsset[] };
+        const persistedAssets = Array.isArray(data.assets) ? data.assets : [];
+        if (cancelled || persistedAssets.length === 0) return;
+        persistedAssetsHydratedRef.current = true;
+        const projectStyleGuide = buildProjectStyleGuide(storyAnalysis, fullText);
+        const persistedCharacters = persistedAssets
+          .filter((asset) => asset.type === "character")
+          .map((asset) => persistedAssetToWorkbench(asset) as ExtractedCharacter);
+        const persistedItems = persistedAssets
+          .filter((asset) => asset.type === "prop")
+          .map((asset) => persistedAssetToWorkbench(asset));
+        const persistedEnvironments = persistedAssets
+          .filter((asset) => asset.type === "scene")
+          .map((asset) => persistedAssetToWorkbench(asset));
+        setCharacters(normalizeImportedCharacters(persistedCharacters, projectStyleGuide));
+        setItems(normalizeImportedItems(persistedItems, projectStyleGuide));
+        setEnvironments(normalizeImportedEnvironments(persistedEnvironments, projectStyleGuide));
+      } catch (error) {
+        console.warn("Failed to hydrate persisted assets:", error);
+      }
+    }
+
+    void loadPersistedAssets();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    currentStep,
+    draftHydrated,
+    forceAssetWorkbench,
+    fullText,
+    historyMode,
+    projectId,
+    stepStatus,
+    storyAnalysis,
+  ]);
 
   useEffect(() => {
     if (!draftHydratedRef.current) return;
@@ -1159,6 +1831,141 @@ export default function ImportPage({
     ]);
   }, []);
 
+  const setDetailSupplementReady = useCallback((ready: boolean) => {
+    detailSupplementedRef.current = ready;
+    setDetailSupplemented(ready);
+  }, []);
+
+  const setCurrentEnrichmentJob = useCallback((jobId: string | null) => {
+    enrichmentJobIdRef.current = jobId;
+    setEnrichmentJobId(jobId);
+    if (!jobId) {
+      enrichmentStatusRef.current = null;
+      setEnrichmentJobStatus(null);
+      lastEnrichmentTerminalLogRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enrichmentJobId) return;
+    let active = true;
+    let polling = false;
+
+    const applyStatus = async (data: ScriptEnrichmentJobStatus) => {
+      if (!active) return;
+      enrichmentStatusRef.current = data;
+      setEnrichmentJobStatus(data);
+
+      const enrichedText = typeof data.enrichedText === "string" && data.enrichedText.trim()
+        ? data.enrichedText
+        : fullText;
+      if (enrichedText && enrichedText !== fullText) {
+        enrichedTextRef.current = enrichedText;
+        setFullText(enrichedText);
+      }
+      if (data.visualEnrichment?.patches?.length) {
+        visualEnrichmentRef.current = data.visualEnrichment;
+      } else if (data.status === "completed") {
+        visualEnrichmentRef.current = null;
+      }
+
+      if (data.status === "queued" || data.status === "running") {
+        setStepStatus((prev) => ({ ...prev, 2: "running" }));
+        return;
+      }
+
+      const terminalKey = `${data.job_id}:${data.status}:${data.completed_tasks}:${data.failed_tasks}:${data.skipped_tasks}`;
+      if (lastEnrichmentTerminalLogRef.current !== terminalKey) {
+        lastEnrichmentTerminalLogRef.current = terminalKey;
+        if (data.status === "completed") {
+          addLog(
+            2,
+            "running",
+            `AI 细节补全完成：成功 ${data.completed_tasks}，跳过 ${data.skipped_tasks}，失败 ${data.failed_tasks}`,
+          );
+        } else if (data.status === "cancelled") {
+          addLog(2, "error", "AI 细节补全已取消");
+        } else {
+          addLog(2, "error", `AI 细节补全失败：${data.error_message || "未知错误"}`);
+        }
+      }
+
+      if (data.status === "completed") {
+        setDetailSupplementReady(true);
+        setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+        await saveDraft({
+          ...buildDraftPayload(),
+          currentStep: 2,
+          stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+          fullText: enrichedText,
+          reviewIssues: [],
+          storyAnalysis: null,
+          enrichmentJobId: data.job_id,
+        });
+      } else {
+        setDetailSupplementReady(false);
+        setStepStatus((prev) => ({ ...prev, 2: data.status === "cancelled" ? "idle" : "error" }));
+      }
+    };
+
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const res = await apiFetch(`/api/projects/${projectId}/script/enrich/jobs/${enrichmentJobId}`);
+        const data = await res.json() as ScriptEnrichmentJobStatus;
+        await applyStatus(data);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        addLog(2, "error", `读取 AI 细节补全进度失败：${msg}`);
+      } finally {
+        polling = false;
+      }
+    };
+
+    void poll();
+    const intervalId = window.setInterval(() => void poll(), SCRIPT_ENRICHMENT_POLL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    addLog,
+    buildDraftPayload,
+    enrichmentJobId,
+    fullText,
+    projectId,
+    saveDraft,
+    setDetailSupplementReady,
+  ]);
+
+  async function cancelEnrichmentJob() {
+    const jobId = enrichmentJobIdRef.current;
+    if (!jobId) return;
+    const res = await apiFetch(`/api/projects/${projectId}/script/enrich/jobs/${jobId}/cancel`, {
+      method: "POST",
+    });
+    const data = await res.json() as ScriptEnrichmentJobStatus;
+    enrichmentStatusRef.current = data;
+    setEnrichmentJobStatus(data);
+    setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+    addLog(2, "error", "AI 细节补全已取消");
+  }
+
+  async function retryFailedEnrichmentJob() {
+    const jobId = enrichmentJobIdRef.current;
+    if (!jobId) return;
+    const res = await apiFetch(`/api/projects/${projectId}/script/enrich/jobs/${jobId}/retry-failed`, {
+      method: "POST",
+    });
+    const data = await res.json() as ScriptEnrichmentJobStatus;
+    enrichmentStatusRef.current = data;
+    setEnrichmentJobStatus(data);
+    setStepStatus((prev) => ({ ...prev, 2: "running" }));
+    setDetailSupplementReady(false);
+    addLog(2, "running", "AI 细节补全失败任务已重新排队");
+  }
+
   const handleFile = useCallback((f: File) => {
     if (f.size > MAX_SIZE) {
       toast.error(t("fileTooLarge"));
@@ -1166,6 +1973,15 @@ export default function ImportPage({
     }
     setFile(f);
     storyReviewedRef.current = false;
+    enrichedTextRef.current = "";
+    visualEnrichmentRef.current = null;
+    setDetailSupplementReady(false);
+    setCurrentEnrichmentJob(null);
+    setIntakeJobId(null);
+    setIntakeJobStatus(null);
+    setConfirmedScriptVersionId(null);
+    setAssetLibraryVersionId(null);
+    intakePollingRef.current = false;
     setHistoryMode(false);
     setSelectedStep(null);
     setCurrentStep(0);
@@ -1182,9 +1998,98 @@ export default function ImportPage({
     setConfirmedEpisodeIndexes(new Set());
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     void saveDraft(resetDraftPayload());
-  }, [resetDraftPayload, saveDraft, t]);
+  }, [resetDraftPayload, saveDraft, setCurrentEnrichmentJob, setDetailSupplementReady, t]);
 
-  // ── Step 1: Parse, then stop for story review ──
+  // ── Step 1: Script intake, then stop for human review ──
+  async function runScriptIntakePipeline(uploadFile: File) {
+    const form = new FormData();
+    form.append("file", uploadFile);
+    form.append("modelConfig", JSON.stringify(getModelConfig()));
+    form.append("allowAiOverwrite", "true");
+
+    const startRes = await apiFetch(`/api/projects/${projectId}/script/intake/start`, {
+      method: "POST",
+      body: form,
+    });
+    if (!startRes.ok) {
+      const errData = await startRes.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${startRes.status}`);
+    }
+
+    const startData = await startRes.json() as { jobId?: string; job_id?: string };
+    const jobId = startData.jobId || startData.job_id;
+    if (!jobId) throw new Error("Script intake job did not return job_id");
+
+    setIntakeJobId(jobId);
+    setConfirmedScriptVersionId(null);
+    setAssetLibraryVersionId(null);
+    intakePollingRef.current = true;
+    addLog(1, "running", `Script intake job queued: ${jobId}`);
+    await saveDraft({
+      ...resetDraftPayload(),
+      currentStep: 1,
+      stepStatus: { 1: "running", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+      intakeJobId: jobId,
+      confirmedScriptVersionId: null,
+      assetLibraryVersionId: null,
+    });
+
+    let lastStage = "";
+    while (intakePollingRef.current) {
+      const statusRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${jobId}`);
+      if (!statusRes.ok) {
+        const errData = await statusRes.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${statusRes.status}`);
+      }
+
+      const status = await statusRes.json() as IntakeJobStatus;
+      setIntakeJobStatus(status);
+      if (status.current_stage && status.current_stage !== lastStage) {
+        lastStage = status.current_stage;
+        addLog(1, "running", `Intake stage: ${status.current_stage} (${Math.round(status.progress || 0)}%)`);
+      }
+
+      if (status.status === "failed" || status.status === "cancelled") {
+        throw new Error(status.error_message || `Script intake ${status.status}`);
+      }
+
+      if (status.status === "awaiting_review" || status.status === "confirmed") {
+        const candidateText = status.candidate_text || "";
+        if (!candidateText.trim()) throw new Error("Script intake finished without candidate text");
+        const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+        const statusStoryAnalysis = storyAnalysisFromStatus(status);
+
+        setFullText(candidateText);
+        setReviewIssues(intakeReviewIssues);
+        setStoryAnalysis(statusStoryAnalysis);
+        enrichedTextRef.current = candidateText;
+        visualEnrichmentRef.current = null;
+        setDetailSupplementReady(true);
+        setCurrentStep(2);
+        setStepStatus((prev) => ({ ...prev, 1: "done", 2: "idle" }));
+        if (status.confirmed_script_version_id) {
+          setConfirmedScriptVersionId(status.confirmed_script_version_id);
+        }
+        addLog(1, "done", `Script intake ready for review: ${candidateText.length} chars`);
+        await saveDraft({
+          ...resetDraftPayload(),
+          currentStep: 2,
+          stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
+          fullText: candidateText,
+          reviewIssues: intakeReviewIssues,
+          storyAnalysis: statusStoryAnalysis,
+          intakeJobId: jobId,
+          confirmedScriptVersionId: status.confirmed_script_version_id || null,
+          assetLibraryVersionId: null,
+        });
+        intakePollingRef.current = false;
+        return;
+      }
+
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+    }
+  }
+
   async function startPipeline() {
     if (!file) return;
     if (!textGuard()) return;
@@ -1204,95 +2109,83 @@ export default function ImportPage({
     setExpandedEpisodeIndexes(new Set());
     setConfirmedEpisodeIndexes(new Set());
     storyReviewedRef.current = false;
+    enrichedTextRef.current = "";
+    visualEnrichmentRef.current = null;
+    setDetailSupplementReady(false);
+    setCurrentEnrichmentJob(null);
+    setIntakeJobId(null);
+    setIntakeJobStatus(null);
+    setConfirmedScriptVersionId(null);
+    intakePollingRef.current = false;
     setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
     await saveDraft(resetDraftPayload());
 
     // Clear old logs
     await apiFetch(`/api/projects/${projectId}/import/logs`, { method: "DELETE" });
 
-    // Step 1: Parse
+    // Step 1: Script intake
     setCurrentStep(1);
     setStepStatus((prev) => ({ ...prev, 1: "running" }));
-    addLog(1, "running", `解析文件: ${file.name}`);
+    addLog(1, "running", `创建剧本标准化任务: ${file.name}`);
 
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await apiFetch(`/api/projects/${projectId}/import/parse`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      setFullText(data.text);
-      addLog(1, "done", `解析完成，共 ${data.charCount} 字`);
-      setStepStatus((prev) => ({ ...prev, 1: "done" }));
-      setCurrentStep(2);
-      await saveDraft({
-        ...resetDraftPayload(),
-        currentStep: 2,
-        stepStatus: { 1: "done", 2: "idle", 3: "idle", 4: "idle", 5: "idle" },
-        fullText: data.text,
-      });
+      await runScriptIntakePipeline(file);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Parse failed";
-      addLog(1, "error", `文件解析失败: ${msg}`);
+      const msg = err instanceof Error ? err.message : "Script intake failed";
+      addLog(1, "error", `剧本标准化失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 1: "error" }));
       return;
     }
   }
 
-  // ── Step 2: AI story review, then human review gate ──
+  // ── Step 2: Intake review refresh, then human review gate ──
   async function runStoryReview(text: string = fullText) {
     if (!text.trim()) return;
     if (!textGuard()) return;
+    if (!intakeJobId) {
+      const message = "请先重新上传并完成剧本标准化，再刷新审阅结果";
+      toast.error(message);
+      addLog(2, "error", message);
+      return;
+    }
 
     setCurrentStep(2);
     setStepStatus((prev) => ({ ...prev, 2: "running" }));
     setReviewIssues([]);
-    addLog(2, "running", "开始 AI 剧情审阅...");
+    addLog(2, "running", "刷新剧本标准化审阅结果...");
 
     try {
       setSelectedIssueIndexes(new Set());
       setActiveIssueIndex(null);
-      const res = await apiFetch(`/api/projects/${projectId}/import/structure`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ modelConfig: getModelConfig(), concurrency: 2 }),
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || `HTTP ${res.status}`);
+      const intakeRes = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}`);
+      if (!intakeRes.ok) {
+        const errData = await intakeRes.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${intakeRes.status}`);
       }
-      const data = await res.json() as {
-        issues: StoryReviewIssue[];
-        storyAnalysis?: StoryAssetAnalysis | null;
-        usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
-      };
-      setReviewIssues(data.issues || []);
-      setStoryAnalysis(data.storyAnalysis || null);
-      const usageParts = [
-        typeof data.usage?.inputTokens === "number" ? `输入 ${data.usage.inputTokens}` : null,
-        typeof data.usage?.outputTokens === "number" ? `输出 ${data.usage.outputTokens}` : null,
-        typeof data.usage?.totalTokens === "number" ? `合计 ${data.usage.totalTokens}` : null,
-      ].filter(Boolean);
-      const usageSuffix = usageParts.length > 0 ? `，token：${usageParts.join(" / ")}` : "";
-      addLog(2, "done", data.issues?.length ? `AI 剧情审阅完成，发现 ${data.issues.length} 个问题${usageSuffix}` : `AI 剧情审阅完成，未发现明显问题${usageSuffix}`);
+      const status = await intakeRes.json() as IntakeJobStatus;
+      const candidateText = status.candidate_text || text;
+      const intakeReviewIssues = intakeIssuesToStoryIssues(status, candidateText);
+      const statusStoryAnalysis = storyAnalysisFromStatus(status);
+      setIntakeJobStatus(status);
+      setFullText(candidateText);
+      setReviewIssues(intakeReviewIssues);
+      if (statusStoryAnalysis) setStoryAnalysis(statusStoryAnalysis);
+      setDetailSupplementReady(status.status === "awaiting_review" || status.status === "confirmed");
       setStepStatus((prev) => ({ ...prev, 2: "idle" }));
+      addLog(2, "done", `剧本标准化审阅结果已刷新，发现 ${intakeReviewIssues.length} 个问题`);
       await saveDraft({
         ...buildDraftPayload(),
         currentStep: 2,
         stepStatus: { ...stepStatus, 1: "done", 2: "idle" },
-        fullText: text,
-        reviewIssues: data.issues || [],
-        storyAnalysis: data.storyAnalysis || null,
+        fullText: candidateText,
+        reviewIssues: intakeReviewIssues,
+        storyAnalysis: statusStoryAnalysis ?? storyAnalysis,
+        intakeJobId,
+        confirmedScriptVersionId: status.confirmed_script_version_id || confirmedScriptVersionId,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Review failed";
-      addLog(2, "error", `AI 剧情审阅失败: ${msg}`);
+      addLog(2, "error", `刷新剧本标准化审阅失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 2: "error" }));
     }
   }
@@ -1385,8 +2278,8 @@ export default function ImportPage({
 
   function applyStoryIssue(index: number) {
     const issue = reviewIssues[index];
-    if (!issue || issue.applied) return;
-    if (!fullText.includes(issue.exactQuote)) {
+    if (!issue || issue.applied || issue.waived) return;
+    if (!issue.exactQuote || !fullText.includes(issue.exactQuote)) {
       toast.error(t("reviewQuoteMissing"));
       return;
     }
@@ -1406,7 +2299,7 @@ export default function ImportPage({
     const targets = new Set(indexes);
     let nextText = fullText;
     const nextIssues = reviewIssues.map((issue, index) => {
-      if (!targets.has(index) || issue.applied || !nextText.includes(issue.exactQuote)) return issue;
+      if (!targets.has(index) || issue.applied || issue.waived || !issue.exactQuote || !nextText.includes(issue.exactQuote)) return issue;
       nextText = issue.replaceMode === "all"
         ? nextText.split(issue.exactQuote).join(issue.replacement)
         : nextText.replace(issue.exactQuote, issue.replacement);
@@ -1425,7 +2318,7 @@ export default function ImportPage({
     const indexes = Array.from(selectedIssueIndexes)
       .filter((index) => {
         const issue = reviewIssues[index];
-        return issue && !issue.applied && fullText.includes(issue.exactQuote);
+        return issue && !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote);
       })
       .sort((a, b) => a - b);
     if (indexes.length === 0) {
@@ -1437,6 +2330,76 @@ export default function ImportPage({
 
   function applyAllStoryIssues() {
     applyStoryIssueIndexes(reviewIssues.map((_, index) => index));
+  }
+
+  function resolveHighRiskStoryIssues(options?: { waiveRemaining?: boolean }) {
+    let nextText = fullText;
+    let appliedCount = 0;
+    let waivedCount = 0;
+    const nextIssues = reviewIssues.map((issue) => {
+      if (issue.severity !== "high" || issue.applied || issue.waived) return issue;
+      if (issue.exactQuote && nextText.includes(issue.exactQuote)) {
+        nextText = issue.replaceMode === "all"
+          ? nextText.split(issue.exactQuote).join(issue.replacement)
+          : nextText.replace(issue.exactQuote, issue.replacement);
+        appliedCount += 1;
+        return { ...issue, applied: true };
+      }
+      if (options?.waiveRemaining) {
+        waivedCount += 1;
+        return {
+          ...issue,
+          waived: true,
+          waiverNote: "manual_release_before_asset_intake",
+        };
+      }
+      return issue;
+    });
+
+    setFullText(nextText);
+    setReviewIssues(nextIssues);
+    setSelectedIssueIndexes(new Set());
+
+    if (appliedCount || waivedCount) {
+      toast.success(`已处理高危问题：自动替换 ${appliedCount} 项，人工确认 ${waivedCount} 项`);
+    } else {
+      toast.error("没有可自动处理的高危问题");
+    }
+
+    return { nextText, nextIssues, appliedCount, waivedCount };
+  }
+
+  function applyResolvableHighRiskIssues() {
+    resolveHighRiskStoryIssues();
+  }
+
+  async function resolveHighRisksAndConfirmStory() {
+    const unresolvedHighCount = reviewIssues.filter((issue) =>
+      issue.severity === "high" && !issue.applied && !issue.waived
+    ).length;
+    if (unresolvedHighCount === 0) {
+      await confirmStoryReview();
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `将按行业审阅规则处理 ${unresolvedHighCount} 个高危问题：可定位文本会自动替换，无法自动定位的问题将标记为人工确认后放行，并写入确认版本审阅记录。是否继续？`,
+    );
+    if (!confirmed) return;
+
+    const { nextText, nextIssues } = resolveHighRiskStoryIssues({ waiveRemaining: true });
+    await confirmStoryReview({ content: nextText, reviewIssues: nextIssues });
+  }
+
+  function waiveStoryIssue(index: number) {
+    setReviewIssues((prev) => prev.map((issue, idx) =>
+      idx === index ? { ...issue, waived: true, waiverNote: "manual_single_issue_release" } : issue
+    ));
+    setSelectedIssueIndexes((prev) => {
+      const next = new Set(prev);
+      next.delete(index);
+      return next;
+    });
   }
 
   function toggleIssueSelection(index: number) {
@@ -1454,15 +2417,90 @@ export default function ImportPage({
   function toggleAllIssueSelection() {
     const selectableIndexes = reviewIssues
       .map((issue, index) => ({ issue, index }))
-      .filter(({ issue }) => !issue.applied && fullText.includes(issue.exactQuote))
+      .filter(({ issue }) => !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote))
       .map(({ index }) => index);
     const allSelected = selectableIndexes.length > 0 && selectableIndexes.every((index) => selectedIssueIndexes.has(index));
 
     setSelectedIssueIndexes(allSelected ? new Set() : new Set(selectableIndexes));
   }
 
-  async function confirmStoryReview() {
-    if (!fullText.trim()) return;
+  function validateStoryReviewReady(nextIssues = reviewIssues) {
+    const missingMeta = missingStoryMetaLabels(storyAnalysis);
+    if (missingMeta.length > 0) {
+      toast.error(`请先补全故事设定：${missingMeta.join("、")}`);
+      return false;
+    }
+    const unresolvedHigh = nextIssues.filter((issue) =>
+      issue.severity === "high" && !issue.applied && !issue.waived
+    );
+    if (unresolvedHigh.length > 0) {
+      toast.error(`请先处理或豁免 ${unresolvedHigh.length} 个高危审阅问题`);
+      return false;
+    }
+    return true;
+  }
+
+  async function ensureConfirmedScriptVersion(options?: { content?: string; reviewIssues?: StoryReviewIssue[] }) {
+    if (confirmedScriptVersionId) return confirmedScriptVersionId;
+    if (!intakeJobId) {
+      throw new Error("请先完成剧本标准化，再确认正文");
+    }
+
+    addLog(2, "running", "正在生成人工确认剧本版本...");
+    const content = options?.content ?? fullText;
+    const issuesForReview = options?.reviewIssues ?? reviewIssues;
+    const res = await apiFetch(`/api/projects/${projectId}/script/intake/jobs/${intakeJobId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content,
+        reviewNotes: {
+          reviewIssues: issuesForReview,
+          storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis),
+        },
+      }),
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${res.status}`);
+    }
+
+    const data = await res.json() as { confirmed_script_version_id?: string };
+    const versionId = data.confirmed_script_version_id;
+    if (!versionId) throw new Error("确认接口没有返回 confirmed_script_version_id");
+
+    setConfirmedScriptVersionId(versionId);
+    setAssetLibraryVersionId(null);
+    setIntakeJobStatus((prev) => prev ? { ...prev, status: "confirmed", confirmed_script_version_id: versionId } : prev);
+    addLog(2, "done", `已生成确认剧本版本: ${versionId}`);
+    await saveDraft({
+      ...buildDraftPayload(),
+      fullText: content,
+      reviewIssues: issuesForReview,
+      intakeJobId,
+      confirmedScriptVersionId: versionId,
+      assetLibraryVersionId: null,
+    });
+    return versionId;
+  }
+
+  async function confirmStoryReview(options?: { content?: string; reviewIssues?: StoryReviewIssue[] }) {
+    const content = options?.content ?? fullText;
+    const issuesForReview = options?.reviewIssues ?? reviewIssues;
+    if (!content.trim()) return;
+    if (!validateStoryReviewReady(issuesForReview)) return;
+    let activeConfirmedScriptVersionId: string;
+    try {
+      activeConfirmedScriptVersionId = await ensureConfirmedScriptVersion({
+        content,
+        reviewIssues: issuesForReview,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "确认失败";
+      addLog(2, "error", `确认剧本版本失败: ${msg}`);
+      toast.error(msg);
+      return;
+    }
     storyReviewedRef.current = true;
     await apiFetch(`/api/projects/${projectId}/import/logs`, {
       method: "POST",
@@ -1470,97 +2508,41 @@ export default function ImportPage({
       body: JSON.stringify({
         step: 2,
         status: "done",
-        message: `剧情审阅通过，共 ${fullText.length} 字`,
-        metadata: { charCount: fullText.length, preview: fullText.slice(0, 2000), text: fullText, storyAnalysis },
+        message: `剧情审阅通过，共 ${content.length} 字`,
+        metadata: { charCount: content.length, preview: content.slice(0, 2000), text: content, storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis) },
       }),
     });
     setCurrentStep(3);
     setStepStatus((prev) => ({ ...prev, 2: "done" }));
-    addLog(2, "done", `剧情审阅通过，共 ${fullText.length} 字`);
+    addLog(2, "done", `剧情审阅通过，共 ${content.length} 字`);
     await saveDraft({
       ...buildDraftPayload(),
       currentStep: 3,
       stepStatus: { ...stepStatus, 2: "done" },
-      fullText,
-      reviewIssues,
-      storyAnalysis,
+      fullText: content,
+      reviewIssues: issuesForReview,
+      storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis),
     });
-    await runCharacterExtract();
-  }
-
-  function ensureEditableStoryAnalysis(): StoryAssetAnalysis {
-    return {
-      storyMeta: storyAnalysis?.storyMeta || {},
-      assets: {
-        characters: storyAnalysis?.assets?.characters || [],
-        scenes: storyAnalysis?.assets?.scenes || [],
-        props: storyAnalysis?.assets?.props || [],
-      },
-    };
+    await runCharacterExtract(activeConfirmedScriptVersionId);
   }
 
   function updateStoryMetaField(field: keyof NonNullable<StoryAssetAnalysis["storyMeta"]>, value: string) {
     setStoryAnalysis((prev) => ({
-      ...(prev || {}),
       storyMeta: {
         ...(prev?.storyMeta || {}),
         [field]: value,
       },
-      assets: prev?.assets || { characters: [], scenes: [], props: [] },
     }));
   }
 
-  function updateStoryAssetItem(section: StoryAssetSectionKey, index: number, patch: Record<string, string>) {
-    setStoryAnalysis((prev) => {
-      const base = prev || ensureEditableStoryAnalysis();
-      const assets = {
-        characters: base.assets?.characters || [],
-        scenes: base.assets?.scenes || [],
-        props: base.assets?.props || [],
-      };
-      const list = [...assets[section]];
-      list[index] = { ...list[index], ...patch };
-      return { ...base, assets: { ...assets, [section]: list } };
-    });
-  }
-
-  function addStoryAssetItem(section: StoryAssetSectionKey) {
-    setStoryAnalysis((prev) => {
-      const base = prev || ensureEditableStoryAnalysis();
-      const assets = {
-        characters: base.assets?.characters || [],
-        scenes: base.assets?.scenes || [],
-        props: base.assets?.props || [],
-      };
-      const blank =
-        section === "characters"
-          ? { name: "", role: "配角", description: "" }
-          : { name: "", type: section === "scenes" ? "场景空间" : "剧情道具", description: "" };
-      return { ...base, assets: { ...assets, [section]: [...assets[section], blank] } };
-    });
-  }
-
-  function removeStoryAssetItem(section: StoryAssetSectionKey, index: number) {
-    setStoryAnalysis((prev) => {
-      if (!prev) return prev;
-      const assets = {
-        characters: prev.assets?.characters || [],
-        scenes: prev.assets?.scenes || [],
-        props: prev.assets?.props || [],
-      };
-      return {
-        ...prev,
-        assets: {
-          ...assets,
-          [section]: assets[section].filter((_, itemIndex) => itemIndex !== index),
-        },
-      };
-    });
-  }
-
   // ── Step 3: Asset setting foundation - character extraction ──
-  async function runCharacterExtract() {
+  async function runCharacterExtract(versionId = confirmedScriptVersionId) {
     if (!fullText) return;
+    if (!versionId) {
+      toast.error("请先确认剧本正文，再提取资产");
+      setStepStatus((prev) => ({ ...prev, 3: "error" }));
+      return;
+    }
     if (!storyReviewedRef.current && stepStatus[2] !== "done") {
       setCurrentStep(2);
       setStepStatus((prev) => ({ ...prev, 2: "idle", 3: "idle" }));
@@ -1568,13 +2550,14 @@ export default function ImportPage({
     }
     setCurrentStep(3);
     setStepStatus((prev) => ({ ...prev, 3: "running" }));
+    setAssetLibraryVersionId(null);
     addLog(3, "running", "开始资产设定：提取角色、物品、场景和音色...");
 
     try {
       const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: fullText, storyAnalysis }),
+        body: JSON.stringify({ confirmedScriptVersionId: versionId, storyAnalysis: storyMetaOnlyAnalysis(storyAnalysis) }),
       });
       if (!res.ok) {
         const errData = await res.json();
@@ -1603,6 +2586,7 @@ export default function ImportPage({
         environments: normalizedEnvironments,
         voices: data.voices || [],
         relationships: data.relationships || [],
+        assetLibraryVersionId: null,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Extract failed";
@@ -1618,15 +2602,121 @@ export default function ImportPage({
     await runCharacterExtract();
   }
 
+  function syncedAssetsByType(assets: SyncedProjectAsset[], type: "character" | "prop" | "scene") {
+    return assets.filter((asset) => asset.type === type);
+  }
+
+  function mergeSyncedAssetIds<T extends WorkbenchAsset>(
+    source: T[],
+    syncedAssets: SyncedProjectAsset[],
+    type: "character" | "prop" | "scene",
+  ): T[] {
+    const candidates = syncedAssetsByType(syncedAssets, type);
+    const byId = new Map(candidates.map((asset) => [asset.id, asset]));
+    const byName = new Map(candidates.map((asset) => [asset.name.trim().toLowerCase(), asset]));
+
+    return source.map((asset, index) => {
+      const synced = (asset.assetId ? byId.get(asset.assetId) : undefined)
+        ?? byName.get(asset.name.trim().toLowerCase())
+        ?? candidates[index];
+      return synced?.id ? { ...asset, assetId: synced.id } as T : asset;
+    });
+  }
+
+  async function syncAndLockAssetLibraryVersion() {
+    if (!confirmedScriptVersionId) {
+      toast.error("请先确认剧本正文，再锁定资产库");
+      return null;
+    }
+    if (assetLibraryVersionId) return assetLibraryVersionId;
+
+    setAssetLibraryLocking(true);
+    addLog(3, "running", "正在同步并锁定资产库版本...");
+
+    try {
+      const syncRes = await apiFetch(`/api/projects/${projectId}/assets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ characters, items, environments }),
+      });
+      const syncData = await syncRes.json().catch(() => ({})) as { assets?: SyncedProjectAsset[]; error?: string };
+      if (!syncRes.ok) {
+        throw new Error(syncData.error || `HTTP ${syncRes.status}`);
+      }
+
+      const syncedAssets = Array.isArray(syncData.assets) ? syncData.assets : [];
+      const nextCharacters = mergeSyncedAssetIds(characters, syncedAssets, "character") as ExtractedCharacter[];
+      const nextItems = mergeSyncedAssetIds(items, syncedAssets, "prop") as ExtractedAsset[];
+      const nextEnvironments = mergeSyncedAssetIds(environments, syncedAssets, "scene") as ExtractedAsset[];
+      const assetIds = [...nextCharacters, ...nextItems, ...nextEnvironments]
+        .map((asset) => asset.assetId)
+        .filter((id): id is string => Boolean(id));
+      if (assetIds.length === 0) {
+        throw new Error("没有可锁定的角色、道具或场景资产");
+      }
+
+      setCharacters(nextCharacters);
+      setItems(nextItems);
+      setEnvironments(nextEnvironments);
+
+      const lockRes = await apiFetch(`/api/projects/${projectId}/pipeline/asset-library/lock`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmedScriptVersionId,
+          assetIds,
+          reviewSummary: {
+            source: "asset_review_before_split",
+            characterCount: nextCharacters.length,
+            itemCount: nextItems.length,
+            environmentCount: nextEnvironments.length,
+            voiceCount: voices.length,
+          },
+        }),
+      });
+      const lockData = await lockRes.json().catch(() => ({})) as {
+        asset_library_version?: { id?: string };
+        error?: string;
+      };
+      if (!lockRes.ok) {
+        throw new Error(lockData.error || `HTTP ${lockRes.status}`);
+      }
+
+      const versionId = lockData.asset_library_version?.id;
+      if (!versionId) throw new Error("锁定接口没有返回 asset_library_version.id");
+
+      setAssetLibraryVersionId(versionId);
+      addLog(3, "done", `资产库已锁定为版本 ${versionId}`);
+      await saveDraft({
+        ...buildDraftPayload(),
+        characters: nextCharacters,
+        items: nextItems,
+        environments: nextEnvironments,
+        assetLibraryVersionId: versionId,
+      });
+      return versionId;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "资产库锁定失败";
+      addLog(3, "error", `资产库锁定失败: ${msg}`);
+      toast.error(msg);
+      return null;
+    } finally {
+      setAssetLibraryLocking(false);
+    }
+  }
+
   // ── Step 4: Split (triggered by user after reviewing asset settings) ──
   async function runSplit() {
-    if (splitRunningRef.current || stepStatus[4] === "running") return;
+    if (splitRunningRef.current || stepStatus[4] === "running" || assetLibraryLocking) return;
     const assets = [...characters, ...items, ...environments, ...voices];
-    const unconfirmedAssets = assets.filter((asset) => asset.confirmed === false);
+    const unconfirmedAssets = assets.filter((asset) => asset.confirmed !== true);
     if (!assets.length || unconfirmedAssets.length > 0) {
       toast.error(`请先确认全部资产（${assets.length - unconfirmedAssets.length}/${assets.length}）`);
       return;
     }
+
+    const lockedAssetLibraryVersionId = await syncAndLockAssetLibraryVersion();
+    if (!lockedAssetLibraryVersionId) return;
 
     splitRunningRef.current = true;
     setCurrentStep(4);
@@ -1653,7 +2743,7 @@ export default function ImportPage({
       setEpisodes(data.episodes);
       setExpandedEpisodeIndexes(new Set());
       setConfirmedEpisodeIndexes(new Set());
-      addLog(4, "done", `分集完成，共 ${data.episodes.length} 集`);
+      addLog(4, "done", `分集完成，共 ${data.episodes.length} 集，使用资产库版本 ${lockedAssetLibraryVersionId}`);
       setStepStatus((prev) => ({ ...prev, 4: "done" }));
       await saveDraft({
         ...buildDraftPayload(),
@@ -1661,6 +2751,7 @@ export default function ImportPage({
         stepStatus: { ...stepStatus, 4: "done" },
         episodes: data.episodes,
         confirmedEpisodeIndexes: [],
+        assetLibraryVersionId: lockedAssetLibraryVersionId,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Split failed";
@@ -1677,10 +2768,18 @@ export default function ImportPage({
       toast.error(t("confirmAllEpisodesRequired"));
       return;
     }
+    if (!confirmedScriptVersionId) {
+      toast.error("请先确认剧本正文，再生成项目内容");
+      return;
+    }
+    if (!assetLibraryVersionId) {
+      toast.error("请先确认资产并锁定资产库版本，再生成项目内容");
+      return;
+    }
 
     setCurrentStep(5);
     setStepStatus((prev) => ({ ...prev, 5: "running" }));
-    addLog(5, "running", `创建 ${episodes.length} 集和角色...`);
+    addLog(5, "running", `创建 ${episodes.length} 集、角色并复用资产库版本 ${assetLibraryVersionId}...`);
 
     try {
       const res = await apiFetch(`/api/projects/${projectId}/import/generate`, {
@@ -1693,15 +2792,35 @@ export default function ImportPage({
           environments,
           voices,
           relationships,
+          confirmedScriptVersionId,
+          assetLibraryVersionId,
         }),
       });
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || `HTTP ${res.status}`);
       }
-      const data = await res.json();
-      addLog(5, "done", `导入完成！创建了 ${data.characterCount} 个角色、${data.itemCount || 0} 个物品、${data.environmentCount || 0} 个环境、${data.voiceCount || 0} 个音色和 ${data.episodes.length} 集`);
+      const data = await res.json() as {
+        episodes: Array<{ id: string }>;
+        characterCount: number;
+        itemCount?: number;
+        environmentCount?: number;
+        voiceCount?: number;
+        assetLibraryVersionId?: string;
+      };
+      const lockedAssetLibraryVersionId = data.assetLibraryVersionId || null;
+      if (!lockedAssetLibraryVersionId) {
+        throw new Error("导入接口没有返回 assetLibraryVersionId");
+      }
+      setAssetLibraryVersionId(lockedAssetLibraryVersionId);
+      addLog(5, "done", `导入完成！创建了 ${data.characterCount} 个角色、${data.itemCount || 0} 个物品、${data.environmentCount || 0} 个环境、${data.voiceCount || 0} 个音色和 ${data.episodes.length} 集，已锁定资产库版本 ${lockedAssetLibraryVersionId}`);
       setStepStatus((prev) => ({ ...prev, 5: "done" }));
+      await saveDraft({
+        ...buildDraftPayload(),
+        currentStep: 5,
+        stepStatus: { ...stepStatus, 5: "done" },
+        assetLibraryVersionId: lockedAssetLibraryVersionId,
+      });
       toast.success(t("complete"));
       setTimeout(() => {
         router.push(`/${locale}/project/${projectId}/episodes`);
@@ -1868,11 +2987,32 @@ export default function ImportPage({
   const showEpReview = stepStatus[4] === "done" && stepStatus[5] === "idle" && !historyMode;
   const hideParseStep = stepStatus[2] === "done" || currentStep >= 3;
   const visibleSteps = hideParseStep ? STEPS.filter(({ num }) => num !== 1) : STEPS;
-  const reviewRunning = stepStatus[2] === "running";
-  const unappliedIssueCount = reviewIssues.filter((issue) => !issue.applied).length;
+  const enrichmentRunning = Boolean(enrichmentJobStatus && (enrichmentJobStatus.status === "queued" || enrichmentJobStatus.status === "running"));
+  const reviewRunning = stepStatus[2] === "running" && !enrichmentRunning;
+  const stepTwoBusy = enrichmentRunning || reviewRunning;
+  const unresolvedIssueCount = reviewIssues.filter((issue) => !issue.applied && !issue.waived).length;
+  const unresolvedHighIssueCount = reviewIssues.filter((issue) =>
+    issue.severity === "high" && !issue.applied && !issue.waived
+  ).length;
+  const storyReviewMissingMetaLabels = missingStoryMetaLabels(storyAnalysis);
+  const intakeReviewRunning = isActiveIntakeStatus(intakeJobStatus);
+  const storyReviewGateWarnings = [
+    intakeReviewRunning ? `剧本标准化仍在运行：${intakeJobStatus?.current_stage || intakeJobStatus?.status || "处理中"} ${Math.round(intakeJobStatus?.progress || 0)}%` : "",
+    storyReviewMissingMetaLabels.length > 0 ? `故事设定待补全：${storyReviewMissingMetaLabels.join("、")}` : "",
+    unresolvedHighIssueCount > 0 ? `高危问题待处理：${unresolvedHighIssueCount} 项` : "",
+  ].filter(Boolean);
+  const intakeRevisionSummaries = collectIntakeRevisionSummaries(intakeJobStatus);
+  const storyReviewHardGateWarnings = [
+    intakeReviewRunning ? "intake_running" : "",
+    storyReviewMissingMetaLabels.length > 0 ? "missing_story_meta" : "",
+  ].filter(Boolean);
+  const unresolvedHighAutoIssueCount = reviewIssues.filter((issue) =>
+    issue.severity === "high" && !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote)
+  ).length;
+  const unresolvedHighManualIssueCount = Math.max(0, unresolvedHighIssueCount - unresolvedHighAutoIssueCount);
   const selectableIssueIndexes = reviewIssues
     .map((issue, index) => ({ issue, index }))
-    .filter(({ issue }) => !issue.applied && fullText.includes(issue.exactQuote))
+    .filter(({ issue }) => !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote))
     .map(({ index }) => index);
   const selectedApplicableIssueCount = selectableIssueIndexes.filter((index) => selectedIssueIndexes.has(index)).length;
   const allSelectableIssuesSelected = selectableIssueIndexes.length > 0
@@ -1909,8 +3049,13 @@ export default function ImportPage({
     }
   }, [activeAssetKey, activeAssetList, activeAssetTab]);
 
+  function invalidateAssetLibraryVersion() {
+    if (assetLibraryVersionId) setAssetLibraryVersionId(null);
+  }
+
   function updateActiveWorkbenchAsset(patch: Partial<WorkbenchAsset>) {
     if (activeWorkbenchAssetIndex < 0) return;
+    invalidateAssetLibraryVersion();
     if (activeAssetTab === "characters") {
       setCharacters((prev) => prev.map((asset, index) => index === activeWorkbenchAssetIndex ? { ...asset, ...patch } as ExtractedCharacter : asset));
     } else if (activeAssetTab === "items") {
@@ -1993,6 +3138,7 @@ export default function ImportPage({
     options?: { persist?: boolean },
   ) {
     if (options?.persist) immediateDraftSaveRef.current = true;
+    invalidateAssetLibraryVersion();
     const setter = getAssetSetter(tab);
     setter((prev) => prev.map((asset, index) => index === assetIndex ? patcher(asset) : asset));
   }
@@ -2062,6 +3208,7 @@ export default function ImportPage({
     if (!window.confirm(`确定删除「${asset.name}」吗？`)) return;
     const key = getAssetKey(asset, assetIndex, tab);
     const setter = getAssetSetter(tab);
+    invalidateAssetLibraryVersion();
     setter((prev) => prev.filter((_, index) => index !== assetIndex));
     setActiveAssetKey((current) => (current === key ? "" : current));
     toast.success("已删除资产");
@@ -2744,12 +3891,14 @@ export default function ImportPage({
     } else {
       setVoices((prev) => [...prev, asset]);
     }
+    invalidateAssetLibraryVersion();
     setActiveAssetTab(tab);
     setActiveAssetKey(key);
     toast.success(`已添加${assetTabInfo(tab).label}`);
   }
 
   function confirmAllWorkbenchAssets() {
+    invalidateAssetLibraryVersion();
     setCharacters((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
     setItems((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
     setEnvironments((prev) => prev.map((asset) => ({ ...asset, confirmed: true })));
@@ -2773,25 +3922,22 @@ export default function ImportPage({
       key: "characters",
       label: "人物",
       icon: Users,
-      items: storyAnalysis?.assets?.characters || [],
-      roleField: "role",
-      getSubText: (item: { role?: string; description?: string }) => item.role || item.description || "角色资产",
+      items: characters,
+      getSubText: (item: WorkbenchAsset) => item.role || item.description || "角色资产",
     },
     {
       key: "scenes",
       label: "场景",
       icon: Layers,
-      items: storyAnalysis?.assets?.scenes || [],
-      roleField: "type",
-      getSubText: (item: { type?: string; description?: string }) => item.type || item.description || "环境资产",
+      items: environments,
+      getSubText: (item: WorkbenchAsset) => item.role || item.category || item.description || "环境资产",
     },
     {
       key: "props",
       label: "物品",
       icon: ImageIcon,
-      items: storyAnalysis?.assets?.props || [],
-      roleField: "type",
-      getSubText: (item: { type?: string; description?: string }) => item.type || item.description || "道具资产",
+      items,
+      getSubText: (item: WorkbenchAsset) => item.role || item.category || item.description || "道具资产",
     },
   ];
   const reviewAssetTotal = reviewAssetSections.reduce((sum, section) => sum + section.items.length, 0);
@@ -2799,6 +3945,8 @@ export default function ImportPage({
     ["time", "时间", storyAnalysis?.storyMeta?.time],
     ["background", "背景", storyAnalysis?.storyMeta?.background],
     ["visualStyleBase", "风格", storyAnalysis?.storyMeta?.visualStyleBase],
+    ["genre", "题材", storyAnalysis?.storyMeta?.genre],
+    ["locationBackground", "地域/空间", storyAnalysis?.storyMeta?.locationBackground],
   ] as const;
 
   const confirmedEpisodeCount = confirmedEpisodeIndexes.size;
@@ -2809,7 +3957,7 @@ export default function ImportPage({
   });
   const episodePendingDelete = episodeDeleteIndex === null ? null : episodes[episodeDeleteIndex];
   const allWorkbenchAssets = [...characters, ...items, ...environments, ...voices];
-  const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed !== false).length;
+  const confirmedAssetCount = allWorkbenchAssets.filter((asset) => asset.confirmed === true).length;
   const allAssetsConfirmed = allWorkbenchAssets.length > 0 && confirmedAssetCount === allWorkbenchAssets.length;
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden bg-[--surface]">
@@ -2930,6 +4078,31 @@ export default function ImportPage({
           </div>
         )}
 
+        {currentStep === 1 && !historyMode && intakeJobStatus && (
+          <div className="mx-auto w-full max-w-2xl rounded-xl border border-[--border-subtle] bg-white p-5">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-[--text-primary]">剧本标准化</div>
+                <div className="truncate text-xs text-[--text-muted]">
+                  {intakeJobStatus.current_stage || intakeJobStatus.status}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2 text-xs font-semibold text-[--text-secondary]">
+                {(intakeJobStatus.status === "queued" || intakeJobStatus.status === "running") && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                {Math.round(intakeJobStatus.progress || 0)}%
+              </div>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-[--surface]">
+              <div
+                className="h-full rounded-full bg-primary transition-all"
+                style={{ width: `${Math.max(0, Math.min(100, intakeJobStatus.progress || 0))}%` }}
+              />
+            </div>
+          </div>
+        )}
+
         {/* Story review gate (AI review, then human approval) */}
         {showStoryReview && (
           <div className="mx-auto flex w-full max-w-[1500px] flex-1 flex-col gap-4">
@@ -2949,17 +4122,148 @@ export default function ImportPage({
                 <Button
                   variant="outline"
                   onClick={() => runStoryReview()}
-                  disabled={reviewRunning || !fullText.trim()}
+                  disabled={stepTwoBusy || !fullText.trim() || !intakeJobId}
                   className="rounded-xl"
                 >
-                  {reviewRunning && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  {reviewIssues.length > 0 ? t("rerunStoryReview") : t("runStoryReview")}
+                  {stepTwoBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                  {enrichmentRunning ? "AI补全中" : intakeJobId ? "刷新审阅结果" : "需重新标准化"}
                 </Button>
-                <Button onClick={confirmStoryReview} disabled={reviewRunning} className="rounded-xl">
+                <Button
+                  onClick={() => confirmStoryReview()}
+                  disabled={
+                    stepTwoBusy
+                    || !fullText.trim()
+                    || (!intakeJobId && !confirmedScriptVersionId)
+                    || storyReviewHardGateWarnings.length > 0
+                  }
+                  className="rounded-xl"
+                >
                   {t("confirmStoryReview")}
                 </Button>
               </div>
             </div>
+
+            {storyReviewGateWarnings.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-800">
+                <span className="font-semibold">确认前需完成</span>
+                {storyReviewGateWarnings.map((warning) => (
+                  <span key={warning} className="rounded-lg bg-white px-2 py-1">
+                    {warning}
+                  </span>
+                ))}
+                {unresolvedHighIssueCount > 0 && (
+                  <div className="ml-auto flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={applyResolvableHighRiskIssues}
+                      disabled={stepTwoBusy || unresolvedHighAutoIssueCount === 0}
+                      className="h-8 rounded-lg border-amber-300 bg-white text-amber-800 hover:bg-amber-100"
+                    >
+                      自动替换可定位高危 {unresolvedHighAutoIssueCount}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={resolveHighRisksAndConfirmStory}
+                      disabled={stepTwoBusy || storyReviewHardGateWarnings.length > 0}
+                      className="h-8 rounded-lg"
+                    >
+                      处理高危并进入资产设定
+                      {unresolvedHighManualIssueCount > 0 ? `（人工确认 ${unresolvedHighManualIssueCount}）` : ""}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {intakeRevisionSummaries.length > 0 && (
+              <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[--text-primary]">AI 修改追踪</div>
+                    <div className="text-xs text-[--text-muted]">
+                      {intakeRevisionSummaries.length} 个阶段产生文本改动
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {intakeRevisionSummaries.map((revision) => (
+                    <div key={revision.stage} className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <div className="text-xs font-bold text-[--text-primary]">{revision.label}</div>
+                        <div className="text-[10px] font-semibold text-[--text-muted]">
+                          {revision.changedLineCount} 行 · {revision.charDelta >= 0 ? "+" : ""}{revision.charDelta} 字
+                        </div>
+                      </div>
+                      <div className="mb-2 text-[10px] text-[--text-muted]">
+                        {revision.beforeHash} → {revision.afterHash}
+                      </div>
+                      <div className="space-y-2">
+                        {revision.changedSamples.map((sample) => (
+                          <div key={`${revision.stage}:${sample.lineNumber}`} className="space-y-1 text-[11px] leading-5">
+                            <div className="font-semibold text-[--text-muted]">第 {sample.lineNumber} 行</div>
+                            {sample.before && <div className="rounded bg-red-50 px-2 py-1 text-red-900">{sample.before}</div>}
+                            {sample.after && <div className="rounded bg-emerald-50 px-2 py-1 text-emerald-900">{sample.after}</div>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {enrichmentJobStatus && !detailSupplemented && (
+              <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[--text-primary]">AI 细节补全</div>
+                    <div className="text-xs text-[--text-muted]">
+                      {enrichmentJobStatus.current_episode || "准备中"}
+                      {enrichmentJobStatus.current_scene ? ` / ${enrichmentJobStatus.current_scene}` : ""}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {enrichmentJobStatus.failed_tasks > 0 && (
+                      <Button variant="outline" size="sm" onClick={retryFailedEnrichmentJob} disabled={enrichmentRunning}>
+                        重试失败
+                      </Button>
+                    )}
+                    {enrichmentRunning && (
+                      <Button variant="outline" size="sm" onClick={cancelEnrichmentJob}>
+                        取消
+                      </Button>
+                    )}
+                    <span className="rounded-lg bg-[--surface] px-2 py-1 text-xs font-semibold text-[--text-secondary]">
+                      {enrichmentJobStatus.status}
+                    </span>
+                  </div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-[--surface]">
+                  <div
+                    className="h-full rounded-full bg-primary transition-all"
+                    style={{ width: `${Math.max(0, Math.min(100, enrichmentJobStatus.progress || 0))}%` }}
+                  />
+                </div>
+                <div className="mt-3 grid grid-cols-4 gap-2 text-xs text-[--text-muted]">
+                  <div>总任务 {enrichmentJobStatus.total_tasks}</div>
+                  <div>完成 {enrichmentJobStatus.completed_tasks}</div>
+                  <div>跳过 {enrichmentJobStatus.skipped_tasks}</div>
+                  <div>失败 {enrichmentJobStatus.failed_tasks}</div>
+                </div>
+                {enrichmentJobStatus.recent_logs && enrichmentJobStatus.recent_logs.length > 0 && (
+                  <div className="mt-3 max-h-24 space-y-1 overflow-y-auto rounded-lg bg-[--surface] p-2 text-xs text-[--text-muted]">
+                    {enrichmentJobStatus.recent_logs.slice(-4).map((log) => (
+                      <div key={log.id} className={log.level === "error" ? "text-red-500" : log.level === "warn" ? "text-amber-600" : ""}>
+                        {log.message}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="grid min-h-0 flex-1 grid-cols-[minmax(520px,1fr)_300px_360px] gap-4">
               <div className="flex min-h-0 flex-col rounded-xl border border-[--border-subtle] bg-white">
@@ -2996,7 +4300,10 @@ export default function ImportPage({
                 <Textarea
                   ref={reviewTextRef}
                   value={fullText}
-                  onChange={(e) => setFullText(e.target.value)}
+                  onChange={(e) => {
+                    setFullText(e.target.value);
+                    setConfirmedScriptVersionId(null);
+                  }}
                   className="h-[60vh] resize-none border-0 bg-transparent font-mono text-sm leading-relaxed shadow-none focus-visible:ring-0"
                 />
                 </div>
@@ -3023,27 +4330,41 @@ export default function ImportPage({
                     </div>
                   )}
 
-                  {!reviewRunning && !storyAnalysis && (
-                    <div className="rounded-lg bg-emerald-50 p-3 text-sm leading-relaxed text-emerald-700">
-                      点击“AI 审阅”后，这里会显示人物、场景、物品和统一故事设定。
+                  {!reviewRunning && (
+                    <div className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <div className="text-xs font-bold text-[--text-secondary]">故事设定</div>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          storyReviewMissingMetaLabels.length > 0
+                            ? "bg-amber-50 text-amber-700"
+                            : "bg-emerald-50 text-emerald-700"
+                        }`}>
+                          {storyReviewMissingMetaLabels.length > 0 ? `待补 ${storyReviewMissingMetaLabels.length}` : "完整"}
+                        </span>
+                      </div>
+                      <div className="space-y-2">
+                        {storyMetaRows.map(([field, label, value]) => {
+                          const missing = !String(value || "").trim();
+                          return (
+                            <div key={field} className="space-y-1">
+                              <label className="text-[10px] font-semibold text-[--text-muted]">{label}</label>
+                              <Textarea
+                                value={value || ""}
+                                onChange={(e) => updateStoryMetaField(field, e.target.value)}
+                                className={`min-h-16 resize-none rounded-lg text-xs leading-relaxed ${
+                                  missing ? "border-amber-200 bg-amber-50/40" : "bg-white"
+                                }`}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
 
-                  {!reviewRunning && storyAnalysis && (
-                    <div className="rounded-lg border border-[--border-subtle] bg-[--surface] p-3">
-                      <div className="mb-2 text-xs font-bold text-[--text-secondary]">故事设定</div>
-                      <div className="space-y-2">
-                        {storyMetaRows.map(([field, label, value]) => (
-                          <div key={field} className="space-y-1">
-                            <label className="text-[10px] font-semibold text-[--text-muted]">{label}</label>
-                            <Textarea
-                              value={value || ""}
-                              onChange={(e) => updateStoryMetaField(field, e.target.value)}
-                              className="min-h-16 resize-none rounded-lg bg-white text-xs leading-relaxed"
-                            />
-                          </div>
-                        ))}
-                      </div>
+                  {!reviewRunning && reviewAssetTotal === 0 && (
+                    <div className="rounded-lg bg-emerald-50 p-3 text-sm leading-relaxed text-emerald-700">
+                      AI 审阅通过并确认剧情后，会自动提取人物、场景、物品，并写入同一份资产草稿库。
                     </div>
                   )}
 
@@ -3058,15 +4379,6 @@ export default function ImportPage({
                           </div>
                           <div className="flex items-center gap-2">
                             <span className="text-xs text-[--text-muted]">{section.items.length}</span>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => addStoryAssetItem(section.key as StoryAssetSectionKey)}
-                              className="h-7 px-2"
-                            >
-                              <Plus className="h-3.5 w-3.5" />
-                            </Button>
                           </div>
                         </div>
                         <div className="max-h-44 overflow-y-auto p-2">
@@ -3076,36 +4388,23 @@ export default function ImportPage({
                             </div>
                           ) : (
                             section.items.map((item, index) => (
-                              <div key={`${section.key}:${index}`} className="mb-2 space-y-1.5 rounded-md bg-[--surface] p-2 last:mb-0">
-                                <div className="flex items-center gap-1.5">
-                                  <Input
-                                    value={item.name || ""}
-                                    onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { name: e.target.value })}
-                                    placeholder={`${section.label}名称`}
-                                    className="h-8 min-w-0 flex-1 rounded-lg bg-white text-xs font-semibold"
-                                  />
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => removeStoryAssetItem(section.key as StoryAssetSectionKey, index)}
-                                    className="h-8 w-8 shrink-0 p-0"
-                                  >
-                                    <X className="h-3.5 w-3.5" />
-                                  </Button>
+                              <div key={`${section.key}:${item.assetId || item.name}:${index}`} className="mb-2 rounded-md bg-[--surface] p-2 last:mb-0">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <div className="truncate text-xs font-bold text-[--text-primary]">{item.name || `${section.label}资产`}</div>
+                                    <div className="mt-0.5 truncate text-[10px] text-[--text-muted]">{section.getSubText(item)}</div>
+                                  </div>
+                                  {(item.variants?.length || 0) > 0 && (
+                                    <span className="shrink-0 rounded-full bg-white px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                                      {item.variants?.length} 变体
+                                    </span>
+                                  )}
                                 </div>
-                                <Input
-                                  value={(section.roleField === "role" ? (item as { role?: string }).role : (item as { type?: string }).type) || ""}
-                                  onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { [section.roleField]: e.target.value })}
-                                  placeholder={section.roleField === "role" ? "角色定位" : "类型"}
-                                  className="h-8 rounded-lg bg-white text-xs"
-                                />
-                                <Textarea
-                                  value={item.description || ""}
-                                  onChange={(e) => updateStoryAssetItem(section.key as StoryAssetSectionKey, index, { description: e.target.value })}
-                                  placeholder="描述"
-                                  className="min-h-16 resize-none rounded-lg bg-white text-xs leading-relaxed"
-                                />
+                                {item.description && (
+                                  <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-[--text-secondary]">
+                                    {item.description}
+                                  </p>
+                                )}
                               </div>
                             ))
                           )}
@@ -3123,7 +4422,7 @@ export default function ImportPage({
                     <div className="text-xs text-[--text-muted]">
                       {reviewRunning
                         ? t("aiReviewRunning")
-                        : `${t("aiReviewIssueCount", { count: reviewIssues.length })} · 已选 ${selectedApplicableIssueCount}`}
+                        : `${t("aiReviewIssueCount", { count: reviewIssues.length })} · 未处理 ${unresolvedIssueCount} · 已选 ${selectedApplicableIssueCount}`}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -3147,7 +4446,7 @@ export default function ImportPage({
                       variant="outline"
                       size="sm"
                       onClick={applyAllStoryIssues}
-                      disabled={reviewRunning || unappliedIssueCount === 0}
+                      disabled={reviewRunning || selectableIssueIndexes.length === 0}
                     >
                       {t("applyAllSuggestions")}
                     </Button>
@@ -3170,7 +4469,7 @@ export default function ImportPage({
 
                   {!reviewRunning && reviewIssues.map((issue, idx) => {
                     const isSelected = selectedIssueIndexes.has(idx);
-                    const canApply = !issue.applied && fullText.includes(issue.exactQuote);
+                    const canApply = !issue.applied && !issue.waived && Boolean(issue.exactQuote) && fullText.includes(issue.exactQuote);
                     return (
                       <div
                         key={`${issue.exactQuote}:${idx}`}
@@ -3213,38 +4512,71 @@ export default function ImportPage({
                                 已替换
                               </span>
                             )}
+                            {issue.waived && (
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600">
+                                已豁免
+                              </span>
+                            )}
                           </div>
+                          {(issue.lineNumber || issue.sceneTitle || issue.episodeTitle) && (
+                            <div className="mt-1 text-[10px] text-[--text-muted]">
+                              {[issue.episodeTitle, issue.sceneTitle, issue.lineNumber ? `第 ${issue.lineNumber} 行` : ""].filter(Boolean).join(" / ")}
+                            </div>
+                          )}
                         </div>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            applyStoryIssue(idx);
-                          }}
-                          disabled={issue.applied || !canApply}
-                        >
-                          {issue.applied ? t("appliedSuggestion") : t("applySuggestion")}
-                        </Button>
-                      </div>
-                      <div className="space-y-2 text-xs">
-                        <div>
-                          <div className="mb-1 font-medium text-[--text-secondary]">{t("originalText")}</div>
-                          <button
-                            type="button"
+                        <div className="flex shrink-0 gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
                             onClick={(e) => {
                               e.stopPropagation();
-                              scrollAndSelectQuote(issue, idx);
+                              applyStoryIssue(idx);
                             }}
-                            className="w-full rounded bg-red-50/70 p-2 text-left text-red-900 transition-colors hover:bg-red-100"
+                            disabled={issue.applied || issue.waived || !canApply}
                           >
-                            {issue.exactQuote}
-                          </button>
+                            {issue.applied ? t("appliedSuggestion") : t("applySuggestion")}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              waiveStoryIssue(idx);
+                            }}
+                            disabled={issue.applied || issue.waived}
+                          >
+                            豁免
+                          </Button>
                         </div>
-                        <div>
-                          <div className="mb-1 font-medium text-[--text-secondary]">{t("replacementText")}</div>
-                          <div className="rounded bg-emerald-50 p-2 text-emerald-900">#{idx} {issue.replacement}</div>
-                        </div>
+                      </div>
+                      <div className="space-y-2 text-xs">
+                        {issue.context && !issue.exactQuote && (
+                          <div>
+                            <div className="mb-1 font-medium text-[--text-secondary]">定位上下文</div>
+                            <div className="rounded bg-[--surface] p-2 text-[--text-secondary]">{issue.context}</div>
+                          </div>
+                        )}
+                        {issue.exactQuote && (
+                          <div>
+                            <div className="mb-1 font-medium text-[--text-secondary]">{t("originalText")}</div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                scrollAndSelectQuote(issue, idx);
+                              }}
+                              className="w-full rounded bg-red-50/70 p-2 text-left text-red-900 transition-colors hover:bg-red-100"
+                            >
+                              {issue.exactQuote}
+                            </button>
+                          </div>
+                        )}
+                        {issue.replacement && (
+                          <div>
+                            <div className="mb-1 font-medium text-[--text-secondary]">{t("replacementText")}</div>
+                            <div className="rounded bg-emerald-50 p-2 text-emerald-900">#{idx} {issue.replacement}</div>
+                          </div>
+                        )}
                         {issue.explanation && (
                           <p className="leading-relaxed text-[--text-muted]">{issue.explanation}</p>
                         )}
@@ -3310,11 +4642,11 @@ export default function ImportPage({
                 </Button>
                 <Button
                   onClick={runSplit}
-                  disabled={stepStatus[4] === "running" || !allAssetsConfirmed}
+                  disabled={stepStatus[4] === "running" || assetLibraryLocking || !allAssetsConfirmed}
                   className="rounded-xl"
                 >
-                  {stepStatus[4] === "running" && <Loader2 className="size-4 animate-spin" />}
-                  {t("confirmAndSplit")}
+                  {(stepStatus[4] === "running" || assetLibraryLocking) && <Loader2 className="size-4 animate-spin" />}
+                  {assetLibraryLocking ? "锁定资产库" : t("confirmAndSplit")}
                 </Button>
               </div>
             </div>
@@ -3399,7 +4731,7 @@ export default function ImportPage({
                             </span>
                           </button>
                           <div className="flex items-center gap-1">
-                            <span className={`mr-1 h-2 w-2 rounded-full ${asset.confirmed === false ? "bg-amber-400" : "bg-emerald-500"}`} />
+                            <span className={`mr-1 h-2 w-2 rounded-full ${asset.confirmed === true ? "bg-emerald-500" : "bg-amber-400"}`} />
                             <Button
                               type="button"
                               size="icon-xs"
@@ -3446,15 +4778,15 @@ export default function ImportPage({
                       </div>
                       <button
                         type="button"
-                        onClick={() => updateActiveWorkbenchAsset({ confirmed: activeWorkbenchAsset.confirmed === false })}
+                        onClick={() => updateActiveWorkbenchAsset({ confirmed: activeWorkbenchAsset.confirmed !== true })}
                         className={`flex h-11 shrink-0 items-center gap-2 rounded-xl border px-4 text-sm font-bold transition-colors ${
-                          activeWorkbenchAsset.confirmed !== false
+                          activeWorkbenchAsset.confirmed === true
                             ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
                             : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
                         }`}
                       >
                         <Check className="size-4" />
-                        {activeWorkbenchAsset.confirmed !== false ? "已确认" : "确认资产"}
+                        {activeWorkbenchAsset.confirmed === true ? "已确认" : "确认资产"}
                       </button>
                     </div>
 
@@ -4508,6 +5840,10 @@ export default function ImportPage({
                       setSelectedStep(null);
                       setCurrentStep(0);
                       storyReviewedRef.current = false;
+                      enrichedTextRef.current = "";
+                      visualEnrichmentRef.current = null;
+                      setDetailSupplementReady(false);
+                      setCurrentEnrichmentJob(null);
                       setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle", 5: "idle" });
                     }}
                   >
@@ -4522,4 +5858,3 @@ export default function ImportPage({
     </div>
   );
 }
-

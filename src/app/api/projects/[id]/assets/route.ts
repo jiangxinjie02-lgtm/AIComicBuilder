@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 import {
+  getProjectAsset,
   listProjectAssets,
   syncImportAssets,
   type ImportAssetDraft,
@@ -50,6 +51,8 @@ export async function POST(
     items: Array.isArray(body.items) ? body.items as ImportAssetDraft[] : [],
     environments: Array.isArray(body.environments) ? body.environments as ImportAssetDraft[] : [],
   });
+  const assets = (await Promise.all(created.map((asset) => getProjectAsset(projectId, asset.id))))
+    .filter(Boolean);
 
-  return NextResponse.json({ count: created.length, assets: created }, { status: 201 });
+  return NextResponse.json({ count: created.length, assets }, { status: 201 });
 }

@@ -8,7 +8,6 @@ import { eq, and } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import { addImportLog, chunkText } from "@/lib/import-utils";
 import {
-  analyzeScriptAssets,
   type StoryAssetAnalysis,
   type StoryMetaAnalysis,
 } from "@/lib/asset-agent/analyze-script-assets";
@@ -766,38 +765,6 @@ function mergeStoryAssetItem<T extends { name: string; role?: string; type?: str
   }
 }
 
-function buildRuleStoryAssetAnalysis(title: string, text: string, storyAnalysis?: StoryAssetAnalysis | null) {
-  const assetProject = analyzeScriptAssets({
-    title,
-    script: text,
-    storyAnalysis: storyAnalysis || null,
-    aspectRatio: "16:9",
-    targetSize: "1536x1024",
-    style: "真人实拍",
-  });
-
-  return normalizeStoryAssetAnalysis({
-    storyMeta: assetProject.summary.storyMeta || storyAnalysis?.storyMeta,
-    assets: {
-      characters: assetProject.assets.characters.map((asset) => ({
-        name: asset.name,
-        role: asset.role,
-        description: asset.description,
-      })),
-      scenes: assetProject.assets.scenes.map((asset) => ({
-        name: asset.name,
-        type: asset.role,
-        description: asset.description,
-      })),
-      props: assetProject.assets.props.map((asset) => ({
-        name: asset.name,
-        type: asset.role,
-        description: asset.description,
-      })),
-    },
-  });
-}
-
 function findSensitiveTermIssues(text: string): ReviewIssue[] {
   return SENSITIVE_TERMS
     .map((item) => ({ item, index: text.indexOf(item.term) }))
@@ -938,7 +905,7 @@ export async function POST(
     let totalTokens = 0;
 
     try {
-      await addImportLog(projectId, 2, "running", "AI 正在解析故事时间、背景和资产草稿...");
+      await addImportLog(projectId, 2, "running", "AI 正在解析故事时间、背景和视觉基调...");
       const result = await analyzeStoryAssets(activeTextModelConfigs, pickModelConfig, textModelAttempts, body.text);
       storyAnalysis = result.analysis;
       totalInputTokens += result.usage.inputTokens ?? 0;
@@ -949,27 +916,15 @@ export async function POST(
         2,
         "running",
         storyAnalysis
-          ? `故事资产解析完成：角色 ${storyAnalysis.assets?.characters?.length || 0}、场景 ${storyAnalysis.assets?.scenes?.length || 0}、物品 ${storyAnalysis.assets?.props?.length || 0}${formatUsage(result.usage)}`
-          : `故事资产解析未返回可用结构，将使用规则 Agent 兜底${formatUsage(result.usage)}`
+          ? `故事元信息解析完成${formatUsage(result.usage)}`
+          : `故事元信息解析未返回可用结构${formatUsage(result.usage)}`
       );
     } catch (err) {
-      console.warn("[ImportReview] Story asset analysis failed, fallback to rule agent:", err);
-      await addImportLog(projectId, 2, "running", "故事资产解析失败，将使用规则 Agent 兜底，不影响剧情审阅。");
+      console.warn("[ImportReview] Story meta analysis failed:", err);
+      await addImportLog(projectId, 2, "running", "故事元信息解析失败，不影响剧情审阅；资产将在资产设定阶段统一提取。");
     }
 
-    const ruleStoryAnalysis = buildRuleStoryAssetAnalysis(project.title, body.text, storyAnalysis);
-    storyAnalysis = mergeStoryAssetAnalyses([
-      ...(storyAnalysis ? [storyAnalysis] : []),
-      ...(ruleStoryAnalysis ? [ruleStoryAnalysis] : []),
-    ]);
-    if (storyAnalysis) {
-      await addImportLog(
-        projectId,
-        2,
-        "running",
-        `资产草稿已补全：角色 ${storyAnalysis.assets?.characters?.length || 0}、场景 ${storyAnalysis.assets?.scenes?.length || 0}、物品 ${storyAnalysis.assets?.props?.length || 0}`
-      );
-    }
+    storyAnalysis = storyAnalysis?.storyMeta ? { storyMeta: storyAnalysis.storyMeta } : null;
 
     const chunkResults = await mapWithConcurrency(
       chunks,
